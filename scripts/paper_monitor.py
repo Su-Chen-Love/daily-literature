@@ -770,15 +770,14 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     if rescreen:
         rows=db.execute("SELECT * FROM papers WHERE eligibility_status='eligible' ORDER BY first_seen").fetchall()
     else:
-        rows=db.execute("""SELECT p.* FROM papers p WHERE (
-          p.needs_rescreen=1 OR NOT EXISTS(
-          SELECT 1 FROM screenings s WHERE s.identity=p.identity AND s.profile_hash=? AND s.provider='codex-agent'
-          AND s.rubric_version=?)
-          ) AND p.eligibility_status='eligible' ORDER BY
-          CASE WHEN EXISTS(SELECT 1 FROM screenings visible WHERE visible.identity=p.identity
-            AND visible.profile_hash=? AND visible.provider='codex-agent' AND visible.score>=?) THEN 0
-            WHEN p.needs_rescreen=1 THEN 1 ELSE 2 END,p.first_seen DESC,p.identity""",
-          (phash,SCREENING_RUBRIC_VERSION,phash,float(cfg.get("relevance_threshold",0.70)))).fetchall()
+        # Daily judgment is once per identity. Changed evidence, feedback,
+        # profiles, or rubrics do not authorize repeating an existing judgment;
+        # only an explicit, user-requested --rescreen may do that.
+        rows=db.execute("""SELECT p.* FROM papers p
+          WHERE p.eligibility_status='eligible' AND NOT EXISTS(
+            SELECT 1 FROM screenings s
+            WHERE s.identity=p.identity AND s.provider='codex-agent')
+          ORDER BY p.first_seen DESC,p.identity""").fetchall()
     total_candidates=len(rows)
     batch_limit=max(1,int(limit if limit is not None else cfg.get("max_candidates",120)))
     rows=rows[:batch_limit]
@@ -1024,7 +1023,7 @@ def main() -> int:
     for name in ("doctor","collect-only","agent-export","agent-import","enrich-abstracts","backfill-history"):
         p=sub.add_parser(name); p.add_argument("--config",required=True,type=Path)
         if name=="agent-export":
-            p.add_argument("--rescreen",action="store_true",help="export all stored papers, including previously judged papers")
+            p.add_argument("--rescreen",action="store_true",help="manual, user-requested re-evaluation of stored eligible papers; default exports only identities never judged by Codex")
             p.add_argument("--no-collect",action="store_true",help="export from the database without network collection")
             p.add_argument("--batch-run",help="collection run to carry into this frozen queue")
             p.add_argument("--limit",type=int,help="maximum candidates in one complete frozen queue (config max_candidates, default 120)")

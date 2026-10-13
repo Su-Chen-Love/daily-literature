@@ -20,6 +20,7 @@ from .recommendations import local_today, recommendation_days, recommendations_o
 from .cloud_views import export_view_contexts
 from .storage import connect, utc_now
 from .product import load_config, resolve_state
+from .governance import latest_scores_sql
 
 
 def canonical(value: Any) -> str:
@@ -106,17 +107,14 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
     try:
         db.execute("BEGIN")
         profile = db.execute("SELECT content,profile_hash,confirmed_at FROM profile_versions WHERE status='active'").fetchone()
-        profile_hash = profile["profile_hash"] if profile else ""
-        scores = """SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(
-          PARTITION BY s.identity ORDER BY s.screened_at DESC,s.rowid DESC) rn
-          FROM screenings s WHERE s.provider='codex-agent' AND s.profile_hash=?) WHERE rn=1"""
+        scores = latest_scores_sql()
         query = f"""SELECT p.identity,p.doi,p.title,p.abstract,p.venue,p.published,p.published_precision,p.url,p.authors_json,
           p.abstract_source,p.abstract_source_url,p.abstract_retrieved_at,p.eligibility_status,p.publication_type,
           EXISTS(SELECT 1 FROM fulltext_files ft WHERE ft.identity=p.identity) fulltext_count,
           (SELECT ft.id FROM fulltext_files ft WHERE ft.identity=p.identity ORDER BY ft.imported_at DESC,ft.id DESC LIMIT 1) fulltext_id,
           p.needs_rescreen,s.score,s.reasons,s.confidence,s.themes_json,s.reasoning_json,s.score_dimensions_json,s.rubric_version
           FROM papers p LEFT JOIN ({scores}) s ON s.identity=p.identity AND s.rn=1 ORDER BY p.identity"""
-        papers = [dict(row) for row in db.execute(query, (profile_hash,))]
+        papers = [dict(row) for row in db.execute(query)]
         for paper in papers:
             paper["abstract_source_url"] = public_source_url(paper["abstract_source_url"])
             paper["url"] = public_source_url(paper["url"])
@@ -127,10 +125,10 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
             history, batches, incomplete = recommendations_on(db, dt.date.fromisoformat(day), timezone)
             allowed = {"identity", "score", "reasons", "confidence", "themes_json", "reasoning_json", "score_dimensions_json", "rubric_version", "evidence_source"}
             append("history", day, {"papers": [{k: p[k] for k in allowed if k in p} for p in history], "batches": batches, "incomplete": incomplete})
-        # Today follows the same latest completed active-profile run as the
+        # Today follows the same latest completed run as the
         # local web app. Historical days retain their immutable daily union.
-        latest = db.execute("""SELECT run_id,imported_at FROM agent_jobs WHERE status='imported' AND profile_hash=?
-          ORDER BY imported_at DESC LIMIT 1""", (profile_hash,)).fetchone()
+        latest = db.execute("""SELECT run_id,imported_at FROM agent_jobs WHERE status='imported'
+          ORDER BY imported_at DESC LIMIT 1""").fetchone()
         current: list[dict] = []
         day = local_today(timezone)
         is_today = bool(latest and _stamp(latest["imported_at"]).astimezone(ZoneInfo(timezone)).date() == day)
@@ -138,10 +136,10 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
             current = [dict(row) for row in db.execute("""SELECT p.identity,s.score,s.reasons,s.confidence,
               s.themes_json,s.reasoning_json,s.score_dimensions_json,s.rubric_version FROM run_papers rp
               JOIN papers p ON p.identity=rp.identity JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id
-              WHERE rp.run_id=? AND s.provider='codex-agent' AND s.profile_hash=? AND p.eligibility_status='eligible'
+              WHERE rp.run_id=? AND s.provider='codex-agent' AND p.eligibility_status='eligible'
               AND s.score>=? AND (rp.role='selected' OR (rp.role='selected_new' AND NOT EXISTS(
                 SELECT 1 FROM run_papers chosen WHERE chosen.run_id=rp.run_id AND chosen.identity=rp.identity AND chosen.role='selected')))
-              ORDER BY p.identity""", (latest["run_id"], profile_hash, config.get("relevance_threshold", .70)))]
+              ORDER BY p.identity""", (latest["run_id"], config.get("relevance_threshold", .70)))]
         append("history", "current", {"day": day.isoformat(), "papers": current, "batches": int(is_today), "incomplete": False})
         for feedback in db.execute("SELECT * FROM paper_feedback ORDER BY identity"):
             append("feedback", feedback["identity"], dict(feedback))
@@ -169,7 +167,7 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
             sources.append(item)
         append("private", "profile", dict(profile) if profile else {})
         totals = dict(db.execute("SELECT COUNT(*) total,SUM(eligibility_status='eligible') eligible,SUM(COALESCE(abstract,'')='') missing_abstracts FROM papers").fetchone())
-        latest_import = db.execute("SELECT MAX(imported_at) t FROM agent_jobs WHERE status='imported' AND profile_hash=?", (profile_hash,)).fetchone()[0]
+        latest_import = db.execute("SELECT MAX(imported_at) t FROM agent_jobs WHERE status='imported'").fetchone()[0]
         append("meta", "overview", {"sources": sources, "counts": totals, "days": days, "timezone": timezone,
                                    "threshold": config.get("relevance_threshold", 0.70), "last_import": latest_import})
         for page, context in export_view_contexts(db, config, db_path.parent).items():

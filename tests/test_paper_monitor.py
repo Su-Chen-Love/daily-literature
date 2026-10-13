@@ -336,7 +336,7 @@ class MonitorTests(unittest.TestCase):
             queue=json.loads(Path(summary["queue_path"]).read_text())
             self.assertEqual(queue["papers"],[])
 
-    def test_enriched_abstract_forces_rescreen_and_exports_publication_type(self):
+    def test_enriched_abstract_requires_explicit_rescreen_and_exports_publication_type(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); profile="profile"; (root/"research-profile.md").write_text(profile,encoding="utf-8")
             config=root/"config.toml"
@@ -351,6 +351,9 @@ class MonitorTests(unittest.TestCase):
             db.execute("UPDATE papers SET needs_rescreen=1 WHERE identity=?",(paper.identity,))
             db.commit(); db.close()
             with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            queue=json.loads(Path(json.loads(output.call_args.args[0])["queue_path"]).read_text())
+            self.assertEqual(queue["papers"],[])
+            with patch("builtins.print") as output: pm.agent_export(config,rescreen=True,no_collect=True)
             queue=json.loads(Path(json.loads(output.call_args.args[0])["queue_path"]).read_text())
             self.assertEqual([item["identity"] for item in queue["papers"]],[paper.identity])
             self.assertEqual(queue["papers"][0]["publication_type"],"Journal Article")
@@ -481,26 +484,57 @@ class MonitorTests(unittest.TestCase):
                 pm.backfill_history(root/'config.toml')
             self.assertEqual(json.loads(output.call_args.args[0]),{'recovered':1,'unavailable':0})
 
-    def test_new_rubric_migration_is_bounded_and_resumes_after_import(self):
+    def test_daily_export_skips_judged_papers_despite_feedback_profile_or_rubric_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("current profile")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "V"\ntype = "crossref"\nissn = "1234"\n')
+            db=pm.db_open(root/"papers.sqlite3")
+            current_hash=__import__("hashlib").sha256(b"current profile").hexdigest()
+            variants=[("feedback",current_hash,pm.SCREENING_RUBRIC_VERSION,1),
+                      ("old-profile","previous-profile",pm.SCREENING_RUBRIC_VERSION,0),
+                      ("old-rubric",current_hash,"evidence-v2",0),
+                      ("never-judged",None,None,1)]
+            for suffix,profile_hash,rubric,dirty in variants:
+                paper=pm.Paper(f"doi:10.1/{suffix}",f"10.1/{suffix}",suffix,"Abstract","V","2026-01-01","",[],"s",
+                               publication_type_raw="journal-article",publication_type_source="crossref")
+                pm.upsert(db,paper,"now")
+                db.execute("UPDATE papers SET needs_rescreen=? WHERE identity=?",(dirty,paper.identity))
+                if profile_hash:
+                    db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,
+                      screened_at,rubric_version) VALUES(?,?,'codex-agent','previous',1,.8,'before',?)""",
+                      (paper.identity,profile_hash,rubric))
+            db.execute("INSERT INTO paper_feedback VALUES(?,?,?,?,?,?,?)",
+                       ("doi:10.1/feedback","not_interested","Updated preference",0,"unread","now","now"))
+            before=[tuple(row) for row in db.execute("SELECT * FROM screenings ORDER BY identity")]
+            db.commit(); db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]); queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual([item["identity"] for item in queue["papers"]],["doi:10.1/never-judged"])
+            self.assertEqual(summary["total_candidates"],1)
+            self.assertEqual(queue["feedback_examples"][0]["reason"],"Updated preference")
+            db=pm.db_open(root/"papers.sqlite3")
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM screenings ORDER BY identity")],before)
+            db.close()
+
+    def test_unjudged_batches_resume_after_import_without_rejudging_on_sync_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"research-profile.md").write_text("profile")
             config=root/"config.toml"
             config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\nmax_candidates = 1\n[[sources]]\nname = "V"\ntype = "crossref"\nissn = "1234"\n')
             db=pm.db_open(root/"papers.sqlite3")
             phash=__import__("hashlib").sha256(b"profile").hexdigest()
-            for suffix,score in [("visible",.8),("low",.1)]:
+            for suffix in ("a","b"):
                 paper=pm.Paper(f"doi:10.1/{suffix}",f"10.1/{suffix}",suffix,"Abstract","V","2026-01-01","",[],"s",
                                publication_type_raw="journal-article",publication_type_source="crossref")
                 pm.upsert(db,paper,"now")
-                db.execute("INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,screened_at,rubric_version) VALUES(?,?,'codex-agent','old',?,?,?,'evidence-v2')",
-                           (paper.identity,phash,int(score>=.7),score,"before"))
-            db.execute("UPDATE papers SET needs_rescreen=0"); db.commit(); db.close()
+            db.commit(); db.close()
             with patch("builtins.print") as output:pm.agent_export(config,no_collect=True)
             summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
             self.assertEqual((summary["candidates"],summary["deferred_candidates"]),(1,1))
-            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/visible")
+            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/a")
             result_path=root/"results.json"
-            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":phash,"model":"test","results":[self.structured_result("doi:10.1/visible")]}))
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":phash,"model":"test","results":[self.structured_result("doi:10.1/a")]}))
             with patch("academic_radar.cloud_sync.sync_configured",side_effect=RuntimeError("Cloud unavailable")),patch("builtins.print") as output:
                 self.assertEqual(pm.agent_import(config,result_path),1)
             self.assertEqual(json.loads(output.call_args.args[0])["cloud_sync"]["status"],"failed")
@@ -509,8 +543,58 @@ class MonitorTests(unittest.TestCase):
             db.close()
             with patch("builtins.print") as output:pm.agent_export(config,no_collect=True)
             summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
-            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/low")
+            self.assertEqual(queue["papers"][0]["identity"],"doi:10.1/b")
             self.assertEqual(summary["deferred_candidates"],0)
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":phash,"model":"test","results":[self.structured_result("doi:10.1/b")]}))
+            with patch("academic_radar.cloud_sync.sync_configured",return_value={"status":"succeeded"}),patch("builtins.print"):
+                self.assertEqual(pm.agent_import(config,result_path),0)
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            summary=json.loads(output.call_args.args[0]);queue=json.loads(Path(summary["queue_path"]).read_text())
+            self.assertEqual((queue["papers"],summary["total_candidates"],summary["deferred_candidates"]),([],0,0))
+
+    def test_empty_daily_import_refreshes_status_and_syncs_without_changing_saved_judgments(self):
+        from academic_radar.operations import recommendation_freshness
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); (root/"research-profile.md").write_text("profile")
+            config=root/"config.toml"
+            config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n[[sources]]\nname = "V"\ntype = "crossref"\nissn = "1234"\n')
+            db=pm.db_open(root/"papers.sqlite3")
+            paper=pm.Paper("doi:10.1/old","10.1/old","Old paper","Abstract","V","2026-01-01","",[],"s",
+                           publication_type_raw="journal-article",publication_type_source="crossref")
+            pm.upsert(db,paper,"before"); db.commit(); db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            queue=json.loads(Path(json.loads(output.call_args.args[0])["queue_path"]).read_text())
+            result_path=root/"results.json"
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":queue["profile_hash"],
+                                              "model":"test","results":[self.structured_result(paper.identity)]}))
+            with patch("academic_radar.cloud_sync.sync_configured",return_value={"status":"succeeded"}),patch("builtins.print"):
+                self.assertEqual(pm.agent_import(config,result_path),0)
+            db=pm.db_open(root/"papers.sqlite3")
+            with db:
+                db.execute("UPDATE agent_jobs SET imported_at='2020-01-01T00:00:00+00:00'")
+            saved_judgments=[tuple(row) for row in db.execute("SELECT * FROM screenings")]
+            saved_history=[tuple(row) for row in db.execute("SELECT * FROM recommendation_snapshots")]
+            self.assertTrue(recommendation_freshness(db)["overdue"])
+            db.close()
+            with patch("builtins.print") as output: pm.agent_export(config,no_collect=True)
+            queue=json.loads(Path(json.loads(output.call_args.args[0])["queue_path"]).read_text())
+            self.assertEqual(queue["papers"],[])
+            result_path.write_text(json.dumps({"run_id":queue["run_id"],"profile_hash":queue["profile_hash"],
+                                              "model":"test","results":[],"source_failures":queue["source_failures"]}))
+            with patch("academic_radar.cloud_sync.sync_configured",return_value={"status":"succeeded"}) as sync,patch("builtins.print") as output:
+                self.assertEqual(pm.agent_import(config,result_path),0)
+            sync.assert_called_once_with(config)
+            summary=json.loads(output.call_args.args[0])
+            self.assertEqual((summary["imported"],summary["relevant"]),(0,0))
+            self.assertTrue(Path(summary["digest_path"]).exists())
+            db=pm.db_open(root/"papers.sqlite3")
+            self.assertEqual(tuple(db.execute("SELECT status,imported_count FROM agent_jobs WHERE run_id=?",(queue["run_id"],)).fetchone()),("imported",0))
+            self.assertEqual(tuple(db.execute("SELECT status,relevant_count FROM pipeline_runs WHERE run_id=?",(queue["run_id"],)).fetchone()),("succeeded",0))
+            self.assertTrue(recommendation_freshness(db)["is_today"])
+            self.assertFalse(recommendation_freshness(db)["overdue"])
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM screenings")],saved_judgments)
+            self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM recommendation_snapshots")],saved_history)
+            db.close()
 
     def test_schema_four_does_not_get_mislabeled_as_new_rubric(self):
         paper={"abstract":"Abstract","title":"Paper"}

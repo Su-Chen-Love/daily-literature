@@ -100,7 +100,7 @@ class CloudSyncTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT value FROM meta WHERE key='cloud_feedback_cursor'").fetchone()[0], "4")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 0)
 
-    def test_snapshot_uses_latest_host_screening_for_active_profile(self):
+    def test_snapshot_preserves_latest_host_screening_across_profile_changes(self):
         with self.db:
             self.db.execute("""INSERT INTO profile_versions(profile_hash,content,status,created_at)
               VALUES('active-profile','Current interests','active','now')""")
@@ -114,7 +114,7 @@ class CloudSyncTests(unittest.TestCase):
                   VALUES('doi:10.1/x',?,?,?,1,?,'Reason',?)""", (profile, provider, model, score, stamp))
         records = snapshot_records(self.path, {"timezone": "Asia/Shanghai"})
         paper = json.loads(next(record["data"] for record in records if record["kind"] == "paper"))
-        self.assertEqual(paper["score"], .75)
+        self.assertEqual(paper["score"], .97)
         self.assertEqual(len([record for record in records if record["kind"] == "paper"]), 1)
 
     def test_snapshot_excludes_paths_credentials_and_raw_source_errors(self):
@@ -151,7 +151,7 @@ class CloudSyncTests(unittest.TestCase):
         self.assertEqual(overview["sources"][0]["official_issues_url"], "https://journal.example/issues")
         self.assertIn("本地日志", overview["sources"][0]["health"]["last_error"])
 
-    def test_today_snapshot_uses_latest_active_profile_run_not_daily_union(self):
+    def test_today_snapshot_preserves_latest_completed_run_across_profile_changes(self):
         import datetime as dt
         with self.db:
             self.db.execute("INSERT INTO profile_versions(profile_hash,content,status,created_at) VALUES('active','Interest','active','now')")
@@ -166,7 +166,8 @@ class CloudSyncTests(unittest.TestCase):
         current = json.loads(next(r['data'] for r in records if r['kind']=='history' and r['key']=='current'))
         history = json.loads(next(r['data'] for r in records if r['kind']=='history' and r['key']=='2026-10-09'))
         self.assertEqual(current['batches'],1)
-        self.assertEqual(current['papers'],[])
+        self.assertEqual(len(current['papers']),1)
+        self.assertEqual(current['papers'][0]['score'],.95)
         self.assertEqual(len(history['papers']),1)
         with patch("academic_radar.cloud_sync.local_today", return_value=dt.date(2026,10,10)):
             current = json.loads(next(r['data'] for r in snapshot_records(self.path,{}) if r['kind']=='history' and r['key']=='current'))

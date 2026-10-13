@@ -21,7 +21,7 @@
     {% if paper.evidence_source == 'unavailable' %}<p class="reason">当时的推荐记录已保留，原始评分详情暂不可恢复。</p>{% endif %}
     {% if anchor_prefix and paper.eligibility_status != 'eligible' %}<p class="reason">当前收录状态：{{ paper.eligibility_status|status_label }}</p>{% endif %}
     {% if paper.reasons %}<p class="reason"><strong>研究解读：</strong>{{ paper.reasons }}</p>{% endif %}
-    {% if paper.needs_rescreen and not anchor_prefix %}<p class="warning">资料或研究偏好有更新，这条推荐理由待重新核验。</p>{% endif %}
+    {% if paper.needs_rescreen and not anchor_prefix %}<p class="muted">资料或研究偏好已有更新；这里保留此前的评分与推荐理由。</p>{% endif %}
     <details class="paper-details">
       <summary>展开详情</summary>
       <div class="paper-detail-content">
@@ -30,7 +30,7 @@
         <input type="hidden" name="identity" value="{{ paper.identity }}">
         <label>完整摘要<textarea name="abstract" rows="6" maxlength="50000" required placeholder="粘贴论文页面明确标注的完整 Abstract"></textarea></label>
         <label>来源链接（建议填写）<input name="source_url" type="url" value="{{ paper.url or '' }}" placeholder="https://..."></label>
-        <button type="submit">保存摘要并重新评分</button>
+        <button type="submit">保存摘要</button>
       </form>{% endif %}
       <div class="abstract-wrap"><p class="abstract">{{ paper.abstract or '公开渠道未找到原始摘要。' }}</p></div>
       <dl class="paper-meta"><div><dt>作者</dt><dd>{{ paper.authors_json|authors }}</dd></div><div><dt>摘要来源</dt><dd>{{ paper.abstract_source or '未找到' }}</dd></div><div><dt>DOI</dt><dd>{{ paper.doi or '无' }}</dd></div></dl>

@@ -125,6 +125,33 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("A useful paper", response.text)
 
+    def test_profile_change_keeps_saved_today_and_library_decisions(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+            with connect(db_path) as db:
+                old_profile = db.execute("SELECT profile_hash FROM profile_versions WHERE status='active'").fetchone()[0]
+                db.execute("""INSERT INTO pipeline_runs(run_id,kind,status,started_at)
+                    VALUES('run','agent-export','succeeded',?)""", (stamp,))
+                db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,created_at,imported_at)
+                    VALUES('run',?,'imported',?,?)""", (old_profile, stamp, stamp))
+                db.execute("INSERT INTO run_papers VALUES('run','doi:10.1/test','selected')")
+                db.execute("UPDATE papers SET needs_rescreen=1")
+            draft = create_profile_draft(db_path, "A different confirmed profile", "New interests")
+            with TestClient(app) as client:
+                response = client.post("/profile/confirm", data={
+                    "csrf_token": app.state.csrf_token, "version_id": str(draft["id"]),
+                }, follow_redirects=False)
+                self.assertEqual(response.status_code, 303)
+                for route in ("/", "/library"):
+                    page = client.get(route)
+                    self.assertEqual(page.status_code, 200)
+                    self.assertIn("A useful paper", page.text)
+                    self.assertIn("Direct match", page.text)
+                status = client.get("/status").text
+            self.assertNotIn("待按新量表重新判断", status)
+            self.assertIn("仅导出从未由 Codex 判断过的新文献", status)
+
     def test_sources_show_completed_official_issue_count(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))
@@ -453,7 +480,7 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.status_code, 400)
             self.assertIn("APA 引用过短", response.json()["error"])
 
-    def test_manual_abstract_updates_status_and_queues_rescreen(self):
+    def test_manual_abstract_preserves_prior_judgment_without_automatic_rescreen(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))
             db = connect(db_path)
@@ -466,18 +493,36 @@ class WebTests(unittest.TestCase):
             )
             with TestClient(app) as client:
                 page = client.get("/library")
-                self.assertIn("保存摘要并重新评分", page.text)
+                self.assertIn("保存摘要", page.text)
                 response = client.post("/api/papers/abstract", json={
                     "identity":"doi:10.1/test", "abstract":abstract,
                     "source_url":"https://doi.org/10.1/test",
                 }, headers={"X-CSRF-Token":app.state.csrf_token})
             self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()["queued_for_screening"])
+            self.assertIn("已有评分保留", response.json()["message"])
             db = connect(db_path)
             paper = db.execute("SELECT abstract_source,abstract_failure_reason,needs_rescreen FROM papers").fetchone()
             attempt = db.execute("SELECT provider,status FROM abstract_attempts ORDER BY id DESC LIMIT 1").fetchone()
             db.close()
             self.assertEqual(tuple(paper), ("user-provided", None, 1))
             self.assertEqual(tuple(attempt), ("manual", "found"))
+
+    def test_manual_paper_existing_judgment_is_not_queued_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            with connect(db_path) as db:
+                db.execute("UPDATE papers SET abstract='' WHERE identity='doi:10.1/test'")
+            with TestClient(app) as client:
+                response = client.post("/api/papers/manual", json={
+                    "apa_citation": "Smith, J. (2026). A useful paper. Test Venue, 1(1), 1–12.",
+                    "abstract": "A complete user-provided abstract describes a decision experiment, its research design, observed results and limitations.",
+                }, headers={"X-CSRF-Token": app.state.csrf_token})
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()["created"])
+            self.assertTrue(response.json()["abstract_updated"])
+            self.assertFalse(response.json()["queued_for_screening"])
+            self.assertIn("已有评分保留", response.json()["message"])
 
     def test_title_only_manual_paper_absorbs_a_later_doi_without_duplication(self):
         with tempfile.TemporaryDirectory() as td:

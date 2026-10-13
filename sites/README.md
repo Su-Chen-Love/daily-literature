@@ -27,7 +27,10 @@ is an internal transport secret and is never required from Site visitors.
 
 ## Synchronization
 
-The local daily task collects scholarly sources and performs Codex judgments.
+The local daily task collects scholarly sources and performs a first Codex
+judgment only for papers that have never been judged. Existing judgments are
+retained across profile, feedback, abstract and rubric changes; daily tasks do
+not rescreen old papers. Batch size is a maximum, never a quota.
 Feedback, reading and favorite edits save immediately on either surface.
 Local saves request background sync immediately; the macOS service also checks
 every five minutes. Sync pulls cloud feedback with an event cursor, merges by

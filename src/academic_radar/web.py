@@ -51,6 +51,7 @@ from .product import (
     initialize_installation,
     source_candidates,
     source_coverage,
+    screening_coverage,
 )
 from .storage import connect, database_status, upgrade_database, utc_now
 
@@ -442,8 +443,7 @@ def create_app(config_path: Path) -> FastAPI:
         db = connect(db_path)
         try:
             active = row(db, "SELECT * FROM profile_versions WHERE status='active'")
-            profile_hash = active["profile_hash"] if active else ""
-            latest_job = row(db,"SELECT * FROM agent_jobs WHERE status='imported' AND profile_hash=? ORDER BY imported_at DESC LIMIT 1", (profile_hash,))
+            latest_job = row(db,"SELECT * FROM agent_jobs WHERE status='imported' ORDER BY imported_at DESC LIMIT 1")
             freshness = recommendation_freshness(db, str(config.get("timezone", "Asia/Shanghai")))
             run_id = latest_job["run_id"] if latest_job else ""
             threshold=float(config.get("relevance_threshold",0.70))
@@ -458,10 +458,9 @@ def create_app(config_path: Path) -> FastAPI:
               JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id AND s.provider='codex-agent'
               LEFT JOIN paper_feedback f ON f.identity=p.identity
               -- The latest agent run is the authoritative recommendation set.
-              -- A paper can be newly recommended after re-screening or a
-              -- feedback-triggered rescreen without being newly collected in
-              -- this API batch, so filtering only selected_new hid valid
-              -- recommendations from the Today page.
+              -- Use the run's saved decisions even after a profile change.
+              -- Ordinary daily runs contain only first judgments; an explicit
+              -- manual rescreen can still produce a completed run.
               WHERE rp.run_id=? AND (
                 rp.role='selected' OR (
                   rp.role='selected_new' AND NOT EXISTS(
@@ -471,11 +470,11 @@ def create_app(config_path: Path) -> FastAPI:
                       AND selected_rp.role='selected'
                   )
                 )
-              ) AND s.profile_hash=?
+              )
                 AND s.score>=? AND p.eligibility_status='eligible'
               ORDER BY CASE WHEN f.interest IS NULL THEN 0 ELSE 1 END,
                 CASE f.interest WHEN 'interested' THEN 0 WHEN 'not_interested' THEN 1 ELSE 0 END,
-                s.score DESC,p.published DESC,p.identity ASC""", (run_id,profile_hash,threshold))
+                s.score DESC,p.published DESC,p.identity ASC""", (run_id,threshold))
             if not freshness["is_today"]:
                 papers = []
             history_papers, history_runs, history_incomplete = recommendations_on(db, selected_day, timezone)
@@ -521,9 +520,7 @@ def create_app(config_path: Path) -> FastAPI:
         if sort not in {"score_desc","score_asc","date_desc","date_asc","title_asc"}: sort="score_desc"
         db=connect(db_path)
         try:
-            active=row(db,"SELECT profile_hash FROM profile_versions WHERE status='active'") or {"profile_hash":""}
-            latest="""SELECT * FROM (SELECT s.*,ROW_NUMBER() OVER(PARTITION BY s.identity ORDER BY s.screened_at DESC,s.rowid DESC) rn
-              FROM screenings s WHERE s.provider='codex-agent' AND s.profile_hash=?) WHERE rn=1"""
+            latest=latest_scores_sql()
             query=f"""SELECT p.*,s.score,s.relevant,s.reasons,s.confidence,s.themes_json,
               s.reasoning_json,s.score_dimensions_json,s.rubric_version,
               f.interest,f.reason AS feedback_reason,
@@ -534,10 +531,10 @@ def create_app(config_path: Path) -> FastAPI:
               FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}
               ORDER BY {order_by},p.identity ASC LIMIT ? OFFSET ?"""
-            paper_rows=rows(db,query,tuple([active["profile_hash"]]+parameters+[limit,offset]))
+            paper_rows=rows(db,query,tuple(parameters+[limit,offset]))
             count=row(db,f"""SELECT COUNT(*) count FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}""",
-              tuple([active["profile_hash"]]+parameters))["count"]
+              tuple(parameters))["count"]
             base_params={"q":q,"interest":interest,"reading":reading,"favorite":favorite,"sort":sort}
             previous_query=urllib.parse.urlencode({**base_params,"page_no":page_no-1})
             next_query=urllib.parse.urlencode({**base_params,"page_no":page_no+1})
@@ -779,7 +776,8 @@ def create_app(config_path: Path) -> FastAPI:
             message=f"已添加《{result['title']}》，将在下次更新中自动评分"
             status_code=201
         elif result["abstract_updated"]:
-            message=f"文献已存在；已补充摘要并安排重新评分：《{result['title']}》"
+            next_step="将在下次更新中首次评分" if result["queued_for_screening"] else "已有评分保留"
+            message=f"文献已存在；已补充摘要，{next_step}：《{result['title']}》"
             status_code=200
         else:
             message=f"文献已存在，未创建重复条目：《{result['title']}》"
@@ -796,9 +794,8 @@ def create_app(config_path: Path) -> FastAPI:
             )
         except ValueError as exc:
             return JSONResponse({"error":str(exc)},status_code=400)
-        return JSONResponse({
-            "ok":True,"message":f"已补充《{result['title']}》的摘要，并安排重新评分",**result,
-        })
+        next_step="将在下次更新中首次评分" if result["queued_for_screening"] else "已有评分保留"
+        return JSONResponse({"ok":True,"message":f"已补充《{result['title']}》的摘要，{next_step}",**result})
 
     @app.post("/fulltext")
     async def upload_fulltext(request: Request) -> RedirectResponse:
@@ -849,10 +846,7 @@ def create_app(config_path: Path) -> FastAPI:
             }]
             checks=[check for check in all_checks if not check["ok"]]
             missing_abstracts=int(verification["governance"]["missing_abstracts"])
-            pending_semantic=next((check for check in checks if check["name"] == "semantic_coverage"), None)
-            rescreen_count=int(db.execute(
-                "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1"
-            ).fetchone()[0])
+            pending_count=screening_coverage(db)["pending"]
             situations=[]
             if missing_abstracts:
                 situations.append(f"正式文献库仍缺 {missing_abstracts} 篇摘要")
@@ -860,10 +854,8 @@ def create_app(config_path: Path) -> FastAPI:
                 situations.append("部分监测来源尚未成功更新")
             else:
                 situations.append("所有已配置来源都有运行记录")
-            if rescreen_count:
-                situations.append(f"有 {rescreen_count} 篇论文待按新量表重新判断")
-            elif pending_semantic and not pending_semantic["ok"]:
-                situations.append("有论文尚未完成相关性判断")
+            if pending_count:
+                situations.append(f"有 {pending_count} 篇新文献待首次判断")
             else:
                 situations.append("现有可筛选论文均已完成相关性判断")
             update_summary="当前："+"；".join(situations)+"。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
@@ -883,7 +875,7 @@ def create_app(config_path: Path) -> FastAPI:
                 f"5. 运行：python3 {monitor_runner_path(state)} collect-only --config {config_path}。记录返回的 run_id；这一步只执行所有来源的 14 天 API 采集。",
                 f"6. 运行：academic-radar official plan --config {config_path} --output {state / 'official' / 'plan-latest.json'}。按计划逐个打开出版商官网，只核验截至计划日期已经出版的最近两期；未来卷期不能占用两期名额。逐篇复制官网明确标注的完整原始摘要，按 DOI 去重，再用 official import 先预览、后 --apply 原子导入。已成功核验的相同卷期可以跳过；官网无法访问或尚无适配时保留 14 天 API 结果并报告来源。",
                 f"7. 再运行摘要补全，并执行 academic-radar profile review --db {db_path}。只有发现未审阅的新反馈时才提出完整画像建议并保存；没有必要修改时用 profile no-change 记录结论，不能静默改动已激活画像。",
-                f"8. 运行：python3 {monitor_runner_path(state)} agent-export --config {config_path} --no-collect --batch-run <第 5 步 run_id>。它会把本轮 API 与官网新增论文合并为同一份待判断清单。",
+                f"8. 运行：python3 {monitor_runner_path(state)} agent-export --config {config_path} --no-collect --batch-run <第 5 步 run_id>。仅导出从未由 Codex 判断过的新文献；已有判断不因画像、反馈、摘要或量表更新自动重评，不使用 --rescreen。",
                 f"9. 阅读 {state / 'agent_queue'} 中最新的 JSON 队列。逐篇按已激活研究兴趣和反馈判断；每篇必须恰好有一条结果。",
                 "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures。"
                 "按 evaluation_policy 为每篇提供 identity、reasoning（论文证据、画像关联、可迁移价值、局限）、"

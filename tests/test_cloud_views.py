@@ -133,6 +133,26 @@ class SharedCloudViewTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "snapshot transaction"):
             export_view_contexts(self.db, self.config, self.state)
 
+    def test_prior_profile_and_rubric_decisions_are_retained_without_daily_rework(self):
+        with self.db:
+            self.db.execute("UPDATE screenings SET profile_hash='old-profile',rubric_version='legacy'")
+            self.db.execute("UPDATE papers SET needs_rescreen=1")
+            self.db.execute("""INSERT INTO pipeline_runs(run_id,kind,status,started_at)
+                VALUES('saved-run','agent-export','succeeded','2026-10-03T00:00:00Z')""")
+            self.db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,created_at,imported_at)
+                VALUES('saved-run','old-profile','imported','2026-10-03T00:00:00Z','2026-10-03T00:00:00Z')""")
+        self.db.execute("BEGIN")
+        contexts = export_view_contexts(self.db, self.config, self.state)
+        self.assertEqual(contexts["library"]["total"], 1)
+        self.assertEqual(contexts["today"]["latest_job"]["run_id"], "saved-run")
+        self.assertEqual(contexts["today"]["freshness"]["last_import"], "2026-10-03 08:00")
+        status = contexts["status"]
+        coverage = next(item for item in status["all_checks"] if item["name"] == "semantic_coverage")
+        self.assertTrue(coverage["ok"])
+        self.assertEqual(status["pending_screening"], 0)
+        self.assertNotIn("待按新量表重新判断", status["update_summary"])
+        self.assertIn("仅导出从未由 Codex 判断过的新文献", status["update_prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

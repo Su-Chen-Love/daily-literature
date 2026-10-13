@@ -23,7 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from .governance import governance_stats
 from .official import resolve_official_source
-from .product import DEFAULT_STATE_DIR, initialize_installation, overall_quality
+from .product import DEFAULT_STATE_DIR, initialize_installation, overall_quality, screening_coverage
 from .storage import connect, database_status, latest_schema_version, migrate_state, upgrade_database
 
 
@@ -68,14 +68,13 @@ def install_sync_service(config_path: Path, interval: int = 300) -> dict[str, An
 def recommendation_freshness(database: Any, timezone: str = "Asia/Shanghai") -> dict[str, Any]:
     """Distinguish a completed import from collection and from historical results."""
     latest = database.execute("""SELECT imported_at FROM agent_jobs
-        WHERE status='imported' AND profile_hash=(
-          SELECT profile_hash FROM profile_versions WHERE status='active')
+        WHERE status='imported'
         ORDER BY imported_at DESC LIMIT 1""").fetchone()
     now = dt.datetime.now(ZoneInfo(timezone))
     imported = None
     if latest and latest["imported_at"]:
         try:
-            imported = dt.datetime.fromisoformat(latest["imported_at"])
+            imported = dt.datetime.fromisoformat(latest["imported_at"].replace("Z", "+00:00"))
             if imported.tzinfo is None:
                 imported = imported.replace(tzinfo=dt.timezone.utc)
             imported = imported.astimezone(now.tzinfo)
@@ -308,34 +307,13 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             "完成今日 collect-only、官网核验和 agent-import；本地定时任务需要电脑开机且 Codex 保持运行",
         )
 
-        eligible_count = int(database.execute(
-            "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible'"
-        ).fetchone()[0])
-        screened_count = int(
-            database.execute(
-                """SELECT COUNT(DISTINCT identity) FROM screenings
-                WHERE provider='codex-agent' AND profile_hash=(
-                  SELECT profile_hash FROM profile_versions WHERE status='active'
-                ) AND identity IN (SELECT identity FROM papers WHERE eligibility_status='eligible')"""
-            ).fetchone()[0]
-        )
-        rescreen_count = int(database.execute(
-            "SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1"
-        ).fetchone()[0])
-        from .recommendations import SCREENING_RUBRIC_VERSION
-        current_rubric_count = int(database.execute("""SELECT COUNT(*) FROM (
-          SELECT identity,rubric_version,ROW_NUMBER() OVER(PARTITION BY identity ORDER BY screened_at DESC,rowid DESC) rank
-          FROM screenings WHERE provider='codex-agent'
-          AND profile_hash=(SELECT profile_hash FROM profile_versions WHERE status='active'))
-          WHERE rank=1 AND rubric_version=? AND identity IN (SELECT identity FROM papers WHERE eligibility_status='eligible')""",
-          (SCREENING_RUBRIC_VERSION,)).fetchone()[0])
-        semantic_ok = (eligible_count == current_rubric_count and rescreen_count == 0) or eligible_count == 0
+        coverage = screening_coverage(database)
         check(
             "semantic_coverage",
-            semantic_ok,
-            f"可筛选论文={eligible_count}；已判断={screened_count}；当前标准={current_rubric_count}；待重评={rescreen_count}；旧标准/未判={eligible_count-current_rubric_count}",
+            coverage["pending"] == 0,
+            f"可筛选论文={coverage['eligible']}；已判断={coverage['judged']}；待首次判断={coverage['pending']}；已有判断保留",
             "warning",
-            "运行 agent-export --no-collect/agent-import 补齐未判断或待重评论文",
+            "运行 agent-export --no-collect/agent-import，仅判断从未评分的新文献；不自动重评已有判断",
         )
         quality = governance_stats(db_path, float(config.get("relevance_threshold", 0.70)))
         abstract_ok = quality["abstract_percent"] >= 70 or quality["visible"] == 0

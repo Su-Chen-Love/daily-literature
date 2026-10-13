@@ -19,7 +19,8 @@ from typing import Any
 from .governance import latest_scores_sql
 from .official import resolve_official_source
 from .operations import recommendation_freshness
-from .recommendations import SCREENING_RUBRIC_VERSION, local_today, recommendation_days
+from .product import screening_coverage
+from .recommendations import local_today, recommendation_days
 from .storage import latest_schema_version
 
 
@@ -253,14 +254,11 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     job = _row(db, "SELECT run_id,status FROM agent_jobs ORDER BY created_at DESC LIMIT 1")
     check("latest_semantic_job", bool(job) and job["status"] == "imported", f"最近任务状态={job['status'] if job else '尚未运行'}", action="完成待判断队列并原子导入")
     check("recommendation_freshness", not freshness["overdue"] and not freshness["pending_collection"], "最近完整更新：" + freshness["last_import"] + ("；存在尚未完成评分导入的采集" if freshness["pending_collection"] else ""), action="执行今日完整更新；本地定时任务需要电脑开机且 Codex 运行")
-    pending = int(db.execute("SELECT COUNT(*) FROM papers WHERE eligibility_status='eligible' AND needs_rescreen=1").fetchone()[0])
-    current = int(db.execute("""SELECT COUNT(*) FROM (SELECT identity,rubric_version,
-      ROW_NUMBER() OVER(PARTITION BY identity ORDER BY screened_at DESC,rowid DESC) rank FROM screenings
-      WHERE provider='codex-agent' AND profile_hash=(SELECT profile_hash FROM profile_versions WHERE status='active'))
-      WHERE rank=1 AND rubric_version=? AND identity IN(SELECT identity FROM papers WHERE eligibility_status='eligible')""", (SCREENING_RUBRIC_VERSION,)).fetchone()[0])
-    eligible = quality["eligible"]
-    check("semantic_coverage", (eligible == current and pending == 0) or eligible == 0,
-          f"可筛选论文={eligible}；当前标准={current}；待重评={pending}；旧标准/未判={eligible-current}", action="判断并导入所有未评分或待重评论文")
+    coverage = screening_coverage(db)
+    pending = coverage["pending"]
+    check("semantic_coverage", pending == 0,
+          f"可筛选论文={coverage['eligible']}；已判断={coverage['judged']}；待首次判断={pending}；已有判断保留",
+          action="仅判断从未评分的新文献；不自动重评已有判断")
     check("abstract_coverage", quality["abstract_percent"] >= 70 or quality["visible"] == 0,
           f"{quality['abstract_percent']}%（{quality['abstracts']}/{quality['visible']}）", action="补全可追溯的原始摘要")
     needed = sorted((item for item in checks if not item["ok"]), key=lambda item: ({"error": 0, "warning": 1}.get(item["level"], 2), item["name"]))
@@ -268,20 +266,20 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     if quality["missing_abstracts"]:
         situations.append(f"正式文献库仍缺 {quality['missing_abstracts']} 篇摘要")
     situations.append("部分监测来源尚未成功更新" if any(not item["ok"] and item["name"].startswith(("source_", "official_issue_")) for item in checks) else "所有已配置来源都有运行记录")
-    situations.append(f"有 {pending} 篇论文待按新量表重新判断" if pending else ("有论文尚未完成相关性判断" if current < eligible else "现有可筛选论文均已完成相关性判断"))
+    situations.append(f"有 {pending} 篇新文献待首次判断" if pending else "现有可筛选论文均已完成相关性判断")
     summary = "当前：" + "；".join(situations) + "。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
     # A portable task is actionable from either page without publishing machine paths.
     prompt = "\n\n".join([
         "请更新个人学术助手。使用本项目已配置的本地数据库和已确认研究兴趣，不使用独立模型 API。",
         "当前诊断：" + "；".join(situations) + "。",
         "先同步并合并云端反馈；采集所有已配置来源最近14天数据，核验已出版的最新两期，补全可追溯的原始摘要。官网或接口失败时保留已有数据并说明真实限制。",
-        "结合完整研究兴趣与累计反馈检查画像是否需要建议；只有本人确认才能启用新画像。导出完整待判断队列，逐篇按当前标准判断并原子导入，每篇恰好一条结果。",
+        "结合完整研究兴趣与累计反馈检查画像是否需要建议；只有本人确认才能启用新画像。仅导出从未由 Codex 判断过的新文献，逐篇按当前标准判断并原子导入，每篇恰好一条结果。已有判断不因画像、反馈、摘要或量表更新自动重评；没有新文献时导入完整的空队列。",
         "推荐理由先讲清研究问题和动机，再说明作者做了什么，最后说明有证据支持的核心成果或价值。区分论文结果与拟议迁移，证据缺失必须明确，不推测未提供的结果。",
         "完成后运行安装与数据检查；有内容变化时同步云端，报告新增论文、补全摘要、推荐结果、来源失败及剩余待处理项。",
     ])
     return {"db_state": db_state, "quality": quality, "recommendation_quality": metrics,
             "checks": needed, "all_checks": checks, "healthy_count": len(checks) - len(needed),
-            "pending_rescreen": pending, "update_summary": summary, "update_prompt": prompt,
+            "pending_screening": pending, "update_summary": summary, "update_prompt": prompt,
             **_run_records(db)}
 
 
@@ -304,7 +302,7 @@ def export_view_contexts(db: sqlite3.Connection, config: dict, state: Path) -> d
     yesterday = local_today(timezone) - dt.timedelta(days=1)
     active = profile["active"]
     latest_job = _row(db, """SELECT run_id,profile_hash,status,exported_count,imported_count,created_at,imported_at
-      FROM agent_jobs WHERE status='imported' AND profile_hash=? ORDER BY imported_at DESC LIMIT 1""", (active["profile_hash"] if active else "",))
+      FROM agent_jobs WHERE status='imported' ORDER BY imported_at DESC LIMIT 1""")
     latest_run = _row(db, """SELECT run_id,kind,status,started_at,finished_at,collected_count,candidate_count,
       relevant_count FROM pipeline_runs WHERE run_id=?""", (latest_job["run_id"],)) if latest_job else None
     totals = _row(db, """SELECT COUNT(*) papers,

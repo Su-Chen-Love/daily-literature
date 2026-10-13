@@ -337,6 +337,10 @@ def add_manual_paper(db_path: Path, apa_citation: str, abstract: str) -> dict[st
                     break
         if existing:
             abstract_changed = not (existing["abstract"] or "").strip()
+            unjudged = db.execute(
+                "SELECT 1 FROM screenings WHERE identity=? AND provider='codex-agent' LIMIT 1",
+                (identity,),
+            ).fetchone() is None
             with db:
                 db.execute(
                     """UPDATE papers SET manual_citation=COALESCE(manual_citation,?),
@@ -359,7 +363,7 @@ def add_manual_paper(db_path: Path, apa_citation: str, abstract: str) -> dict[st
                 )
             return {
                 "identity": identity, "title": existing["title"], "created": False,
-                "abstract_updated": abstract_changed, "queued_for_screening": True,
+                "abstract_updated": abstract_changed, "queued_for_screening": unjudged,
             }
         decision = publication_decision(
             metadata["title"], metadata["venue"], metadata["publication_type_raw"], "manual-apa",
@@ -393,7 +397,7 @@ def add_manual_paper(db_path: Path, apa_citation: str, abstract: str) -> dict[st
 
 
 def add_manual_abstract(db_path: Path, identity: str, abstract: str, source_url: str = "") -> dict[str, Any]:
-    """Fill one missing abstract with user-verified evidence and queue re-screening."""
+    """Fill missing evidence without scheduling an already judged paper again."""
 
     abstract_text = re.sub(r"\s+", " ", abstract or "").strip()
     if len(abstract_text) < 80:
@@ -411,6 +415,10 @@ def add_manual_abstract(db_path: Path, identity: str, abstract: str, source_url:
             raise ValueError("没有找到这篇文献")
         if (paper["abstract"] or "").strip():
             raise ValueError("这篇文献已经有摘要，无需重复添加")
+        unjudged = db.execute(
+            "SELECT 1 FROM screenings WHERE identity=? AND provider='codex-agent' LIMIT 1",
+            (identity,),
+        ).fetchone() is None
         with db:
             db.execute(
                 """UPDATE papers SET abstract=?,abstract_source='user-provided',
@@ -425,7 +433,10 @@ def add_manual_abstract(db_path: Path, identity: str, abstract: str, source_url:
                 ) VALUES(?,?,'manual','found',?,'official_page_manual','用户核验并补充完整摘要',?)""",
                 ("manual-" + now, identity, url or paper["url"] or None, now),
             )
-        return {"identity": identity, "title": paper["title"], "needs_rescreen": True}
+        # Keep the evidence-change marker for explicit manual re-evaluation;
+        # automatic screening only consumes never-judged papers.
+        return {"identity": identity, "title": paper["title"], "needs_rescreen": True,
+                "queued_for_screening": unjudged}
     finally:
         db.close()
 
@@ -481,6 +492,16 @@ def overall_quality(db_path: Path) -> dict[str, Any]:
         }
     finally:
         db.close()
+
+
+def screening_coverage(db: Any) -> dict[str, int]:
+    """Count first judgments across all profiles and rubric versions."""
+    values = db.execute("""SELECT COUNT(*) eligible,
+        COALESCE(SUM(EXISTS(SELECT 1 FROM screenings s
+          WHERE s.identity=p.identity AND s.provider='codex-agent')),0) judged
+        FROM papers p WHERE p.eligibility_status='eligible'""").fetchone()
+    eligible, judged = int(values["eligible"]), int(values["judged"])
+    return {"eligible": eligible, "judged": judged, "pending": eligible - judged}
 
 
 def safe_slug(value: str, fallback: str = "paper") -> str:

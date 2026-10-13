@@ -75,6 +75,10 @@ python scripts/paper_monitor.py agent-import \
   --results ~/.local/share/personal-academic-radar/agent-results/<results.json>
 ```
 
+每日默认只判断从未有过 Codex 判断记录的合格论文，包括尚未判断的采集积压；已判断的论文无论原评分高低、采用何种画像或标准，都不重复进入每日队列。更新画像、偏好反馈或摘要只影响后续新论文的判断，不自动重评旧论文。默认 `120` 是单次队列的数量上限，不是每日任务量：不足时按实际数量处理，没有候选时正常完成空队列，不用旧论文凑数；超出部分留待后续处理，`agent-export --limit` 可调整上限。
+
+只有用户明确要求重新判断旧论文时，才在该次手动 `agent-export` 中使用 `--rescreen`；每日自动任务不得使用此参数，也不因旧标准、画像、反馈或摘要变化自行追加重评。
+
 官网卷期导入要求同一期中的研究论文具有完整官网摘要，Editorial 等非研究内容可无摘要并由治理规则排除。队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。我的文献只显示相关性分数大于或等于 0.70 的论文，低分记录留在内部用于去重和审计。
 
 确定性官网适配器会直接读取出版商的卷期目录与论文结构化元数据；尚需浏览器的出版商继续逐篇核验。受阻卷期使用 `academic-radar official fail` 留下可恢复的失败证据，并可用 `academic-radar official status` 查看，不会把不完整卷期伪装成成功。
@@ -90,7 +94,7 @@ academic-radar abstracts export-missing \
   --output missing-abstracts.json
 ```
 
-自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据；配置 `ELSEVIER_API_KEY` 后还会使用 Elsevier 官方元数据接口补全 ScienceDirect 论文。每次尝试都记录来源、URL、时间和失败原因；缺失项可在论文卡片中手动补充完整摘要，保存后会立即更新状态并安排重新评分。批量人工导入仍接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
+自动流程依次复用同 DOI 本地记录，并访问 Crossref、OpenAlex、Semantic Scholar、Europe PMC、PubMed 和出版商结构化元数据；配置 `ELSEVIER_API_KEY` 后还会使用 Elsevier 官方元数据接口补全 ScienceDirect 论文。每次尝试都记录来源、URL、时间和失败原因；缺失项可在论文卡片中手动补充完整摘要，保存后会立即更新资料。尚未判断的论文使用补全后的摘要进入每日队列；已判断论文保留原判断，只有用户明确要求时才重评。批量人工导入仍接受严格 JSON/CSV 证据包，并校验 identity、URL、重复项和明显截断内容。
 
 ## 清洗、备份与恢复
 
@@ -143,4 +147,4 @@ python scripts/paper_monitor.py backfill-history --config ~/.local/share/persona
 
 ### 最新推荐标准
 
-新队列使用 evidence-v3/schema 5，逐篇保存可核验的原摘要引用，区分核心相关、具体方法借鉴、邻近背景和范围外。高分必须说明精确机制，方法借鉴封顶 0.84，邻近背景低于推荐阈值。旧判断按可恢复的完整批次重评，默认每批 120；历史推荐快照保持原貌。`agent-export --limit` 可调整批量，`verify` 明确报告旧标准剩余量。
+新队列使用 evidence-v3/schema 5，逐篇保存可核验的原摘要引用，区分核心相关、具体方法借鉴、邻近背景和范围外。高分必须说明精确机制，方法借鉴封顶 0.84，邻近背景低于推荐阈值。新标准用于尚未判断的论文；旧标准记录保留原判断，不作为每日必须迁移的任务。历史推荐快照保持原貌，用户明确要求的手动重评也不会覆盖过去的推荐。

@@ -153,6 +153,38 @@ class OperationsTests(unittest.TestCase):
             self.assertEqual(checks["latest_semantic_job"]["level"], "warning")
             self.assertTrue(result["recommendations"])
 
+    def test_verify_counts_prior_decisions_and_only_flags_first_judgments(self):
+        with tempfile.TemporaryDirectory() as td, \
+             patch("academic_radar.operations.web_service_status", side_effect=self.stopped_service):
+            root = Path(td)
+            result = setup_installation(root, install_service=False)
+            path = root / "papers.sqlite3"
+            with connect(path) as db:
+                for identity in ("old", "new"):
+                    db.execute("""INSERT INTO papers(identity,title,abstract,venue,published,url,authors_json,
+                        first_seen,updated_at,eligibility_status,needs_rescreen)
+                        VALUES(?,?,'An abstract','Journal','','','[]','now','now','eligible',1)""", (identity, identity))
+                db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,reasons,
+                    screened_at,rubric_version) VALUES('old','former-profile','codex-agent','host',1,.8,'Saved decision','2020-01-01','old-rubric')""")
+                db.execute("""INSERT INTO screenings(identity,profile_hash,provider,model,relevant,score,reasons,
+                    screened_at) VALUES('new','former-profile','external','external',1,.9,'External decision','2026-01-01')""")
+                db.execute("""INSERT INTO pipeline_runs(run_id,kind,status,started_at)
+                    VALUES('old-run','agent-export','succeeded','2020-01-01')""")
+                db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,created_at,imported_at)
+                    VALUES('old-run','former-profile','imported','2020-01-01','2020-01-01T00:00:00Z')""")
+                self.assertEqual(recommendation_freshness(db)["last_import"], "2020-01-01 08:00")
+            check = next(item for item in verify_installation(Path(result["config"]))["checks"]
+                         if item["name"] == "semantic_coverage")
+            self.assertFalse(check["ok"])
+            self.assertIn("已判断=1；待首次判断=1", check["detail"])
+            with connect(path) as db:
+                db.execute("DELETE FROM screenings WHERE identity='new'")
+                db.execute("DELETE FROM papers WHERE identity='new'")
+            check = next(item for item in verify_installation(Path(result["config"]))["checks"]
+                         if item["name"] == "semantic_coverage")
+            self.assertTrue(check["ok"])
+            self.assertIn("已有判断保留", check["detail"])
+
     def test_verify_surfaces_official_issue_coverage_and_latest_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); config=root/"config.toml"; profile=root/"research-profile.md"

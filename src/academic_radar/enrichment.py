@@ -707,7 +707,7 @@ def enrich_abstracts(
             "unresolved": len(unresolved),
             "provider_found": provider_found,
             "unresolved_items": unresolved,
-            "requires_rescreen": updated,
+            "evidence_updated": updated,
         }
         status = "succeeded" if not unresolved else ("partial" if updated or type_updated else "failed")
         if budget_exhausted:
