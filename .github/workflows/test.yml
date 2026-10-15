@@ -31,5 +31,5 @@ jobs:
           node-version: "24"
       - run: npm ci
         working-directory: sites
-      - run: npm run build && npm run validate && node scripts/test-worker.mjs && node scripts/test-cloud-state.mjs && node scripts/test-mcp.mjs
+      - run: npm run build && npm run validate && node scripts/test-worker.mjs && node scripts/test-cloud-state.mjs && node scripts/test-mcp.mjs && node scripts/test-mcp-sdk.mjs
         working-directory: sites

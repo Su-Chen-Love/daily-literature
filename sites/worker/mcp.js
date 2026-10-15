@@ -25,7 +25,7 @@ const definitions=[
  ['read_feedback','Read up to 500 ordered feedback events after a durable cursor, including cleared feedback.',object({after:integer}),true],
  ['read_profile_events','Read up to 100 ordered research-profile and screening-preference edits after a durable cursor.',object({after:integer}),true],
  ['read_profile','Read the current research profile and screening preferences, including pending edits.',object(),true],
- ['stage_snapshot','Stage bounded, checksum-validated display records. Finish validates without publishing or acknowledging edits.',{oneOf:[
+ ['stage_snapshot','Stage bounded, checksum-validated display records. Finish validates without publishing or acknowledging edits.',{type:'object',properties:{action:{type:'string',enum:['begin','chunk','finish']},data:{type:'object'}},required:['action','data'],oneOf:[
   object({action:{const:'begin'},data:object({generation:hash,count:{type:'integer',minimum:1,maximum:100000},manifest:{type:'array',maxItems:100000,items:manifest}},['generation','count'])}),
   object({action:{const:'chunk'},data:object({generation:hash,records:{type:'array',minItems:1,maxItems:40,items:row}})}),
   object({action:{const:'finish'},data:object({generation:hash,activate:{const:false}},['generation'])}),
@@ -78,7 +78,12 @@ export async function handleMcp(request,env,handlers){
  }
  if(message.method==='ping')return success({});
  if(message.method==='tools/list'){
-  if(message.params!==undefined&&(!matches(object(),message.params)))return error(id,-32602,'Unexpected tool-list parameters');
+  // RequestParams._meta is a standard MCP extension field, including during
+  // discovery. It is ignored, never used as identity or application input.
+  const p=message.params;
+  if(p!==undefined&&(!p||typeof p!=='object'||Array.isArray(p)||Object.keys(p).some(key=>!['_meta','cursor'].includes(key))
+   ||Object.hasOwn(p,'_meta')&&(!p._meta||typeof p._meta!=='object'||Array.isArray(p._meta))
+   ||Object.hasOwn(p,'cursor')&&p.cursor!==''))return error(id,-32602,'Unexpected tool-list parameters');
   return success({tools});
  }
  if(message.method!=='tools/call')return error(id,-32601,'Method not found',404);
