@@ -27,8 +27,11 @@ VERSION = "0.11.0"
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python 3.9/3.10 compatibility without dependencies
-    tomllib = None
+except ModuleNotFoundError:  # Python 3.9/3.10 use the declared compatibility dependency.
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:  # Preserve simple standalone configurations without dependencies.
+        tomllib = None
 
 def _toml_value(raw: str) -> Any:
     raw = raw.strip()

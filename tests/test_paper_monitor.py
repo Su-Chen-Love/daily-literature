@@ -399,6 +399,25 @@ class MonitorTests(unittest.TestCase):
         out=pm._toml_load_fallback(text)
         self.assertEqual(out["s"]["n"],3); self.assertEqual(out["sources"][0]["name"],"A")
 
+    def test_python39_uses_tomli_for_portable_inline_configuration(self):
+        # Exercise the Python 3.9 import branch even on a newer test interpreter.
+        parser = pm.tomllib
+        self.assertIsNotNone(parser, "The installed package needs a complete TOML parser")
+        name = "paper_monitor_without_stdlib_toml"
+        spec = importlib.util.spec_from_file_location(name, SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"tomllib": None, "tomli": parser, name: module}):
+            spec.loader.exec_module(module)
+            self.assertIs(module.tomllib, parser)
+            with tempfile.TemporaryDirectory() as td:
+                config = Path(td) / "config.toml"
+                config.write_text('state_dir = "."\nprofile_file = "research-profile.md"\n'
+                                  'display = { "rows_per_page" = 25 }\n'
+                                  'sources = [{ name = "Synthetic", type = "crossref" }]\n')
+                loaded = module.config_load(config)
+                self.assertEqual(loaded["display"]["rows_per_page"], 25)
+                self.assertEqual(loaded["sources"][0]["name"], "Synthetic")
+
     def test_import_preserves_review_needed_when_feedback_or_evidence_changed_after_export(self):
         for change, expected in [("feedback", 1), ("late_feedback", 1), ("abstract", 1), ("reading", 0)]:
             with self.subTest(change=change), tempfile.TemporaryDirectory() as td:
