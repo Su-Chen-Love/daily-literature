@@ -35,7 +35,11 @@ The implementation is `academic_radar.library_checkpoint`.
 
 There is no generic bootstrap bypass. A first migration must pass through a normal prepared/imported run (an empty queue is valid when appropriate), stage its view and save its committing/library journal. Proof is checked before packaging and again during retained-archive verification or restore.
 
-This adapter is not automatically wired into `cloud_runtime.commit`. A host workflow must explicitly supply these callbacks and connect staging, checkpoint creation, publication and subsequent acknowledgement.
+This adapter is not automatically wired into `cloud_runtime.commit`. The
+[bounded native host runner](native-host-runner.md) connects staging, checkpoint
+creation, publication, recovery and subsequent acknowledgement through explicit
+JSON-lines callbacks. A real approved host must still invoke the native tools;
+the runner does not supply connector authorization or live acceptance.
 
 ## Host callback contract
 

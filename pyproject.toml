@@ -23,6 +23,7 @@ test = ["httpx>=0.27,<1", "httpx2>=2,<3"]
 
 [project.scripts]
 academic-radar = "academic_radar.cli:main"
+academic-radar-native-host = "academic_radar.native_host:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

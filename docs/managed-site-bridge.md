@@ -45,7 +45,10 @@ acceptance. No raw bearer token is needed by this adapter.
 
 Set `cloud_sync.transport = "managed"` to make cloud preparation refuse to run
 without the approved host bridge. `cloud_runtime.prepare(..., sync_client=site)`
-works with the managed bridge; the CLI cannot inject a host callback by itself.
+works with the managed bridge. The bounded [native host runner](native-host-runner.md)
+can exchange fixed JSON-lines requests with an approved tool host; it cannot
+invoke or authorize a connector by itself. The legacy CLI still cannot inject
+a host callback on its own.
 `cloud_runtime.commit` remains the R2 transport commit path. It can take this
 bridge for its small sync/ACK calls, but must not be mistaken for the separate
 Library publication protocol. Do not pass a Library head to an R2 commit.
