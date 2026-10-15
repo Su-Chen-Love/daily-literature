@@ -61,6 +61,41 @@ def _json_object(value: Any) -> dict:
     return result if isinstance(result, dict) else {}
 
 
+def history_artifact_availability(db: sqlite3.Connection) -> dict:
+    """Count inert historical references without exporting private provenance.
+
+    This is a read-only display summary, not permission to open/restore a path.
+    Checkpoint validation separately restricts these markers to terminal history.
+    """
+    archived: set[str] = set()
+    backups: set[str] = set()
+
+    def visit(value: Any, *, backup: bool = False) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, backup=backup or key == "backup_path")
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, backup=backup)
+        elif isinstance(value, str) and re.fullmatch(r"archive://[0-9a-f]{64}", value):
+            archived.add(value)
+            if backup:
+                backups.add(value)
+
+    for table, fields in (
+        ("agent_jobs", ("queue_path", "results_path")),
+        ("pipeline_runs", ("details_json",)),
+        ("cleanup_audits", ("backup_path", "report_path", "before_json", "after_json")),
+    ):
+        # These are fixed schema identifiers, never request-supplied SQL.
+        for values in db.execute("SELECT " + ",".join(fields) + " FROM " + table):
+            for field, value in zip(fields, values):
+                if field.endswith("_json"):
+                    value = _json_object(value)
+                visit(value, backup=field == "backup_path")
+    return {"unavailable_files": len(archived), "local_restore_backups": len(backups)}
+
+
 def _quality(db: sqlite3.Connection, threshold: float) -> tuple[dict, dict]:
     """The same recommendation and feedback metrics used by the local views."""
     counts = {row["eligibility_status"]: row["n"] for row in db.execute(
@@ -278,6 +313,7 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
         "完成后运行安装与数据检查；有内容变化时同步云端，报告新增论文、补全摘要、推荐结果、来源失败及剩余待处理项。",
     ])
     return {"db_state": db_state, "quality": quality, "recommendation_quality": metrics,
+            "history_artifacts": history_artifact_availability(db),
             "checks": needed, "all_checks": checks, "healthy_count": len(checks) - len(needed),
             "pending_screening": pending, "update_summary": summary, "update_prompt": prompt,
             **_run_records(db)}

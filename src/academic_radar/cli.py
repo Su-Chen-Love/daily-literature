@@ -198,12 +198,67 @@ def parser() -> argparse.ArgumentParser:
     cleanup_apply.add_argument("--report", required=True, type=Path)
     sync = groups.add_parser("sync", help="synchronize the opted-in Sites database")
     sync.add_argument("--config", required=True, type=Path)
+    cloud = groups.add_parser("cloud", help="checkpointed cloud host-agent pipeline (no scheduler or model API)")
+    cloud_commands = cloud.add_subparsers(dest="command", required=True)
+    for name in ("prepare", "import", "status", "commit"):
+        command = cloud_commands.add_parser(name)
+        command.add_argument("--config", required=True, type=Path)
+        command.add_argument("--operation", required=True)
+        if name == "prepare":
+            command.add_argument("--head-file", type=Path, help="head captured before restoring this workspace")
+            command.add_argument("--no-collect", action="store_true", help="synthetic validation only; do not fetch new papers")
+            command.add_argument("--limit", type=int)
+        elif name == "import":
+            command.add_argument("--results", required=True, type=Path)
+        elif name == "commit":
+            command.add_argument("--checkpoint", required=True, type=Path, help="new checkpoint directory outside state")
+    checkpoint = cloud_commands.add_parser("checkpoint")
+    checkpoint.add_argument("--config", required=True, type=Path)
+    checkpoint.add_argument("--output", required=True, type=Path)
+    checkpoint.add_argument("--reference-policy", type=Path,
+                            help="explicit exact-path relocation or terminal-history archive policy JSON")
+    inventory = cloud_commands.add_parser("inventory", help="read-only path reference and usage inventory")
+    inventory.add_argument("--state", required=True, type=Path)
+    restore_cloud = cloud_commands.add_parser("restore")
+    restore_cloud.add_argument("--checkpoint", required=True, type=Path)
+    restore_cloud.add_argument("--destination", required=True, type=Path)
+    head = cloud_commands.add_parser("head")
+    head.add_argument("--config", required=True, type=Path)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.group == "cloud":
+            from . import cloud_runtime
+            if args.command == "prepare":
+                expected = json.loads(args.head_file.read_text()) if args.head_file else None
+                result = cloud_runtime.prepare(args.config, args.operation, no_collect=args.no_collect,
+                                               limit=args.limit, expected_head=expected)
+            elif args.command == "import":
+                result = cloud_runtime.import_results(args.config, args.operation, args.results)
+            elif args.command == "status":
+                result = cloud_runtime.status(args.config, args.operation)
+            elif args.command == "commit":
+                result = cloud_runtime.commit(args.config, args.operation, args.checkpoint)
+            elif args.command == "head":
+                from .checkpoint_transport import from_config
+                result = from_config(args.config).get_head()
+            elif args.command == "checkpoint":
+                from .checkpoints import create_checkpoint
+                config = load_config(args.config)
+                policy = json.loads(args.reference_policy.read_text(encoding="utf-8")) if args.reference_policy else None
+                result = create_checkpoint(resolve_state(args.config, config), args.output,
+                                           config_path=args.config, reference_policy=policy)
+            elif args.command == "inventory":
+                from .checkpoints import inventory_references
+                result = inventory_references(args.state)
+            else:
+                from .checkpoints import restore_checkpoint
+                result = restore_checkpoint(args.checkpoint, args.destination)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.group == "sync":
             from .cloud_sync import sync_configured
             result = sync_configured(args.config)

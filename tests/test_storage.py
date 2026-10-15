@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -30,6 +31,29 @@ class StorageTests(unittest.TestCase):
               ) VALUES('doi:10.1/x','10.1/x','A research paper','Journal','now','now','journal-article','crossref')""")
         db.close()
         return path
+
+    def test_archived_pending_cleanup_cannot_apply_or_restore(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = self.cleanup_fixture(root)
+            preview = preview_cleanup(db_path, root, 0.70)
+            marker = "archive://" + "a" * 64
+            db = sqlite3.connect(db_path)
+            with db:
+                db.execute("UPDATE cleanup_audits SET backup_path=?", (marker,))
+            before = db.execute("SELECT * FROM papers").fetchall()
+            # Even a report retaining a real backup cannot bypass the disabled
+            # authoritative audit. No backup validation/write is attempted.
+            with patch("academic_radar.governance._verified_cleanup_backup", side_effect=AssertionError("opened backup")):
+                with self.assertRaisesRegex(ValueError, "原存档"):
+                    apply_cleanup_preview(db_path, root, Path(preview["report_path"]))
+            self.assertEqual(db.execute("SELECT * FROM papers").fetchall(), before)
+            self.assertEqual(db.execute("SELECT status FROM cleanup_audits").fetchone()[0], "preview")
+            db.close()
+            with self.assertRaisesRegex(ValueError, "Archived backup"):
+                restore_database(Path(marker), db_path, replace=True)
+            with self.assertRaisesRegex(ValueError, "原存档"):
+                apply_cleanup_preview(db_path, root, Path(marker))
 
     def test_cleanup_rejects_changed_paper_and_preserves_feedback(self):
         with tempfile.TemporaryDirectory() as td:

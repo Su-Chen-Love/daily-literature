@@ -13,3 +13,10 @@ export const cloudFeedback = sqliteTable("cloud_feedback", {
   interest: text("interest"), reason: text("reason"), favorite: integer("favorite").notNull(),
   readingStatus: text("reading_status").notNull(), updatedAt: text("updated_at").notNull(),
 });
+export const cloudProfileEvents = sqliteTable("cloud_profile_events", {
+  seq: integer("seq").primaryKey(), baseVersion: integer("base_version").notNull(),
+  baseGeneration: text("base_generation").notNull(), baseProfileHash: text("base_profile_hash").notNull(),
+  basePreferences: text("base_preferences").notNull(), profileHash: text("profile_hash").notNull(),
+  content: text("content").notNull(), screeningPreferences: text("screening_preferences").notNull(),
+  summary: text("summary").notNull(), updatedAt: text("updated_at").notNull(),
+});

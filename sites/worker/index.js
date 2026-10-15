@@ -1,30 +1,47 @@
 import {render,staticAsset} from './render.js';
+import {handleCloudState,streamCheckpointFile,readLibraryHead,commitLibraryHead} from './cloud-state.js';
+import {handleMcp} from './mcp.js';
+import {eventPage} from './events.js';
+import {isOwner,profileState,profileEvents,profileHistory,saveProfile} from './profile.js';
 const h={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'};
 const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{...h,'Content-Type':'application/json; charset=utf-8'}});
 const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
 const hash=async text=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)))).map(n=>n.toString(16).padStart(2,'0')).join('');
-const owner=()=>true;
+const owner=(r,e)=>isOwner(r,e)||e.SITE_ACCESS==='public-legacy';
 async function pointer(db,key){return (await db.prepare('SELECT value FROM pointers WHERE key=?').bind(key).first())?.value;}
-async function syncState(db){const request_id=Number(await pointer(db,'sync_request')||0),acknowledged_request_id=Number(await pointer(db,'sync_request_ack')||0),cursor=Number((await db.prepare('SELECT MAX(seq) seq FROM cloud_feedback').first())?.seq||0),acknowledged_cursor=Number(await pointer(db,'sync_cursor_ack')||0);return {request_id,acknowledged_request_id,cursor,acknowledged_cursor,pending:request_id>acknowledged_request_id||cursor>acknowledged_cursor,synced_at:await pointer(db,'synced_at'),active_generation:await active(db)};}
-async function requestSync(r,e,u){if(r.headers.get('Origin')!==u.origin)fail('请求来源无效',403);await e.DB.prepare("INSERT INTO pointers(key,value) VALUES('sync_request','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").run();return json({...(await syncState(e.DB)),message:'同步请求已保存；本地在线时会在下一次检查中完成（最多约五分钟）。'});}
-async function body(r){if(!(r.headers.get('content-type')||'').includes('application/json'))fail('需要 JSON 请求',415);const t=await r.text();if(t.length>2000000)fail('请求过大',413);try{return JSON.parse(t);}catch{fail('JSON 格式无效');}}
+async function syncState(db){const request_id=Number(await pointer(db,'sync_request')||0),acknowledged_request_id=Number(await pointer(db,'sync_request_ack')||0),cursor=Number((await db.prepare('SELECT MAX(seq) seq FROM cloud_feedback').first())?.seq||0),acknowledged_cursor=Number(await pointer(db,'sync_cursor_ack')||0);const profile_cursor=Number((await db.prepare('SELECT MAX(seq) seq FROM cloud_profile_events').first())?.seq||0),acknowledged_profile_cursor=Number(await pointer(db,'sync_profile_cursor_ack')||0);return {profile_events_version:1,profile_cursor,acknowledged_profile_cursor,request_id,acknowledged_request_id,cursor,acknowledged_cursor,pending:request_id>acknowledged_request_id||cursor>acknowledged_cursor||profile_cursor>acknowledged_profile_cursor,synced_at:await pointer(db,'synced_at'),active_generation:await active(db)};}
+async function requestSync(r,e,u){if(r.headers.get('Origin')!==u.origin)fail('请求来源无效',403);await e.DB.prepare("INSERT INTO pointers(key,value) VALUES('sync_request','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)").run();return json({...(await syncState(e.DB)),message:'同步请求已保存；云端任务会在下次运行时处理。'});}
+async function boundedText(r){const reader=r.body?.getReader();if(!reader)return '';const chunks=[];let size=0;try{while(true){const part=await reader.read();if(part.done)break;size+=part.value.byteLength;if(size>2000000){await reader.cancel();fail('请求过大',413);}chunks.push(part.value);}}finally{reader.releaseLock();}const bytes=new Uint8Array(size);let offset=0;for(const part of chunks){bytes.set(part,offset);offset+=part.byteLength;}try{return new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch{fail('请求编码无效');}}
+async function body(r){if((r.headers.get('content-type')||'').split(';')[0].trim()!=='application/json')fail('需要 JSON 请求',415);const t=await boundedText(r);try{return JSON.parse(t);}catch{fail('JSON 格式无效');}}
 const gid=v=>{if(!/^[a-f0-9]{64}$/.test(v||''))fail('快照编号无效');return v;};
 async function active(db){return(await db.prepare("SELECT value FROM pointers WHERE key='active'").first())?.value;}
 async function record(db,g,k,key){const r=await db.prepare('SELECT data FROM records WHERE generation=? AND kind=? AND key=?').bind(g,k,key).first();return r?JSON.parse(r.data):null;}
 async function all(db,g,k){return(await db.prepare('SELECT data FROM records WHERE generation=? AND kind=? ORDER BY key').bind(g,k).all()).results.map(r=>JSON.parse(r.data));}
 async function feedback(db,g){const m=new Map((await all(db,g,'feedback')).map(r=>[r.identity,r]));for(const r of(await db.prepare('SELECT * FROM cloud_feedback ORDER BY seq').all()).results){const p=m.get(r.identity);if(!p||Date.parse(r.updated_at)>Date.parse(p.updated_at))m.set(r.identity,r);}return m;}
+async function requireSyncAuth(r,e){const token=r.headers.get('Authorization');if(!e.SYNC_TOKEN||!token?.startsWith('Bearer ')||await hash(token.slice(7))!==await hash(e.SYNC_TOKEN))fail('同步凭据无效',401);}
 async function sync(r,e,u){
- if(!e.SYNC_TOKEN||await hash(r.headers.get('Authorization')?.replace(/^Bearer /,'')||'')!==await hash(e.SYNC_TOKEN))fail('同步凭据无效',401);
+ await requireSyncAuth(r,e);
  const db=e.DB;
- if(u.pathname==='/api/sync/feedback'&&r.method==='GET'){const n=Number(u.searchParams.get('after')||0);if(!Number.isSafeInteger(n)||n<0)fail('游标无效');const a=(await db.prepare('SELECT * FROM cloud_feedback WHERE seq>? ORDER BY seq LIMIT 500').bind(n).all()).results;return json({...await syncState(db),events:a,cursor:a.length?a.at(-1).seq:n,more:a.length===500});}
- if(r.method!=='POST')fail('不支持此方法',405);const d=await body(r),g=gid(d.generation);
- if(u.pathname==='/api/sync/ack'){
+ if(u.pathname==='/api/sync/profile'&&r.method==='GET')return json(await profileEvents(db,Number(u.searchParams.get('after')||0)));
+ if(u.pathname==='/api/sync/feedback'&&r.method==='GET'){const n=Number(u.searchParams.get('after')||0);if(!Number.isSafeInteger(n)||n<0)fail('游标无效');return json({...await syncState(db),...await eventPage(db,'cloud_feedback',n,500)});}
+ if(r.method!=='POST')fail('不支持此方法',405);return syncOperation(e,u.pathname,await body(r));
+}
+// Authentication belongs to each transport; this shared implementation never
+// constructs synthetic trusted identity headers or consumes host credentials.
+async function syncOperation(e,path,d){
+ const db=e.DB,g=gid(d.generation);
+ if(path==='/api/sync/ack'){
   const state=await syncState(db);if(state.active_generation!==g)fail('快照已更新，请重新检查',409);
   if(!Number.isSafeInteger(d.request_id)||d.request_id<0||d.request_id>state.request_id||!Number.isSafeInteger(d.cursor)||d.cursor<0||d.cursor>state.cursor)fail('确认游标无效');
-  await db.batch([db.prepare("INSERT INTO pointers(key,value) VALUES('sync_request_ack',?) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)").bind(String(d.request_id)),db.prepare("INSERT INTO pointers(key,value) VALUES('sync_cursor_ack',?) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)").bind(String(d.cursor))]);
-  const done=await syncState(db);return json({ok:true,acknowledged_request_id:done.acknowledged_request_id,acknowledged_cursor:done.acknowledged_cursor});
+  const profileCursor=d.profile_cursor??0;if(!Number.isSafeInteger(profileCursor)||profileCursor<0||profileCursor>state.profile_cursor)fail('画像确认游标无效');
+  const profileSnapshot=await record(db,g,'private','profile');if(profileCursor>Number(profileSnapshot?.profile_cursor||0))fail('画像尚未包含在已激活快照中',409);
+  const acknowledgements=await db.batch([
+   ['sync_profile_cursor_ack',profileCursor],['sync_request_ack',d.request_id],['sync_cursor_ack',d.cursor]
+  ].map(([key,value])=>db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE (SELECT value FROM pointers WHERE key='active')=? ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)").bind(key,String(value),g)));
+  if(!acknowledgements[0]?.meta?.changes)fail('快照已更新，请重新检查',409);
+  const done=await syncState(db);return json({ok:true,acknowledged_request_id:done.acknowledged_request_id,acknowledged_cursor:done.acknowledged_cursor,acknowledged_profile_cursor:done.acknowledged_profile_cursor});
  }
- if(u.pathname==='/api/sync/begin'){
+ if(path==='/api/sync/begin'){
   if(!Number.isSafeInteger(d.count)||d.count<1||d.count>100000)fail('记录数量无效');
   await db.prepare('INSERT INTO generations(id,count,created_at) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING').bind(g,d.count,new Date().toISOString()).run();
   const existing=await db.prepare('SELECT count,status FROM generations WHERE id=?').bind(g).first();if(existing.count!==d.count)fail('快照不一致',409);
@@ -43,17 +60,21 @@ async function sync(r,e,u){
   return json({generation:g,active:false});
  }
  const generation=await db.prepare('SELECT * FROM generations WHERE id=?').bind(g).first();if(!generation)fail('请先建立快照');
- if(u.pathname==='/api/sync/chunk'){
+ if(path==='/api/sync/chunk'){
   if(!Array.isArray(d.records)||!d.records.length||d.records.length>40)fail('批次无效');const statements=[];
   for(const row of d.records){if(!['paper','history','feedback','private','meta'].includes(row.kind)||typeof row.key!=='string'||row.key.length>1000||typeof row.data!=='string'||row.data.length>1000000)fail('快照记录无效');if(await hash(row.data)!==row.checksum)fail('记录校验失败');const p=JSON.parse(row.data);if(row.kind==='paper'&&p.identity!==row.key)fail('身份不一致');statements.push(db.prepare('INSERT INTO records(generation,kind,key,data,checksum) VALUES(?,?,?,?,?) ON CONFLICT(generation,kind,key) DO NOTHING').bind(g,row.kind,row.key,row.data,row.checksum));}
   if(generation.status==='staging')await db.batch(statements);return json({accepted:d.records.length});
  }
- if(u.pathname==='/api/sync/finish'){
+ if(path==='/api/sync/finish'){
   const rows=(await db.prepare('SELECT kind,key,checksum FROM records WHERE generation=? ORDER BY kind,key').bind(g).all()).results;
   if(rows.length!==generation.count||await hash(rows.map(r=>`${r.kind}:${r.key}:${r.checksum}`).join('\n'))!==g)fail('快照尚不完整，原数据仍可访问',409);
-  await db.batch([db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g),db.prepare("INSERT INTO pointers(key,value) VALUES('active',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(g),db.prepare("INSERT INTO pointers(key,value) VALUES('synced_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(new Date().toISOString())]);
-  const keep=(await db.prepare("SELECT id FROM generations WHERE status='complete' ORDER BY created_at DESC LIMIT 2").all()).results.map(r=>r.id);
-  for(const s of(await db.prepare("SELECT id FROM generations WHERE id<>? AND (status='complete' OR created_at<?)").bind(g,new Date(Date.now()-7*86400000).toISOString()).all()).results){if(keep.includes(s.id))continue;await db.batch([db.prepare('DELETE FROM records WHERE generation=?').bind(s.id),db.prepare('DELETE FROM generations WHERE id=?').bind(s.id)]);}
+  if(d.activate===false){await db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g).run();return json({generation:g,count:rows.length,staged:true});}
+  // Legacy publication cannot race the first cloud checkpoint commit. Both
+  // pointer updates test the fence inside the same D1 transaction.
+  const published=await db.batch([db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'active',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'synced_at',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(new Date().toISOString())]);
+  if(!published[1]?.meta?.changes)fail('云端主数据库已启用；请通过云端检查点提交发布',409);
+  // Immutable snapshots are retained. Garbage collection must be fenced by the
+  // checkpoint head and all in-flight commits, not a racy last-two heuristic.
   return json({generation:g,count:rows.length});
  }
  fail('同步操作不存在',404);
@@ -62,7 +83,7 @@ async function view(r,e,u){
  const db=e.DB,g=await active(db),own=owner(r,e);if(!g)return json({ready:false,owner:own,message:'数据库正在首次同步，请稍后刷新。'},503);
  const meta=await record(db,g,'meta','overview'),result={ready:true,owner:own,overview:meta,generation:g,synced_at:(await db.prepare("SELECT value FROM pointers WHERE key='synced_at'").first())?.value};
  const v=u.searchParams.get('view')||'today';
- if(v==='profile'){result.profile=await record(db,g,'private','profile');return json(result);}
+ if(v==='profile'){result.profile={...await record(db,g,'private','profile'),...await profileState(db,g)};result.profile_editable=isOwner(r,e);return json(result);}
  if(v==='sources'||v==='status'){if(!own)result.overview.sources=meta.sources.map(s=>({...s,health:{status:s.health?.status,last_success_at:s.health?.last_success_at}}));return json(result);}
  let papers=await all(db,g,'paper');
  if(v==='today'){const today=new Date().toLocaleDateString('en-CA',{timeZone:meta.timezone||'Asia/Shanghai'}),day=u.searchParams.get('day')||today;let history=await record(db,g,'history',day===today?'current':day);if(day===today&&history?.day!==today)history=null;const index=new Map(papers.map(p=>[p.identity,p]));result.day=day;result.batches=history?.batches||0;result.incomplete=history?.incomplete||false;papers=(history?.papers||[]).filter(p=>index.has(p.identity)).map(p=>({...index.get(p.identity),...p}));}
@@ -89,7 +110,7 @@ async function saveFeedback(r,e,u){
  await e.DB.prepare("INSERT INTO cloud_feedback(identity,interest,reason,favorite,reading_status,updated_at) SELECT ?,?,?,?,?,CASE WHEN MAX(julianday(updated_at))>=julianday(?) THEN strftime('%Y-%m-%dT%H:%M:%fZ',MAX(julianday(updated_at))+1.0/86400000) ELSE ? END FROM cloud_feedback WHERE identity=?").bind(d.identity,patch.interest,reason||null,patch.favorite,patch.reading_status,stamp,stamp,d.identity).run();
  if(form){const target=String(d.return_to||'/feedback');return new Response(null,{status:303,headers:{...h,Location:target.startsWith('/')&&!target.startsWith('//')?target:'/feedback'}});}
  const labels={interested:'已完成 · 感兴趣',not_interested:'已完成 · 不感兴趣'};
- return json({ok:true,saved:true,updated_at:stamp,interest:patch.interest,favorite:Boolean(patch.favorite),reading_status:patch.reading_status,status_label:labels[patch.interest]||'',message:'反馈已保存到云端；本地在线时自动同步。'});
+ return json({ok:true,saved:true,updated_at:stamp,interest:patch.interest,favorite:Boolean(patch.favorite),reading_status:patch.reading_status,status_label:labels[patch.interest]||'',message:'反馈已保存到云端，将用于后续推荐。'});
 }
 const binary=(a,b)=>a===b?0:a==null?-1:b==null?1:a<b?-1:1;
 const fold=s=>String(s||'').replace(/[A-Z]/g,c=>c.toLowerCase());
@@ -101,7 +122,8 @@ async function pageContext(r,e,u,page){
  const state=await syncState(db),f=await feedback(db,g),papers=await all(db,g,'paper');
  const merge=p=>{const saved=f.get(p.identity)||{};return {...p,...saved,feedback_reason:saved.reason||'',reasons:p.reasons,reading_status:saved.reading_status||'unread',favorite:saved.favorite||0};};
  const index=new Map(papers.map(p=>[p.identity,merge(p)]));
- const context={...base,site_mode:'cloud',state_path:'与本地数据库同步',cloud_url:u.origin,cloud_sync_status:{status:'succeeded',synced_at:state.synced_at},csrf_token:'same-origin-public',request:{url:{path:u.pathname,query:u.search.slice(1)}}};
+ const context={...base,site_mode:'cloud',state_path:'云端主数据库',cloud_url:u.origin,cloud_sync_status:{status:'succeeded',synced_at:state.synced_at},csrf_token:'same-origin-public',request:{url:{path:u.pathname,query:u.search.slice(1)}}};
+ if(page==='profile'){context.cloud_profile=await profileState(db,g);context.profile_editable=isOwner(r,e);context.cloud_profile_history=await profileHistory(db);context.profile_saved=u.searchParams.get('saved')==='1';}
  const sp=u.searchParams;
  if(page==='today'){
   const timezone=meta.timezone||'Asia/Shanghai',dateLabel=d=>d.toLocaleDateString('en-CA',{timeZone:timezone}),today=dateLabel(new Date()),current=await record(db,g,'history','current');
@@ -135,15 +157,53 @@ async function pageContext(r,e,u,page){
  return context;
 }
 export default {async fetch(r,e){const u=new URL(r.url);try{
+ if(u.pathname==='/mcp')return await handleMcp(r,e,{
+  read_run_status:async()=>{const state=await syncState(e.DB);return {...state,run:state.active_generation?await record(e.DB,state.active_generation,'meta','ui:status'):null};},
+  read_feedback:async({after})=>({...await syncState(e.DB),...await eventPage(e.DB,'cloud_feedback',after,500)}),
+  read_profile_events:async({after})=>profileEvents(e.DB,after),
+  read_profile:async()=>{const generation=await active(e.DB);if(!generation)fail('No active profile snapshot',503);return profileState(e.DB,generation);},
+  stage_snapshot:async({action,data})=>syncOperation(e,'/api/sync/'+action,action==='finish'?{...data,activate:false}:data),
+  acknowledge_snapshot:async({data})=>syncOperation(e,'/api/sync/ack',data),
+  read_checkpoint_head:async()=>readLibraryHead(e.DB),
+  commit_library_checkpoint:async({data})=>commitLibraryHead(e.DB,data),
+ });
  const asset=staticAsset(u.pathname);if(asset)return asset;
  if(u.pathname==='/healthz')return json({ok:!!e.DB,ready:!!(e.DB&&await active(e.DB))});
  if(!e.DB&&u.pathname.startsWith('/api/'))fail('云端数据库暂时不可用',503);
+ if(u.pathname.startsWith('/api/state/')){await requireSyncAuth(r,e);return await handleCloudState(r,e,u.pathname);}
+ if(e.SITE_ACCESS!=='public-legacy'&&(!u.pathname.startsWith('/api/sync/')||u.pathname==='/api/sync/status')&&!isOwner(r,e))fail('请使用站点所有者的 ChatGPT 账号登录',403);
+ if(u.pathname==='/api/profile'&&r.method==='POST'){if(!isOwner(r,e))fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好',403);return json(await saveProfile(r,e,u,await body(r)));}
+ if(u.pathname==='/profile/save'&&r.method==='POST'){
+  if(!isOwner(r,e))fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好',403);
+  if(r.headers.get('Origin')!==u.origin)fail('请求来源无效',403);
+  if((r.headers.get('content-type')||'').split(';')[0].trim()!=='application/x-www-form-urlencoded')fail('需要表单请求',415);
+  const raw=Object.fromEntries(new URLSearchParams(await boundedText(r))),data={base_version:Number(raw.base_version),generation:raw.generation,content:raw.content,summary:raw.summary,screening_preferences:{relevance_threshold:Number(raw.relevance_threshold),instructions:raw.instructions||''}};
+  try{await saveProfile(r,e,u,data);return new Response(null,{status:303,headers:{...h,Location:'/profile?saved=1'}});}
+  catch(error){if(!error.status)throw error;const context=await pageContext(r,e,u,'profile');context.profile_error=error.message;context.profile_submission=data;return new Response(render('profile',context),{status:error.status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});}
+ }
  if(u.pathname==='/api/sync'&&r.method==='POST')return await requestSync(r,e,u);
- if(u.pathname==='/api/sync/status'&&r.method==='GET'){const state=await syncState(e.DB);return json({...state,message:state.pending?'已保存更新，等待本地在线后同步。':'两端同步已完成；暂无待同步更新。'});}
+ if(u.pathname==='/api/sync/status'&&r.method==='GET'){const state=await syncState(e.DB);return json({...state,message:state.pending?'已保存更新，等待云端任务处理。':'云端数据已更新；暂无待处理更新。'});}
  if(u.pathname.startsWith('/api/sync/'))return await sync(r,e,u);
  if(u.pathname==='/api/view'&&r.method==='GET')return await view(r,e,u);
  if(['/api/feedback','/api/favorite','/feedback','/feedback/clear'].includes(u.pathname)&&r.method==='POST')return await saveFeedback(r,e,u);
- if(u.pathname==='/fulltext/file')return new Response(render('error',{page:'error',title:'全文保存在本地',message:'PDF 文件保存在本机，请在本地文献库打开这篇论文查看全文。',action:'云端可阅读原始摘要、推荐理由并保存反馈。',csrf_token:'same-origin-public',request:{url:{path:u.pathname,query:u.search.slice(1)}},site_mode:'cloud'}),{status:409,headers:{...h,'Content-Type':'text/html; charset=utf-8'}});
+ if(u.pathname==='/fulltext/file'){
+  if(!isOwner(r,e))fail('只有已登录的站点所有者可以查看全文 PDF',403);
+  if(!['GET','HEAD'].includes(r.method))fail('不支持此方法',405);
+  const generation=await active(e.DB);if(!generation)fail('数据库正在同步，请稍后刷新',503);
+  let id=u.searchParams.get('id');const identity=u.searchParams.get('identity');
+  if(identity){if(identity.length>1000)fail('论文编号无效');const paper=await record(e.DB,generation,'paper',identity);if(!paper?.fulltext_id)fail('全文 PDF 不存在',404);id=String(paper.fulltext_id);}
+  if(!/^[1-9][0-9]*$/.test(id||'')||!Number.isSafeInteger(Number(id)))fail('全文编号无效');
+  const file=await record(e.DB,generation,'private','fulltext:'+id);
+  if(!file||(identity&&file.identity!==identity))fail('全文 PDF 不存在',404);
+  if(typeof file.path!=='string'||!file.path.startsWith('payload/fulltexts/'))fail('全文文件索引无效',409);
+  const response=await streamCheckpointFile(e,file.path.slice('payload/'.length),file.sha256,file.size_bytes,generation);
+  const headers=new Headers(response.headers);let filename=String(file.filename||'paper.pdf').split(/[\\/]/).at(-1).replace(/[\u0000-\u001f\u007f]/g,'').slice(0,255)||'paper.pdf';
+  const encoded=encodeURIComponent(filename).replace(/[!'()*]/g,char=>'%'+char.charCodeAt(0).toString(16).toUpperCase());
+  headers.set('Content-Disposition',`inline; filename="paper.pdf"; filename*=UTF-8''${encoded}`);
+  headers.set('X-Frame-Options','DENY');headers.set('Referrer-Policy','no-referrer');
+  if(r.method==='HEAD'){await response.body?.cancel();return new Response(null,{headers});}
+  return new Response(response.body,{headers});
+ }
  if(r.method==='POST')fail('这项操作需要在本地站点执行；保存的反馈和阅读标记可在两端直接修改。',409);
  if(!['/','/library','/sources','/profile','/feedback','/status'].includes(u.pathname))fail('页面不存在',404);
  const name=u.pathname==='/'?'today':u.pathname.slice(1);

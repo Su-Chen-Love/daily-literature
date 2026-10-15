@@ -84,6 +84,21 @@ class WebTests(unittest.TestCase):
                 self.assertTrue(status["message"])
                 self.assertIs(status["pending"], False)
 
+    def test_status_explains_archived_history_without_old_paths_or_restore_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, db_path, _ = self.make_app(Path(td))
+            archived = "archive://" + "a" * 64
+            with connect(db_path) as db:
+                db.execute("""INSERT INTO cleanup_audits(audit_id,status,backup_path,report_path,before_json,created_at)
+                    VALUES('old-audit','applied',?,'/private/old-mac/audit.json','{}','2020-01-01')""", (archived,))
+            with TestClient(app) as client:
+                response = client.get("/status")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("历史附件存档", response.text)
+                self.assertIn("不能在此在线撤销旧操作", response.text)
+                self.assertNotIn(archived, response.text)
+                self.assertNotIn("/private/old-mac", response.text)
+
     def test_old_recommendations_are_history_and_not_today(self):
         with tempfile.TemporaryDirectory() as td:
             app, db_path, _ = self.make_app(Path(td))

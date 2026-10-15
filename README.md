@@ -148,3 +148,7 @@ python scripts/paper_monitor.py backfill-history --config ~/.local/share/persona
 ### 最新推荐标准
 
 新队列使用 evidence-v3/schema 5，逐篇保存可核验的原摘要引用，区分核心相关、具体方法借鉴、邻近背景和范围外。高分必须说明精确机制，方法借鉴封顶 0.84，邻近背景低于推荐阈值。新标准用于尚未判断的论文；旧标准记录保留原判断，不作为每日必须迁移的任务。历史推荐快照保持原貌，用户明确要求的手动重评也不会覆盖过去的推荐。
+
+## Cloud-primary migration candidate
+
+The optional checkpointed cloud runner, private chunk transport and owner-only profile editing are described in [the migration runbook](docs/cloud-migration-runbook.md). This code does not provision credentials, enable cloud scheduling, or cut over existing jobs. Complete the runbook acceptance gates before using it with personal production state.

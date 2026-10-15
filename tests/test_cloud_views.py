@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from academic_radar.cloud_views import export_view_contexts
+from academic_radar.cloud_views import export_view_contexts, history_artifact_availability
 from academic_radar.recommendations import SCREENING_RUBRIC_VERSION
 from academic_radar.storage import connect, upgrade_database
 
@@ -132,6 +132,26 @@ class SharedCloudViewTests(unittest.TestCase):
     def test_export_requires_a_caller_owned_transaction(self):
         with self.assertRaisesRegex(ValueError, "snapshot transaction"):
             export_view_contexts(self.db, self.config, self.state)
+
+    def test_archived_history_summary_is_readonly_and_hides_provenance(self):
+        queue = "archive://" + "a" * 64
+        backup = "archive://" + "b" * 64
+        with self.db:
+            self.db.execute("UPDATE pipeline_runs SET details_json=?",
+                            (json.dumps({"queue_path": queue, "nested": {"backup_path": backup},
+                                         "legacy_path": "/private/mac/archive.sqlite3"}),))
+            self.db.execute("""INSERT INTO agent_jobs(run_id,profile_hash,status,queue_path,created_at)
+                VALUES('api-run','old-profile','abandoned',?,'2026-10-01T00:00:00Z')""", (queue,))
+        self.db.execute("BEGIN")
+        self.db.execute("PRAGMA query_only=ON")
+        before = self.db.total_changes
+        summary = history_artifact_availability(self.db)
+        self.assertEqual(summary, {"unavailable_files": 2, "local_restore_backups": 1})
+        exported = export_view_contexts(self.db, self.config, self.state)
+        self.assertEqual(exported["status"]["history_artifacts"], summary)
+        self.assertEqual(self.db.total_changes, before)
+        for private in (queue, backup, "/private/mac/archive.sqlite3"):
+            self.assertNotIn(private, json.dumps(exported))
 
     def test_prior_profile_and_rubric_decisions_are_retained_without_daily_rework(self):
         with self.db:

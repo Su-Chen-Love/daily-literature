@@ -262,6 +262,8 @@ def backup_database(source: Path, output: Path) -> dict[str, object]:
 
 
 def restore_database(backup: Path, destination: Path, replace: bool = False) -> dict[str, object]:
+    if str(backup).startswith(("archive:", "state:")):
+        raise ValueError("Archived backup is unavailable; retrieve and verify it before an explicit restore")
     backup = backup.expanduser().resolve()
     destination = destination.expanduser().resolve()
     if backup == destination:

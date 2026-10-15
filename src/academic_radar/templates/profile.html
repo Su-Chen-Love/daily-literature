@@ -2,13 +2,21 @@
 {% block title %}研究兴趣 · 个人学术助手{% endblock %}
 {% block content %}
 <header class="page-head"><div><p class="kicker">RESEARCH INTERESTS · VERSIONED</p><h1>研究兴趣</h1><p>系统会根据你的兴趣反馈定期检查画像是否需要调整；只有你确认采用的版本才会影响后续推荐。</p></div>{% if active %}<span class="version-pill">当前 v{{ active.version_number }}</span>{% endif %}</header>
+{% if site_mode == 'cloud' %}
+<section class="panel">
+  {% if profile_saved %}<p role="status">已保存并确认。下一次云端任务会采用新的研究兴趣和筛选偏好。</p>{% endif %}
+  {% if profile_error %}<p role="alert">{{ profile_error }} 输入内容保留在下方，请先复制保存后再刷新核对。</p>{% endif %}
+  {% if cloud_profile.pending %}<p role="status">云端已保存新版本，等待下一次任务采用。已完成的评分不会自动重评。</p>{% endif %}
+  {% if not profile_editable %}<p>只有已登录的站点所有者可以修改。<a href="/signin-with-chatgpt">使用 ChatGPT 登录</a></p>{% endif %}
+</section>
+{% endif %}
 <section class="panel profile-recommendation">
   <div class="panel-head"><h2>推荐</h2><span>基于偏好反馈</span></div>
   {% set suggestion = profile_review.pending_suggestion %}
   {% if suggestion %}
     <div class="recommendation-callout"><div><span class="status draft">待你确认</span><h3>{{ suggestion.change_summary }}</h3><p>系统参考了 {{ suggestion.feedback_count }} 条新反馈，形成了一个画像建议。采用前可以先查看完整内容。</p></div>
       <details><summary>查看建议画像</summary><pre class="profile-preview">{{ suggestion.content }}</pre></details>
-      <div class="recommendation-actions"><form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button>采用这个建议</button></form><form method="post" action="/profile/dismiss"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button class="secondary">暂不采用</button></form></div>
+      {% if site_mode != 'cloud' %}<div class="recommendation-actions"><form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button>采用这个建议</button></form><form method="post" action="/profile/dismiss"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ suggestion.version_id }}"><button class="secondary">暂不采用</button></form></div>{% else %}<p class="muted">可将建议内容复制到下方编辑区，核对后保存确认。</p>{% endif %}
     </div>
   {% elif profile_review.needed %}
     <p class="muted">发现 {{ profile_review.feedback_count }} 条尚未分析的新反馈。下一次每日任务会判断是否需要更新画像。</p>
@@ -19,18 +27,35 @@
 </section>
 <div class="profile-layout">
   <section class="panel profile-editor"><div class="panel-head"><h2>当前画像</h2><span>已确认</span></div>
+    {% if site_mode == 'cloud' %}
+    {% set edit = profile_submission if profile_submission else cloud_profile %}
+    <form method="post" action="/profile/save">
+      <input type="hidden" name="base_version" value="{{ edit.base_version if profile_submission else cloud_profile.version }}">
+      <input type="hidden" name="generation" value="{{ edit.generation }}">
+      <label>研究兴趣<textarea name="content" rows="28" maxlength="100000" required {% if not profile_editable %}readonly{% endif %}>{{ edit.content }}</textarea></label>
+      <label>推荐阈值（0 到 1）<input type="number" name="relevance_threshold" min="0" max="1" step="0.01" required value="{{ edit.screening_preferences.relevance_threshold }}" {% if not profile_editable %}readonly{% endif %}></label>
+      <label>筛选偏好说明<textarea name="instructions" rows="6" maxlength="20000" {% if not profile_editable %}readonly{% endif %}>{{ edit.screening_preferences.instructions }}</textarea></label>
+      <p class="muted">仅用于后续新论文的筛选。此前已完成的评分与每日历史不会自动重评。</p>
+      {% if profile_editable %}
+      <label>本次修改说明<input name="summary" maxlength="1000" required value="{{ profile_submission.summary if profile_submission else '' }}" placeholder="例如：排除仅做通用可用性评估的论文"></label>
+      <button type="submit">确认并用于后续推荐</button>
+      {% endif %}
+    </form>
+    {% else %}
     <form method="post" action="/profile/draft">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <textarea name="content" rows="28">{{ active.content if active else '' }}</textarea>
       <label>本次修改说明<input name="summary" required placeholder="例如：排除仅做通用可用性评估的论文"></label>
       <button type="submit">保存为草稿</button>
     </form>
+    {% endif %}
   </section>
   <aside class="panel version-list"><div class="panel-head"><h2>版本记录</h2><span>{{ versions|length }} 个已采用版本</span></div>
+    {% if site_mode == 'cloud' %}{% for event in cloud_profile_history %}<article><div><strong>云端编辑 #{{ event.seq }}</strong></div><p>{{ event.summary }}</p><small>{{ event.updated_at|human_time }}</small></article>{% endfor %}{% endif %}
     {% for version in versions %}<article>
       <div><strong>v{{ version.version_number }}</strong><span class="status {{ version.status }}">{{ version.status|status_label }}</span></div>
       <p>{{ version.change_summary or '无修改说明' }}</p><small>{{ version.created_at|human_time }}</small>
-      {% if version.status != 'active' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">{% if version.status == 'draft' %}确认并启用{% else %}切换回{% endif %} v{{ version.version_number }}</button></form>{% endif %}
+      {% if version.status != 'active' and site_mode != 'cloud' %}<form method="post" action="/profile/confirm"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version_id" value="{{ version.id }}"><button class="secondary">{% if version.status == 'draft' %}确认并启用{% else %}切换回{% endif %} v{{ version.version_number }}</button></form>{% endif %}
     </article>{% endfor %}
   </aside>
 </div>

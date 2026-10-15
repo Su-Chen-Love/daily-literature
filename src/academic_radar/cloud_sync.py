@@ -18,9 +18,10 @@ from zoneinfo import ZoneInfo
 
 from .recommendations import local_today, recommendation_days, recommendations_on
 from .cloud_views import export_view_contexts
-from .storage import connect, utc_now
+from .storage import connect, utc_now, upgrade_database
 from .product import load_config, resolve_state
 from .governance import latest_scores_sql
+from .profile_sync import apply_remote_profiles, effective_config, reconcile_profile_file, screening_preferences
 
 
 def canonical(value: Any) -> str:
@@ -48,7 +49,7 @@ def _stamp(value: str) -> dt.datetime:
     return stamp.astimezone(dt.timezone.utc)
 
 
-def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: int) -> int:
+def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: int, *, authoritative: bool = False) -> int:
     """Commit a cursor and its events together; newer local edits win conflicts."""
     changed = 0
     if not isinstance(events, list) or type(cursor) is not int or cursor < 0:
@@ -61,11 +62,21 @@ def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: in
             raise ValueError("Cloud feedback cursor cannot move backwards")
         if not events and cursor == previous_cursor:
             return 0
+        sequence_cursor = previous_cursor
         for event in events:
             if not isinstance(event, dict):
                 raise ValueError("Invalid cloud feedback event")
             if "seq" in event and (type(event["seq"]) is not int or not 0 < event["seq"] <= cursor):
                 raise ValueError("Cloud feedback event sequence exceeds its cursor")
+            if authoritative:
+                sequence = event.get("seq")
+                if type(sequence) is not int or sequence <= 0:
+                    raise ValueError("Authoritative cloud feedback requires event sequences")
+                if sequence <= previous_cursor:
+                    continue
+                if sequence != sequence_cursor + 1:
+                    raise ValueError("Cloud feedback event sequence has a gap")
+                sequence_cursor = sequence
             identity = event["identity"]
             if not db.execute("SELECT 1 FROM papers WHERE identity=?", (identity,)).fetchone():
                 raise ValueError("Cloud feedback refers to an unknown paper; cursor was not advanced")
@@ -83,7 +94,7 @@ def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: in
                 raise ValueError("Invalid cloud feedback timestamp")
             remote_stamp = _stamp(stamp)
             previous = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
-            if previous and _stamp(previous["updated_at"]) >= remote_stamp:
+            if previous and not authoritative and _stamp(previous["updated_at"]) >= remote_stamp:
                 continue
             semantic = (previous["interest"] if previous else None) != event["interest"] or (previous["reason"] if previous else None) != reason
             values = (identity, event["interest"], reason, event["favorite"], event["reading_status"], stamp, stamp)
@@ -94,11 +105,14 @@ def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: in
                 db.execute("INSERT INTO feedback_events(identity,interest,reason,favorite,reading_status,created_at) VALUES(?,?,?,?,?,?)", values[:6])
                 db.execute("UPDATE papers SET needs_rescreen=1 WHERE identity=?", (identity,))
             changed += 1
+        if authoritative and sequence_cursor != cursor:
+            raise ValueError("Cloud feedback cursor skips unreceived events")
         db.execute("INSERT INTO meta(key,value) VALUES('cloud_feedback_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cursor),))
     return changed
 
 
 def snapshot_records(db_path: Path, config: dict) -> list[dict]:
+    config = effective_config(config, db_path)
     db = connect(db_path)
     records: list[dict] = []
     def append(kind: str, key: str, value: Any) -> None:
@@ -119,6 +133,28 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
             paper["abstract_source_url"] = public_source_url(paper["abstract_source_url"])
             paper["url"] = public_source_url(paper["url"])
             append("paper", paper["identity"], paper)
+        # References name only files in the committed checkpoint; the Site
+        # resolves these through its fenced head, never through executor paths.
+        if config.get("cloud_runtime", {}).get("role") in {"staging", "primary"}:
+            state = db_path.expanduser().resolve().parent
+            for fulltext in db.execute("SELECT id,identity,stored_path,sha256,size_bytes FROM fulltext_files ORDER BY id"):
+                path = Path(fulltext["stored_path"]).expanduser().resolve()
+                try:
+                    relative = path.relative_to(state)
+                except ValueError:
+                    raise ValueError("PDF must be relocated into the cloud state before publication") from None
+                if (not relative.parts or relative.parts[0] != "fulltexts" or
+                        len(relative.parts) < 2 or "\\" in relative.as_posix() or ":" in relative.as_posix()):
+                    raise ValueError("PDF checkpoint path is invalid")
+                if (not isinstance(fulltext["sha256"], str) or len(fulltext["sha256"]) != 64 or
+                        any(c not in "0123456789abcdef" for c in fulltext["sha256"]) or
+                        type(fulltext["size_bytes"]) is not int or not 0 < fulltext["size_bytes"] <= 50 * 1024 * 1024):
+                    raise ValueError("PDF checkpoint metadata is invalid")
+                append("private", "fulltext:" + str(fulltext["id"]), {
+                    "identity": fulltext["identity"], "path": "payload/" + relative.as_posix(),
+                    "sha256": fulltext["sha256"], "size_bytes": fulltext["size_bytes"],
+                    "filename": relative.name,
+                })
         timezone = config.get("timezone", "Asia/Shanghai")
         days = recommendation_days(db, timezone)
         for day in days:
@@ -137,9 +173,9 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
               s.themes_json,s.reasoning_json,s.score_dimensions_json,s.rubric_version FROM run_papers rp
               JOIN papers p ON p.identity=rp.identity JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id
               WHERE rp.run_id=? AND s.provider='codex-agent' AND p.eligibility_status='eligible'
-              AND s.score>=? AND (rp.role='selected' OR (rp.role='selected_new' AND NOT EXISTS(
+              AND (rp.role='selected' OR (rp.role='selected_new' AND NOT EXISTS(
                 SELECT 1 FROM run_papers chosen WHERE chosen.run_id=rp.run_id AND chosen.identity=rp.identity AND chosen.role='selected')))
-              ORDER BY p.identity""", (latest["run_id"], config.get("relevance_threshold", .70)))]
+              ORDER BY p.identity""", (latest["run_id"],))]
         append("history", "current", {"day": day.isoformat(), "papers": current, "batches": int(is_today), "incomplete": False})
         for feedback in db.execute("SELECT * FROM paper_feedback ORDER BY identity"):
             append("feedback", feedback["identity"], dict(feedback))
@@ -165,7 +201,11 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
                 except (ValueError, KeyError, TypeError, AttributeError):
                     pass
             sources.append(item)
-        append("private", "profile", dict(profile) if profile else {})
+        profile_state = dict(profile) if profile else {}
+        profile_cursor = db.execute("SELECT value FROM meta WHERE key='cloud_profile_cursor'").fetchone()
+        profile_state.update(profile_cursor=int(profile_cursor[0]) if profile_cursor else 0,
+                             screening_preferences=screening_preferences(db, config))
+        append("private", "profile", profile_state)
         totals = dict(db.execute("SELECT COUNT(*) total,SUM(eligibility_status='eligible') eligible,SUM(COALESCE(abstract,'')='') missing_abstracts FROM papers").fetchone())
         latest_import = db.execute("SELECT MAX(imported_at) t FROM agent_jobs WHERE status='imported'").fetchone()[0]
         append("meta", "overview", {"sources": sources, "counts": totals, "days": days, "timezone": timezone,
@@ -234,6 +274,27 @@ def request_json(endpoint: str, path: str, credentials: dict, data: dict | None 
 
 
 def sync_configured(config_path: Path) -> dict:
+    return _run_configured(config_path, "sync")
+
+
+def pull_configured(config_path: Path) -> dict:
+    """Drain owner edits into local state without publishing a snapshot or ACK."""
+    return _run_configured(config_path, "pull")
+
+
+def stage_configured(config_path: Path) -> dict:
+    """Upload a verified snapshot without activating it or acknowledging edits."""
+    return _run_configured(config_path, "stage")
+
+
+def acknowledge_configured(config_path: Path, generation: str, cursor: int,
+                           request_id: int, profile_cursor: int = 0) -> dict:
+    """ACK only after a separate checkpoint CAS has activated this generation."""
+    return _run_configured(config_path, "ack", {"generation": generation, "cursor": cursor,
+                           "request_id": request_id, "profile_cursor": profile_cursor})
+
+
+def _run_configured(config_path: Path, operation: str, acknowledgement: dict | None = None) -> dict:
     config = load_config(config_path)
     settings = config.get("cloud_sync", {})
     if not settings.get("enabled"):
@@ -253,9 +314,23 @@ def sync_configured(config_path: Path) -> dict:
         except BlockingIOError:
             return {"status": "busy"}
         try:
-            result = _synchronize(state / "papers.sqlite3", config, endpoint, credentials)
-            result["synced_at"] = utc_now()
-            _save_status(state, result)
+            if operation == "pull":
+                pulled = _pull_remote(state / "papers.sqlite3", config, endpoint, credentials)
+                return {"status": "pulled", "feedback_imported": pulled["pulled"],
+                        "profiles_imported": pulled["profiles_imported"], "cursor": pulled["cursor"],
+                        "profile_cursor": pulled["profile_cursor"], "request_id": pulled["request_id"]}
+            if operation == "ack":
+                result = request_json(endpoint, "/api/sync/ack", credentials, acknowledgement)
+                if (result.get("acknowledged_cursor", -1) < acknowledgement["cursor"]
+                    or result.get("acknowledged_request_id", -1) < acknowledgement["request_id"]
+                    or result.get("acknowledged_profile_cursor", -1) < acknowledgement["profile_cursor"]):
+                    raise ValueError("Cloud acknowledgement could not be confirmed")
+                return result
+            result = _synchronize(state / "papers.sqlite3", config, endpoint, credentials,
+                                  activate=operation != "stage")
+            if operation != "stage":
+                result["synced_at"] = utc_now()
+                _save_status(state, result)
             return result
         except Exception as error:
             _save_status(state, {"status": "failed", "checked_at": utc_now(), "error": type(error).__name__ + ": " + str(error)[:300]})
@@ -355,7 +430,9 @@ def _save_sync_meta(db_path: Path, values: dict[str, str | int]) -> None:
         db.close()
 
 
-def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) -> dict:
+def _pull_remote(db_path: Path, config: dict, endpoint: str, credentials: dict, *, request_fn=None) -> dict:
+    request = request_fn or request_json
+    upgrade_database(db_path)
     db = connect(db_path)
     pulled = 0
     remote_generation = None
@@ -363,16 +440,22 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
     request_id = None
     remote_acknowledged_request = None
     remote_acknowledged_cursor = None
+    remote_acknowledged_profile_cursor = None
+    profiles_imported = 0
+    profile_events_version = None
+    profile_cursor = 0
     try:
         saved = dict(db.execute("""SELECT key,value FROM meta WHERE key IN
           ('cloud_feedback_cursor','cloud_last_synced_generation',
-           'cloud_acknowledged_request_id','cloud_acknowledged_cursor')"""))
+           'cloud_acknowledged_request_id','cloud_acknowledged_cursor','cloud_profile_cursor')"""))
         cursor = int(saved.get("cloud_feedback_cursor", "0"))
+        profile_cursor = int(saved.get("cloud_profile_cursor", "0"))
         while True:
-            response = request_json(endpoint, f"/api/sync/feedback?after={cursor}", credentials)
+            response = request(endpoint, f"/api/sync/feedback?after={cursor}", credentials)
             if response.get("more") and (type(response.get("cursor")) is not int or response["cursor"] <= cursor):
                 raise ValueError("Cloud feedback pagination did not advance its cursor")
-            pulled += apply_remote_feedback(db, response["events"], response["cursor"])
+            pulled += apply_remote_feedback(db, response["events"], response["cursor"],
+                                            authoritative=config.get("cloud_runtime", {}).get("role") == "primary")
             cursor = response["cursor"]
             # The last page is the freshest view of the active snapshot. Older
             # servers omit these fields and retain begin/manifest negotiation.
@@ -383,22 +466,61 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
                     raise ValueError("Invalid cloud synchronization acknowledgement state")
             remote_acknowledged_request = response.get("acknowledged_request_id")
             remote_acknowledged_cursor = response.get("acknowledged_cursor")
+            profile_events_version = response.get("profile_events_version")
+            remote_acknowledged_profile_cursor = response.get("acknowledged_profile_cursor")
+            if remote_acknowledged_profile_cursor is not None and (type(remote_acknowledged_profile_cursor) is not int or remote_acknowledged_profile_cursor < 0):
+                raise ValueError("Invalid cloud profile acknowledgement")
             if "request_id" in response:
                 if type(response["request_id"]) is not int or response["request_id"] < 0:
                     raise ValueError("Invalid cloud synchronization request ID")
                 request_id = max(request_id or 0, response["request_id"])
             if not response.get("more"):
                 break
+        if profile_events_version == 1:
+            while True:
+                page = request(endpoint, f"/api/sync/profile?after={profile_cursor}", credentials)
+                if page.get("more") and (type(page.get("cursor")) is not int or page["cursor"] <= profile_cursor):
+                    raise ValueError("Cloud profile pagination did not advance its cursor")
+                profiles_imported += apply_remote_profiles(db, page["events"], page["cursor"], config)
+                profile_cursor = page["cursor"]
+                if not page.get("more"):
+                    break
+        elif profile_events_version is not None:
+            raise ValueError("Unsupported cloud profile event protocol")
     finally:
         db.close()
+    reconcile_profile_file(db_path, db_path.parent / config.get("profile_file", "research-profile.md"))
+    return {"saved": saved, "pulled": pulled, "profiles_imported": profiles_imported,
+            "cursor": cursor, "profile_cursor": profile_cursor, "request_id": request_id,
+            "remote_generation": remote_generation, "remote_synced_at": remote_synced_at,
+            "remote_acknowledged_request": remote_acknowledged_request,
+            "remote_acknowledged_cursor": remote_acknowledged_cursor,
+            "remote_acknowledged_profile_cursor": remote_acknowledged_profile_cursor,
+            "profile_events_version": profile_events_version}
+
+
+def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict, *, activate: bool = True, request_fn=None) -> dict:
+    request = request_fn or request_json
+    pulled_state = _pull_remote(db_path, config, endpoint, credentials, request_fn=request)
+    saved = pulled_state["saved"]
+    pulled, cursor, profile_cursor = pulled_state["pulled"], pulled_state["cursor"], pulled_state["profile_cursor"]
+    request_id = pulled_state["request_id"]
+    remote_generation, remote_synced_at = pulled_state["remote_generation"], pulled_state["remote_synced_at"]
+    remote_acknowledged_request = pulled_state["remote_acknowledged_request"]
+    remote_acknowledged_cursor = pulled_state["remote_acknowledged_cursor"]
+    remote_acknowledged_profile_cursor = pulled_state["remote_acknowledged_profile_cursor"]
     records = snapshot_records(db_path, config)
     fingerprint = "\n".join(f"{r['kind']}:{r['key']}:{r['checksum']}" for r in records)
     generation = hashlib.sha256(fingerprint.encode()).hexdigest()
-    base = {"generation": generation, "records": len(records), "feedback_imported": pulled}
+    base = {"generation": generation, "records": len(records), "feedback_imported": pulled,
+            "profiles_imported": pulled_state["profiles_imported"], "cursor": cursor,
+            "profile_cursor": profile_cursor, "request_id": request_id or 0}
     if isinstance(remote_synced_at, str):
         base["remote_synced_at"] = remote_synced_at
 
     def complete(result: dict) -> dict:
+        if not activate:
+            return {**result, "status": "staged"}
         # Record verified activation even when acknowledging a UI request
         # subsequently fails. The next run can retry that ACK without upload.
         if saved.get("cloud_last_synced_generation") != generation:
@@ -410,10 +532,12 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
                                 else int(saved.get("cloud_acknowledged_request_id", "0")))
         acknowledged_cursor = (remote_acknowledged_cursor if remote_acknowledged_cursor is not None
                                else int(saved.get("cloud_acknowledged_cursor", "0")))
-        if request_id is not None and (request_id > acknowledged_request or cursor > acknowledged_cursor):
-            acknowledged = request_json(endpoint, "/api/sync/ack", credentials,
+        if request_id is not None and (request_id > acknowledged_request or cursor > acknowledged_cursor
+                                       or profile_cursor > (remote_acknowledged_profile_cursor or 0)):
+            acknowledged = request(endpoint, "/api/sync/ack", credentials,
                                         {"request_id": request_id, "cursor": cursor,
-                                         "generation": generation})
+                                         "generation": generation, **({"profile_cursor": profile_cursor}
+                                         if pulled_state["profile_events_version"] == 1 else {})})
             if acknowledged.get("ok") is not True:
                 raise ValueError("Cloud synchronization acknowledgement could not be confirmed")
             _save_sync_meta(db_path, {"cloud_acknowledged_request_id": request_id,
@@ -424,7 +548,7 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
     if generation == saved.get("cloud_last_synced_generation") == remote_generation:
         return complete({"status": "unchanged", "uploaded_records": 0, **base})
     manifest = [{k: row[k] for k in ("kind", "key", "checksum")} for row in records]
-    opened = request_json(endpoint, "/api/sync/begin", credentials, {"generation": generation, "count": len(records), "manifest": manifest})
+    opened = request(endpoint, "/api/sync/begin", credentials, {"generation": generation, "count": len(records), "manifest": manifest})
     if opened.get("active"):
         return complete({"status": "unchanged", "uploaded_records": 0, **base})
     pending = records
@@ -438,13 +562,14 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
         if row_size > 1500000:
             raise ValueError("Cloud snapshot record exceeds the safe upload size")
         if chunk and (len(chunk) == 40 or size + row_size > 1500000):
-            request_json(endpoint, "/api/sync/chunk", credentials, {"generation": generation, "records": chunk})
+            request(endpoint, "/api/sync/chunk", credentials, {"generation": generation, "records": chunk})
             chunk, size = [], 0
         chunk.append(row)
         size += row_size
     if chunk:
-        request_json(endpoint, "/api/sync/chunk", credentials, {"generation": generation, "records": chunk})
-    completed = request_json(endpoint, "/api/sync/finish", credentials, {"generation": generation})
+        request(endpoint, "/api/sync/chunk", credentials, {"generation": generation, "records": chunk})
+    completed = request(endpoint, "/api/sync/finish", credentials,
+                             {"generation": generation, **({"activate": False} if not activate else {})})
     if completed.get("generation") != generation or completed.get("count") != len(records):
         raise ValueError("Cloud snapshot verification failed; remote activation could not be confirmed")
     return complete({"status": "succeeded", "uploaded_records": len(pending), **base})

@@ -438,11 +438,29 @@ def preview_cleanup(
 
 
 def apply_cleanup_preview(db_path: Path, state_dir: Path, report_path: Path) -> dict[str, Any]:
+    def require_available(value):
+        # pathlib collapses archive:// to archive:/; neither is a local file.
+        if str(value).startswith(("archive:", "state:")):
+            raise ValueError("历史清洗附件仅在原存档中；请先取回并校验备份，再重新生成预览")
+    require_available(report_path)
     report = json.loads(report_path.expanduser().read_text(encoding="utf-8"))
     if report.get("status") != "preview":
         raise ValueError("清洗报告不是可应用的预览")
     if report.get("snapshot_version") != 1 or not report.get("paper_fingerprint"):
         raise ValueError("清洗预览缺少快照校验，请重新生成预览")
+    require_available(report.get("database"))
+    require_available(report.get("backup"))
+    # An edited report cannot reactivate a deliberately disabled local-only
+    # preview. Check its authoritative audit before touching any backup file.
+    check = connect(db_path)
+    try:
+        existing = check.execute("SELECT backup_path,report_path FROM cleanup_audits WHERE audit_id=?",
+                                 (report.get("audit_id"),)).fetchone()
+        if existing:
+            require_available(existing["backup_path"])
+            require_available(existing["report_path"])
+    finally:
+        check.close()
     if Path(report["database"]).expanduser().resolve() != db_path.expanduser().resolve():
         raise ValueError("清洗预览属于其他数据库")
     backup = Path(report["backup"])
@@ -460,6 +478,7 @@ def apply_cleanup_preview(db_path: Path, state_dir: Path, report_path: Path) -> 
             ).fetchone()
             if not audit or audit["status"] != "preview":
                 raise ValueError("清洗预览不存在或已经应用，请重新生成预览")
+            require_available(audit["backup_path"])
             if Path(audit["backup_path"]).expanduser().resolve() != backup.expanduser().resolve():
                 raise ValueError("清洗预览与审计记录的备份不一致")
             reviews = report.get("publication_reviews", [])

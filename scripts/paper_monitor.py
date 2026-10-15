@@ -722,8 +722,11 @@ def collect_only(config_path: Path) -> int:
 
 
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
-                 batch_run: str | None=None, limit: int | None=None) -> int:
+                 batch_run: str | None=None, limit: int | None=None,
+                 operation_id: str | None=None) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
+    from academic_radar.profile_sync import effective_config
+    cfg=effective_config(cfg,state/"papers.sqlite3")
     profile_path=state/cfg["profile_file"]
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id=now.replace(":","-"); db=db_open(state/"papers.sqlite3")
     active=confirmed_profile(db,profile_path); phash=active["profile_hash"]
@@ -789,6 +792,8 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
              "feedback_examples":examples,"feedback_event_cursor":db.execute("SELECT COALESCE(MAX(id),0) FROM feedback_events").fetchone()[0],
              "threshold":float(cfg.get("relevance_threshold",0.70)),
+             "screening_instructions":str(cfg.get("screening_instructions", "")),
+             "screening_preferences_version":cfg.get("screening_preferences_version", 0),
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
              "total_candidates":total_candidates,"deferred_candidates":total_candidates-len(papers),
              "evaluation_policy":evaluation_policy()}
@@ -811,6 +816,9 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
           profile_version_id,feedback_snapshot_json
         ) VALUES(?,?,'exported',?,NULL,?,0,?,NULL,?,?)""",
         (run_id,phash,str(queue_path),len(papers),now,active["id"],json.dumps(examples,ensure_ascii=False)))
+        if operation_id is not None:
+            db.execute("INSERT INTO meta(key,value) VALUES(?,?)",
+                       ("cloud_runtime_export:" + operation_id, run_id))
         for paper in collected:
             db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'collected')",(run_id,paper.identity))
         for paper in new:
@@ -822,7 +830,7 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     db.close()
     print(json.dumps(summary,ensure_ascii=False,indent=2)); return 1 if required and failed_required==required else 0
 
-def agent_import(config_path: Path, results_path: Path) -> int:
+def agent_import(config_path: Path, results_path: Path, *, sync_after: bool=True) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); db=db_open(state/"papers.sqlite3")
     active=confirmed_profile(db,state/cfg["profile_file"]); phash=active["profile_hash"]
     data=json.loads(results_path.read_text(encoding="utf-8"))
@@ -852,7 +860,10 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     if received != expected:
         missing=sorted(expected-received); extra=sorted(received-expected)
         raise ValueError(f"Results must cover the complete queue (missing={len(missing)}, extra={len(extra)})")
-    threshold=float(cfg.get("relevance_threshold",0.70))
+    # Interpret a frozen judgment under the threshold it was exported with.
+    # Later Site edits affect the next queue, never reinterpret this one.
+    threshold=float(queue.get("threshold",cfg.get("relevance_threshold",0.70)))
+    if not 0 <= threshold <= 1: raise ValueError("Invalid frozen queue threshold")
     validated=[]; validation_errors=[]
     queue_schema_version=int(queue.get("schema_version", 1))
     for item in results:
@@ -925,6 +936,10 @@ def agent_import(config_path: Path, results_path: Path) -> int:
         raise
     db.close()
     summary={"run_id":run_id,"imported":imported,"relevant":len(selected),"digest_path":str(digest_path)}
+    if not sync_after:
+        summary["cloud_sync"]={"status":"deferred", "reason":"Awaiting durable cloud checkpoint commit"}
+        print(json.dumps(summary,ensure_ascii=False,indent=2))
+        return 0
     try:
         from academic_radar.cloud_sync import sync_configured
         summary["cloud_sync"]=sync_configured(config_path)

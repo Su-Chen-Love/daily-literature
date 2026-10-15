@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .cloud_sync import background_sync, background_sync_state
+from .cloud_views import history_artifact_availability
 from .engagement import (
     clear_feedback,
     confirm_profile,
@@ -887,6 +888,7 @@ def create_app(config_path: Path) -> FastAPI:
             ])
             return templates.TemplateResponse(request,"status.html",context(request,"status",
                 db_state=db_state,quality=verification["governance"],
+                history_artifacts=history_artifact_availability(db),
                 recommendation_quality=recommendation_feedback_metrics(
                     db_path,float(config.get("relevance_threshold",0.70))
                 ),checks=checks,healthy_count=len(all_checks)-len(checks),

@@ -8,6 +8,13 @@
       "when": 1791521337991,
       "tag": "0000_burly_tattoo",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792070247936,
+      "tag": "0001_nifty_warlock",
+      "breakpoints": true
     }
   ]
 }
