@@ -14,6 +14,11 @@ const kind={type:'string',enum:['paper','history','feedback','private','meta']};
 const key={type:'string',maxLength:1000};
 const manifest=object({kind,key,checksum:hash});
 const row=object({kind,key,checksum:hash,data:{type:'string',maxLength:1000000}});
+// Main-store operations have a closed action set and a second strict domain
+// validator at the boundary. No SQL, binding names or identity are accepted.
+const mainData={type:'object',properties:{},required:[],additionalProperties:true};
+const mainReadActions=['head','capacity','export_summary','read_manifest','query_rows','export_rows','query_files','export_files','summary','read_object','read_chunk','read_objects','read_chunks','read_object_chunks'];
+const mainWriteActions=['put_chunk','put_chunks','put_object','put_objects','verify_object','verify_objects','begin_import','import_rows','verify_import','commit_import','begin_operation','stage_operation','verify_operation','commit_staged_operation','commit_operations'];
 export const publicationSchema=object({
  operation_id:{type:'string',pattern:'^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$'},
  snapshot_generation:hash,archive_sha256:hash,archive_size:{type:'integer',minimum:1,maximum:16*1024**3},checkpoint_id:hash,
@@ -33,6 +38,15 @@ const definitions=[
  ['acknowledge_snapshot','Acknowledge consumed edits only against the currently published snapshot.',object({data:object({generation:hash,cursor:integer,request_id:integer,profile_cursor:integer},['generation','cursor','request_id'])}),false],
  ['read_checkpoint_head','Read the exact immutable Library checkpoint publication currently active on the Site.',object(),true],
  ['commit_library_checkpoint','After the host has created and verified an immutable Library archive, atomically publish its exact receipt and a complete staged display snapshot using compare-and-swap. Does not upload or verify Library bytes.',object({data:object({expected_head:head,publication:publicationSchema})}),false],
+ ['read_main_store','Read bounded, revision-pinned personal main-store rows, immutable objects, files or capacity measurements. No arbitrary SQL.',object({action:{type:'string',enum:mainReadActions},data:mainData}),true],
+ ['write_main_store','Stage and verify lossless personal main-store data, or atomically commit an idempotent revision with compare-and-swap. Retains prior revisions; does not activate the Site display.',object({action:{type:'string',enum:mainWriteActions},data:mainData}),false],
+ ['publish_main_snapshot','Preview or atomically publish a complete display generation bound to an exact committed main revision. Activation fences legacy writers and acknowledges only committed edit cursors.',object({data:object({operation_id:{type:'string',pattern:'^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$'},revision:integer,snapshot_generation:hash,expected_generation:{anyOf:[{type:'null'},hash]},expected_published_revision:integer,expected_writer_mode:{type:'string',enum:['local','d1-main']},activate:{type:'boolean'}})}),false],
+ ['read_site_backup','Capture a single pinned main/Site revision and export complete retained display generations and append-only edit streams, without secrets or writes.',{type:'object',properties:{action:{type:'string',enum:['begin','records','feedback','profiles','event_chunks']},data:mainData},required:['action','data'],oneOf:[
+  object({action:{const:'begin'},data:object()}),
+  object({action:{const:'records'},data:object({generation:hash,after:object({kind,key,offset:integer})},['generation'])}),
+  object({action:{type:'string',enum:['feedback','profiles']},data:object({after:integer,until:integer})}),
+  object({action:{const:'event_chunks'},data:object({stream:{type:'string',enum:['feedback','profiles']},seq:integer,offset:integer,until:integer})}),
+ ]},true],
 ];
 export const tools=definitions.map(([name,description,inputSchema,readOnlyHint])=>({name,description,inputSchema,annotations:{readOnlyHint,destructiveHint:false,idempotentHint:true,openWorldHint:false}}));
 // A small, deliberately closed validator for the schemas above. No executable
@@ -43,10 +57,11 @@ function matches(schema,value){
  if(Object.hasOwn(schema,'const'))return value===schema.const;
  if(schema.enum&&!schema.enum.includes(value))return false;
  if(schema.type==='null')return value===null;
+ if(schema.type==='boolean')return typeof value==='boolean';
  if(schema.type==='integer')return Number.isSafeInteger(value)&&value>=schema.minimum&&value<=schema.maximum;
  if(schema.type==='string')return typeof value==='string'&&value.length>=(schema.minLength??0)&&value.length<=(schema.maxLength??Infinity)&&(!schema.pattern||new RegExp(schema.pattern).test(value));
  if(schema.type==='array')return Array.isArray(value)&&value.length>=(schema.minItems??0)&&value.length<=(schema.maxItems??Infinity)&&value.every(item=>matches(schema.items,item));
- if(schema.type==='object')return !!value&&typeof value==='object'&&!Array.isArray(value)&&schema.required.every(key=>Object.hasOwn(value,key))&&Object.keys(value).every(key=>Object.hasOwn(schema.properties,key)&&matches(schema.properties[key],value[key]));
+ if(schema.type==='object')return !!value&&typeof value==='object'&&!Array.isArray(value)&&(schema.required||[]).every(key=>Object.hasOwn(value,key))&&Object.keys(value).every(key=>Object.hasOwn(schema.properties||{},key)?matches(schema.properties[key],value[key]):schema.additionalProperties===true);
  return false;
 }
 async function readJSON(request){

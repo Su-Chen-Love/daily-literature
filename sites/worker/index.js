@@ -2,6 +2,11 @@ import {render,staticAsset} from './render.js';
 import {handleCloudState,streamCheckpointFile,readLibraryHead,commitLibraryHead} from './cloud-state.js';
 import {handleMcp} from './mcp.js';
 import {eventPage} from './events.js';
+import {appendFeedback} from './feedback.js';
+import {mainStoreOperation} from './main-store.js';
+import {publishMainSnapshot} from './main-publication.js';
+import {siteBackup} from './site-backup.js';
+import {displayRecord,displayRecords} from './display-records.js';
 import {isOwner,profileState,profileEvents,profileHistory,saveProfile} from './profile.js';
 const h={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'};
 const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{...h,'Content-Type':'application/json; charset=utf-8'}});
@@ -15,8 +20,8 @@ async function boundedText(r){const reader=r.body?.getReader();if(!reader)return
 async function body(r){if((r.headers.get('content-type')||'').split(';')[0].trim()!=='application/json')fail('需要 JSON 请求',415);const t=await boundedText(r);try{return JSON.parse(t);}catch{fail('JSON 格式无效');}}
 const gid=v=>{if(!/^[a-f0-9]{64}$/.test(v||''))fail('快照编号无效');return v;};
 async function active(db){return(await db.prepare("SELECT value FROM pointers WHERE key='active'").first())?.value;}
-async function record(db,g,k,key){const r=await db.prepare('SELECT data FROM records WHERE generation=? AND kind=? AND key=?').bind(g,k,key).first();return r?JSON.parse(r.data):null;}
-async function all(db,g,k){return(await db.prepare('SELECT data FROM records WHERE generation=? AND kind=? ORDER BY key').bind(g,k).all()).results.map(r=>JSON.parse(r.data));}
+async function record(db,g,k,key){const r=await displayRecord(db,g,k,key);return r?JSON.parse(r.data):null;}
+async function all(db,g,k){return(await displayRecords(db,g,k)).map(r=>JSON.parse(r.data));}
 async function feedback(db,g){const m=new Map((await all(db,g,'feedback')).map(r=>[r.identity,r]));for(const r of(await db.prepare('SELECT * FROM cloud_feedback ORDER BY seq').all()).results){const p=m.get(r.identity);if(!p||Date.parse(r.updated_at)>Date.parse(p.updated_at))m.set(r.identity,r);}return m;}
 async function requireSyncAuth(r,e){const token=r.headers.get('Authorization');if(!e.SYNC_TOKEN||!token?.startsWith('Bearer ')||await hash(token.slice(7))!==await hash(e.SYNC_TOKEN))fail('同步凭据无效',401);}
 async function sync(r,e,u){
@@ -28,16 +33,17 @@ async function sync(r,e,u){
 }
 // Authentication belongs to each transport; this shared implementation never
 // constructs synthetic trusted identity headers or consumes host credentials.
-async function syncOperation(e,path,d){
+async function syncOperation(e,path,d,{deduplicate=false}={}){
  const db=e.DB,g=gid(d.generation);
  if(path==='/api/sync/ack'){
+  if(await pointer(db,'writer_mode')==='d1-main')fail('Main-store publication acknowledges edits atomically',409);
   const state=await syncState(db);if(state.active_generation!==g)fail('快照已更新，请重新检查',409);
   if(!Number.isSafeInteger(d.request_id)||d.request_id<0||d.request_id>state.request_id||!Number.isSafeInteger(d.cursor)||d.cursor<0||d.cursor>state.cursor)fail('确认游标无效');
   const profileCursor=d.profile_cursor??0;if(!Number.isSafeInteger(profileCursor)||profileCursor<0||profileCursor>state.profile_cursor)fail('画像确认游标无效');
   const profileSnapshot=await record(db,g,'private','profile');if(profileCursor>Number(profileSnapshot?.profile_cursor||0))fail('画像尚未包含在已激活快照中',409);
   const acknowledgements=await db.batch([
    ['sync_profile_cursor_ack',profileCursor],['sync_request_ack',d.request_id],['sync_cursor_ack',d.cursor]
-  ].map(([key,value])=>db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE (SELECT value FROM pointers WHERE key='active')=? ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)").bind(key,String(value),g)));
+  ].map(([key,value])=>db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE (SELECT value FROM pointers WHERE key='active')=? AND NOT EXISTS(SELECT 1 FROM pointers WHERE key='writer_mode' AND value='d1-main') ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)").bind(key,String(value),g)));
   if(!acknowledgements[0]?.meta?.changes)fail('快照已更新，请重新检查',409);
   const done=await syncState(db);return json({ok:true,acknowledged_request_id:done.acknowledged_request_id,acknowledged_cursor:done.acknowledged_cursor,acknowledged_profile_cursor:done.acknowledged_profile_cursor});
  }
@@ -45,15 +51,19 @@ async function syncOperation(e,path,d){
   if(!Number.isSafeInteger(d.count)||d.count<1||d.count>100000)fail('记录数量无效');
   await db.prepare('INSERT INTO generations(id,count,created_at) VALUES(?,?,?) ON CONFLICT(id) DO NOTHING').bind(g,d.count,new Date().toISOString()).run();
   const existing=await db.prepare('SELECT count,status FROM generations WHERE id=?').bind(g).first();if(existing.count!==d.count)fail('快照不一致',409);
+  if(deduplicate)await db.prepare("INSERT INTO display_generations(generation) SELECT ? WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND status='staging') ON CONFLICT DO NOTHING").bind(g,g).run();
   if(await active(db)===g)return json({generation:g,active:true});
   if(d.manifest){
    if(!Array.isArray(d.manifest)||d.manifest.length!==d.count)fail('快照清单无效');
    const keys=new Set();for(const m of d.manifest){if(!['paper','history','feedback','private','meta'].includes(m.kind)||typeof m.key!=='string'||m.key.length>1000||!/^[a-f0-9]{64}$/.test(m.checksum||''))fail('快照清单无效');const key=m.kind+':'+m.key;if(keys.has(key))fail('重复记录');keys.add(key);}
    const base=await active(db);
-   if(base&&existing.status==='staging')await db.prepare(`INSERT OR IGNORE INTO records(generation,kind,key,data,checksum)
-     SELECT ?,r.kind,r.key,r.data,r.checksum FROM json_each(?) m JOIN records r
+   if(base&&existing.status==='staging')await db.batch([
+    db.prepare(`INSERT INTO display_payloads(checksum,data) SELECT r.checksum,r.data FROM json_each(?) m JOIN records r ON r.generation=? AND r.kind=json_extract(m.value,'$.kind') AND r.key=json_extract(m.value,'$.key') AND r.checksum=json_extract(m.value,'$.checksum') WHERE r.data!='' AND EXISTS(SELECT 1 FROM display_generations WHERE generation=?) AND EXISTS(SELECT 1 FROM generations WHERE id=? AND status='staging') ON CONFLICT(checksum) DO NOTHING`).bind(JSON.stringify(d.manifest),base,g,g),
+    db.prepare(`INSERT OR IGNORE INTO records(generation,kind,key,data,checksum)
+     SELECT ?,r.kind,r.key,CASE WHEN EXISTS(SELECT 1 FROM display_generations WHERE generation=?) THEN '' ELSE COALESCE(NULLIF(r.data,''),p.data) END,r.checksum FROM json_each(?) m JOIN records r
      ON r.generation=? AND r.kind=json_extract(m.value,'$.kind') AND r.key=json_extract(m.value,'$.key')
-     AND r.checksum=json_extract(m.value,'$.checksum')`).bind(g,JSON.stringify(d.manifest),base).run();
+     AND r.checksum=json_extract(m.value,'$.checksum') LEFT JOIN display_payloads p ON p.checksum=r.checksum WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND status='staging')`).bind(g,g,JSON.stringify(d.manifest),base,g),
+   ]);
    const ready=new Set((await db.prepare('SELECT kind,key FROM records WHERE generation=?').bind(g).all()).results.map(r=>r.kind+':'+r.key));
    return json({generation:g,active:false,missing:d.manifest.filter(m=>!ready.has(m.kind+':'+m.key)).map(m=>({kind:m.kind,key:m.key}))});
   }
@@ -61,17 +71,35 @@ async function syncOperation(e,path,d){
  }
  const generation=await db.prepare('SELECT * FROM generations WHERE id=?').bind(g).first();if(!generation)fail('请先建立快照');
  if(path==='/api/sync/chunk'){
-  if(!Array.isArray(d.records)||!d.records.length||d.records.length>40)fail('批次无效');const statements=[];
-  for(const row of d.records){if(!['paper','history','feedback','private','meta'].includes(row.kind)||typeof row.key!=='string'||row.key.length>1000||typeof row.data!=='string'||row.data.length>1000000)fail('快照记录无效');if(await hash(row.data)!==row.checksum)fail('记录校验失败');const p=JSON.parse(row.data);if(row.kind==='paper'&&p.identity!==row.key)fail('身份不一致');statements.push(db.prepare('INSERT INTO records(generation,kind,key,data,checksum) VALUES(?,?,?,?,?) ON CONFLICT(generation,kind,key) DO NOTHING').bind(g,row.kind,row.key,row.data,row.checksum));}
-  if(generation.status==='staging')await db.batch(statements);return json({accepted:d.records.length});
+  if(!Array.isArray(d.records)||!d.records.length||d.records.length>40)fail('批次无效');const keys=new Set();
+  for(const row of d.records){if(!['paper','history','feedback','private','meta'].includes(row.kind)||typeof row.key!=='string'||row.key.length>1000||typeof row.data!=='string'||row.data.length>1000000)fail('快照记录无效');if(await hash(row.data)!==row.checksum)fail('记录校验失败');const p=JSON.parse(row.data);if(row.kind==='paper'&&p.identity!==row.key)fail('身份不一致');const key=row.kind+':'+row.key;if(keys.has(key))fail('重复记录');keys.add(key);}
+  if(generation.status==='staging'){const raw=JSON.stringify(d.records);await db.batch([
+   db.prepare("INSERT INTO display_payloads(checksum,data) SELECT json_extract(j.value,'$.checksum'),json_extract(j.value,'$.data') FROM json_each(?) j WHERE EXISTS(SELECT 1 FROM display_generations WHERE generation=?) AND EXISTS(SELECT 1 FROM generations WHERE id=? AND status='staging') ON CONFLICT(checksum) DO NOTHING").bind(raw,g,g),
+   db.prepare("INSERT INTO records(generation,kind,key,data,checksum) SELECT ?,json_extract(j.value,'$.kind'),json_extract(j.value,'$.key'),CASE WHEN EXISTS(SELECT 1 FROM display_generations WHERE generation=?) THEN '' ELSE json_extract(j.value,'$.data') END,json_extract(j.value,'$.checksum') FROM json_each(?) j WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND status='staging') AND (NOT EXISTS(SELECT 1 FROM display_generations WHERE generation=?) OR EXISTS(SELECT 1 FROM display_payloads p WHERE p.checksum=json_extract(j.value,'$.checksum') AND p.data=json_extract(j.value,'$.data'))) ON CONFLICT(generation,kind,key) DO NOTHING").bind(g,g,raw,g,g),
+  ]);}return json({accepted:d.records.length});
  }
  if(path==='/api/sync/finish'){
-  const rows=(await db.prepare('SELECT kind,key,checksum FROM records WHERE generation=? ORDER BY kind,key').bind(g).all()).results;
-  if(rows.length!==generation.count||await hash(rows.map(r=>`${r.kind}:${r.key}:${r.checksum}`).join('\n'))!==g)fail('快照尚不完整，原数据仍可访问',409);
-  if(d.activate===false){await db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g).run();return json({generation:g,count:rows.length,staged:true});}
+  // Seal before hashing. Every ingestion statement rechecks staging in SQL,
+  // so a delayed chunk cannot append to a verified immutable generation.
+  let seal=null;
+  if(generation.status!=='complete'){
+   const expired=generation.status.startsWith('verifying:')&&Date.now()-Number(generation.status.split(':')[1])>600000;
+   if(generation.status!=='staging'&&!expired)fail('快照正在校验，请稍后重试',409);
+   seal='verifying:'+Date.now()+':'+crypto.randomUUID();
+   const lock=await db.prepare('UPDATE generations SET status=? WHERE id=? AND status=?').bind(seal,g,generation.status).run();
+   if(!lock.meta?.changes)fail('快照校验状态已变化，请重试',409);
+  }
+  let rows;
+  try{
+   rows=(await db.prepare('SELECT kind,key,checksum FROM records WHERE generation=? ORDER BY kind,key').bind(g).all()).results;
+   if(await db.prepare("SELECT 1 missing FROM records r LEFT JOIN display_payloads p ON p.checksum=r.checksum WHERE r.generation=? AND r.data='' AND p.data IS NULL LIMIT 1").bind(g).first())fail('快照内容引用不完整',409);
+   if(rows.length!==generation.count||await hash(rows.map(r=>`${r.kind}:${r.key}:${r.checksum}`).join('\n'))!==g)fail('快照尚不完整，原数据仍可访问',409);
+   if(seal){const done=await db.prepare("UPDATE generations SET status='complete' WHERE id=? AND status=?").bind(g,seal).run();if(!done.meta?.changes)fail('快照校验租约已变化，请重试',409);}
+  }catch(error){if(seal)await db.prepare("UPDATE generations SET status='staging' WHERE id=? AND status=?").bind(g,seal).run();throw error;}
+  if(d.activate===false)return json({generation:g,count:rows.length,staged:true});
   // Legacy publication cannot race the first cloud checkpoint commit. Both
   // pointer updates test the fence inside the same D1 transaction.
-  const published=await db.batch([db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'active',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'synced_at',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(new Date().toISOString())]);
+  const published=await db.batch([db.prepare("UPDATE generations SET status='complete' WHERE id=?").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'active',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') AND NOT EXISTS(SELECT 1 FROM pointers WHERE key='writer_mode' AND value='d1-main') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(g),db.prepare("INSERT INTO pointers(key,value) SELECT 'synced_at',? WHERE NOT EXISTS(SELECT 1 FROM pointers WHERE key='checkpoint_head') AND NOT EXISTS(SELECT 1 FROM pointers WHERE key='writer_mode' AND value='d1-main') ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(new Date().toISOString())]);
   if(!published[1]?.meta?.changes)fail('云端主数据库已启用；请通过云端检查点提交发布',409);
   // Immutable snapshots are retained. Garbage collection must be fenced by the
   // checkpoint head and all in-flight commits, not a racy last-two heuristic.
@@ -105,12 +133,13 @@ async function saveFeedback(r,e,u){
  if(u.pathname==='/feedback/clear')patch={interest:null,reason:null,favorite:0,reading_status:'unread'};
  if(![null,'interested','not_interested'].includes(patch.interest)||![0,1].includes(patch.favorite)||!['unread','read','read_later'].includes(patch.reading_status))fail('反馈格式无效');
  const reason=String(patch.reason||'').trim();if(reason.length>3000||patch.interest&&!reason)fail('请填写具体偏好理由');const stamp=new Date(Math.max(Date.now(),Date.parse(previous.updated_at||'')+1||0)).toISOString();
- // One SQL statement assigns a strictly newer logical UTC time, even when two
- // requests read the same previous row during the same millisecond.
- await e.DB.prepare("INSERT INTO cloud_feedback(identity,interest,reason,favorite,reading_status,updated_at) SELECT ?,?,?,?,?,CASE WHEN MAX(julianday(updated_at))>=julianday(?) THEN strftime('%Y-%m-%dT%H:%M:%fZ',MAX(julianday(updated_at))+1.0/86400000) ELSE ? END FROM cloud_feedback WHERE identity=?").bind(d.identity,patch.interest,reason||null,patch.favorite,patch.reading_status,stamp,stamp,d.identity).run();
+ const changedFields=u.pathname==='/feedback/clear'?['interest','reason','favorite','reading_status']:
+  u.pathname==='/api/favorite'?['favorite']:['interest','reason','favorite','reading_status'].filter(key=>has(key)||(form&&key==='favorite'));
+ const edits=Object.fromEntries(changedFields.map(key=>[key,key==='reason'?reason||null:patch[key]]));
+ const saved=await appendFeedback(e.DB,g,d.identity,previous,edits,stamp);
  if(form){const target=String(d.return_to||'/feedback');return new Response(null,{status:303,headers:{...h,Location:target.startsWith('/')&&!target.startsWith('//')?target:'/feedback'}});}
  const labels={interested:'已完成 · 感兴趣',not_interested:'已完成 · 不感兴趣'};
- return json({ok:true,saved:true,updated_at:stamp,interest:patch.interest,favorite:Boolean(patch.favorite),reading_status:patch.reading_status,status_label:labels[patch.interest]||'',message:'反馈已保存到云端，将用于后续推荐。'});
+ return json({ok:true,saved:true,changed:saved.changed,updated_at:saved.updated_at,interest:saved.interest,favorite:Boolean(saved.favorite),reading_status:saved.reading_status,status_label:labels[saved.interest]||'',message:'反馈已保存到云端，将用于后续推荐。'});
 }
 const binary=(a,b)=>a===b?0:a==null?-1:b==null?1:a<b?-1:1;
 const fold=s=>String(s||'').replace(/[A-Z]/g,c=>c.toLowerCase());
@@ -162,10 +191,14 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
   read_feedback:async({after})=>({...await syncState(e.DB),...await eventPage(e.DB,'cloud_feedback',after,500)}),
   read_profile_events:async({after})=>profileEvents(e.DB,after),
   read_profile:async()=>{const generation=await active(e.DB);if(!generation)fail('No active profile snapshot',503);return profileState(e.DB,generation);},
-  stage_snapshot:async({action,data})=>syncOperation(e,'/api/sync/'+action,action==='finish'?{...data,activate:false}:data),
+  stage_snapshot:async({action,data})=>syncOperation(e,'/api/sync/'+action,action==='finish'?{...data,activate:false}:data,{deduplicate:true}),
   acknowledge_snapshot:async({data})=>syncOperation(e,'/api/sync/ack',data),
   read_checkpoint_head:async()=>readLibraryHead(e.DB),
   commit_library_checkpoint:async({data})=>commitLibraryHead(e.DB,data),
+  read_main_store:async({action,data})=>mainStoreOperation(e.DB,action,data),
+  write_main_store:async({action,data})=>mainStoreOperation(e.DB,action,data),
+  publish_main_snapshot:async({data})=>publishMainSnapshot(e.DB,data),
+  read_site_backup:async({action,data})=>siteBackup(e.DB,action,data),
  });
  const asset=staticAsset(u.pathname);if(asset)return asset;
  if(u.pathname==='/healthz')return json({ok:!!e.DB,ready:!!(e.DB&&await active(e.DB))});

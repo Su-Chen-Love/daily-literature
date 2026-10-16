@@ -15,6 +15,20 @@
       "when": 1792070247936,
       "tag": "0001_nifty_warlock",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792133702266,
+      "tag": "0002_early_golden_guardian",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792134835098,
+      "tag": "0003_dark_starhawk",
+      "breakpoints": true
     }
   ]
 }

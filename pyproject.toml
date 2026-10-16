@@ -24,6 +24,7 @@ test = ["httpx>=0.27,<1", "httpx2>=2,<3"]
 [project.scripts]
 academic-radar = "academic_radar.cli:main"
 academic-radar-native-host = "academic_radar.native_host:main"
+academic-radar-d1-native-host = "academic_radar.d1_native_host:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -32,7 +33,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-academic_radar = ["migrations/*.sql", "templates/*.html", "static/*.css", "static/*.js", "static/images/*.png", "assets/*.toml", "assets/*.md"]
+academic_radar = ["migrations/*.sql", "templates/*.html", "static/*.css", "static/*.js", "static/images/*.png", "assets/*.toml", "assets/*.md", "assets/*.json"]
 
 [tool.setuptools.data-files]
 "share/personal-academic-radar" = ["scripts/paper_monitor.py"]

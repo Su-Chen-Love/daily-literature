@@ -1,4 +1,5 @@
 import {eventPage} from './events.js';
+import {displayRecord} from './display-records.js';
 // Sites dispatch authenticates visitors and supplies these headers. Never expose
 // this Worker behind a proxy that accepts caller-supplied identity headers.
 export function isOwner(request, env) {
@@ -19,7 +20,7 @@ export function preferences(value) {
 }
 const decode = row => ({...row, version: row.seq, screening_preferences: JSON.parse(row.screening_preferences), base_preferences: JSON.parse(row.base_preferences)});
 async function source(db, generation, kind, key) {
-  const row = await db.prepare('SELECT data FROM records WHERE generation=? AND kind=? AND key=?').bind(generation, kind, key).first();
+  const row = await displayRecord(db,generation,kind,key);
   return row ? JSON.parse(row.data) : {};
 }
 export async function profileState(db, generation) {

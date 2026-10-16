@@ -102,7 +102,7 @@ async function commitHead(request,env) {
  // A losing publisher changes neither the active snapshot nor the head. Every
  // dependent statement tests the exact winning value within one transaction.
  await env.DB.batch([
-  env.DB.prepare('INSERT INTO pointers(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND count=(SELECT COUNT(*) FROM records WHERE generation=?)) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pointers.value=?').bind(HEAD_KEY,serialized,data.snapshot_generation,data.snapshot_generation,raw),
+  env.DB.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND count=(SELECT COUNT(*) FROM records WHERE generation=?)) AND NOT EXISTS(SELECT 1 FROM pointers WHERE key='writer_mode' AND value='d1-main') ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pointers.value=?").bind(HEAD_KEY,serialized,data.snapshot_generation,data.snapshot_generation,raw),
   env.DB.prepare("UPDATE generations SET status='complete' WHERE id=? AND EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?)").bind(data.snapshot_generation,HEAD_KEY,serialized),
   env.DB.prepare("INSERT INTO pointers(key,value) SELECT 'active',? WHERE EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(data.snapshot_generation,HEAD_KEY,serialized),
   env.DB.prepare("INSERT INTO pointers(key,value) SELECT 'synced_at',? WHERE EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(next.updated_at,HEAD_KEY,serialized),
@@ -213,7 +213,7 @@ export async function commitLibraryHead(db,data){
  if((await db.prepare('SELECT status FROM generations WHERE id=?').bind(g).first())?.status!=='complete')fail('Display snapshot must be finished before publication',409);
  const next={backend:'library',generation:expected.generation+1,publication,snapshot_generation:g,updated_at:new Date().toISOString()},serialized=JSON.stringify(next);
  await db.batch([
-  db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND status='complete' AND count=(SELECT COUNT(*) FROM records WHERE generation=?)) AND NOT EXISTS(SELECT 1 FROM pointers WHERE key=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pointers.value=?").bind(HEAD_KEY,serialized,g,g,historyKey,raw),
+  db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM generations WHERE id=? AND status='complete' AND count=(SELECT COUNT(*) FROM records WHERE generation=?)) AND NOT EXISTS(SELECT 1 FROM pointers WHERE key='writer_mode' AND value='d1-main') AND NOT EXISTS(SELECT 1 FROM pointers WHERE key=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE pointers.value=?").bind(HEAD_KEY,serialized,g,g,historyKey,raw),
   db.prepare("INSERT INTO pointers(key,value) SELECT ?,? WHERE EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?) ON CONFLICT(key) DO NOTHING").bind(historyKey,JSON.stringify(publication),HEAD_KEY,serialized),
   db.prepare("INSERT INTO pointers(key,value) SELECT 'active',? WHERE EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(g,HEAD_KEY,serialized),
   db.prepare("INSERT INTO pointers(key,value) SELECT 'synced_at',? WHERE EXISTS(SELECT 1 FROM pointers WHERE key=? AND value=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(next.updated_at,HEAD_KEY,serialized),

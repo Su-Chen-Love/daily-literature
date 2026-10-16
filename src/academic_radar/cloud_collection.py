@@ -65,8 +65,15 @@ def _official_status(sources):
     return "partial"
 
 
-def run(config_path: Path, operation_id: str, saved: dict, monitor) -> dict:
-    """Resume one original head/config/date/batch, with no queue side effects."""
+def run(config_path: Path, operation_id: str, saved: dict, monitor, *, checkpoint=None, hydrate_official=None) -> dict:
+    """Resume one original head/config/date/batch, with no queue side effects.
+
+    Optional native-D1 hooks run only after a local durable stage save, or before
+    applying an official package. A checkpoint failure propagates; the caller
+    must recover from its last authoritative revision. A collection interrupted
+    before its durable boundary may replay idempotent upserts, not claim exactly
+    once network collection. Defaults retain the original checkpoint behavior.
+    """
     config = load_config(config_path)
     state = resolve_state(config_path, config)
     db_path = state / "papers.sqlite3"
@@ -97,6 +104,8 @@ def run(config_path: Path, operation_id: str, saved: dict, monitor) -> dict:
         nonlocal saved
         progress["phase"] = phase
         saved = runtime._save(db_path, operation_id, {**saved, "collection_progress": progress})
+        if checkpoint is not None:
+            checkpoint(saved)
 
     if progress["api"] is None:
         persist("api_collecting")
@@ -192,6 +201,8 @@ def run(config_path: Path, operation_id: str, saved: dict, monitor) -> dict:
             continue
         # Re-preview after an interruption. Existing checked issues still pass
         # the original full evidence validation; they are never blindly trusted.
+        if hydrate_official is not None:
+            hydrate_official(package, operation_id, index)
         preview = official.preview_official_import(db_path, config, output)
         preview_path = _absolute(directory / (str(index) + "-preview.json"))
         _atomic_write(preview_path, runtime._canonical(preview))
@@ -241,4 +252,6 @@ def run(config_path: Path, operation_id: str, saved: dict, monitor) -> dict:
     progress["phase"] = "completed"
     saved = runtime._save(db_path, operation_id, {**saved, "collection_progress": progress,
         "collection_report": report, "collection_exit_code": progress["api"]["exit_code"]})
+    if checkpoint is not None:
+        checkpoint(saved)
     return {**saved, "collection_performed": performed}

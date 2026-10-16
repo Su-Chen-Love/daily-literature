@@ -27,19 +27,19 @@ if(process.env.MCP_EXPECT_DISCOVERY_FAILURE==='1'){
  console.log('Official SDK reproduces pre-fix discovery refusal: stage_snapshot.inputSchema.type is missing.');
 }else{
  const discovered=await client.listTools({_meta:{progressToken:'fixture-discovery','client/extension':true}});
- assert.equal(discovered.tools.length,8);
+ assert.equal(discovered.tools.length,12);
  for(const tool of discovered.tools)ToolSchema.parse(tool);
  const digest='a'.repeat(64),head={generation:0,publication:null};
  const publication={operation_id:'fixture',snapshot_generation:digest,archive_sha256:digest,archive_size:1,checkpoint_id:digest,library_file_id:'library-fixture',current_version:0,file_id:'file-fixture',file_name:'fixture.tar.gz',publication_id:digest};
  const args={read_run_status:{},read_feedback:{after:0},read_profile_events:{after:0},read_profile:{},
   stage_snapshot:{action:'begin',data:{generation:digest,count:1}},
   acknowledge_snapshot:{data:{generation:digest,cursor:0,request_id:0}},read_checkpoint_head:{},
-  commit_library_checkpoint:{data:{expected_head:head,publication}}};
+  commit_library_checkpoint:{data:{expected_head:head,publication}},read_main_store:{action:'head',data:{}},write_main_store:{action:'verify_object',data:{sha256:digest,expected_cursor:0}},publish_main_snapshot:{data:{operation_id:'fixture',revision:1,snapshot_generation:digest,expected_generation:null,expected_published_revision:0,expected_writer_mode:'local',activate:false}},read_site_backup:{action:'begin',data:{}}};
  for(const tool of discovered.tools){
   const result=await client.callTool({name:tool.name,arguments:args[tool.name]});
   assert.equal(result.isError,false,tool.name);assert.equal(result.structuredContent.tool,tool.name);
  }
- assert.equal(calls.length,8);
+ assert.equal(calls.length,12);
  assert.equal(transport.sessionId,undefined,'Stateless server must not invent a session requirement');
  assert.ok(transcript.some(row=>row.method==='initialize'&&row.status===200));
  assert.ok(transcript.some(row=>row.method==='notifications/initialized'&&row.status===202));
@@ -48,5 +48,5 @@ if(process.env.MCP_EXPECT_DISCOVERY_FAILURE==='1'){
   assert.ok(row.accept.includes('application/json')&&row.accept.includes('text/event-stream'));
  }
  await client.close();
- console.log('Official MCP SDK Streamable HTTP client passes initialize, initialized notification, metadata discovery, all eight Tool schemas/calls, protocol headers and stateless-session behavior.');
+ console.log('Official MCP SDK Streamable HTTP client passes initialize, initialized notification, metadata discovery, all twelve Tool schemas/calls, protocol headers and stateless-session behavior.');
 }

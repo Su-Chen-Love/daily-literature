@@ -15,7 +15,7 @@ const value=result=>{assert.equal(result.status,200);assert.equal(result.data.re
 const refused=(result,status)=>{assert.equal(result.status,200);assert.equal(result.data.result.isError,true);assert.equal(result.data.result.structuredContent.status,status);};
 const initialization=await rpc('initialize',{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'fixture',version:'1'}},{own:false});
 assert.equal(initialization.data.result.protocolVersion,'2025-11-25');assert.deepEqual(initialization.data.result.capabilities,{tools:{}});
-const listed=await rpc('tools/list',{}, {own:false});assert.equal(listed.data.result.tools.length,8);assert.ok(!JSON.stringify(listed).includes('site-scoped-owner'));assert.ok(!JSON.stringify(listed).includes('private interest'));
+const listed=await rpc('tools/list',{}, {own:false});assert.equal(listed.data.result.tools.length,12);assert.ok(!JSON.stringify(listed).includes('site-scoped-owner'));assert.ok(!JSON.stringify(listed).includes('private interest'));
 // MCP Tool.inputSchema requires an object root even when validation uses oneOf.
 for(const tool of listed.data.result.tools)assert.equal(tool.inputSchema.type,'object',tool.name);
 assert.equal((await rpc('tools/list',{_meta:{progressToken:'discovery','client/extension':true}},{own:false})).status,200);
@@ -29,7 +29,7 @@ for(const version of ['2024-11-05','2025-03-26','2025-06-18','2025-11-25']){
  const notification=await worker.fetch(new Request(origin+'/mcp',{method:'POST',headers:{...extraHeaders,'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',method:'notifications/initialized',params:{_meta:{}}})}),env);
  assert.equal(notification.status,202);assert.equal(await notification.text(),'');
  const discovery=await rpc('tools/list',{_meta:{}},{own:false,extraHeaders});
- assert.equal(discovery.status,200);assert.equal(discovery.data.result.tools.length,8);
+ assert.equal(discovery.status,200);assert.equal(discovery.data.result.tools.length,12);
 }
 assert.equal((await rpc('initialize',{protocolVersion:'future',capabilities:{},clientInfo:{name:'fixture',version:'1'}})).data.result.protocolVersion,'2025-11-25');
 assert.equal((await rpc('ping')).status,200);

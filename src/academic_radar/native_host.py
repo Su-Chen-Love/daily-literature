@@ -31,7 +31,8 @@ MAX_MESSAGE_BYTES = 2_000_000
 MAX_REQUESTS = 10_000
 SITE_TOOLS = frozenset({"read_run_status", "read_feedback", "read_profile_events", "read_profile",
                         "stage_snapshot", "acknowledge_snapshot", "read_checkpoint_head",
-                        "commit_library_checkpoint"})
+                        "commit_library_checkpoint", "read_main_store", "write_main_store",
+                        "publish_main_snapshot", "read_site_backup"})
 LIBRARY_OPERATIONS = frozenset({"library.create_archive", "library.materialize_archive"})
 
 
@@ -105,6 +106,11 @@ def normalize_library_metadata(value):
 def _site_arguments(name, args):
     if name not in SITE_TOOLS:
         raise ValueError("Unsupported Site operation")
+    if name in {"read_main_store", "write_main_store", "publish_main_snapshot", "read_site_backup"}:
+        # Lazy import keeps the legacy runner independent of D1 initialization.
+        from .d1_native_host import validate_arguments
+        validate_arguments(name, args)
+        return
     if name in {"read_run_status", "read_profile", "read_checkpoint_head"}:
         _object(args, ())
     elif name in {"read_feedback", "read_profile_events"}:
@@ -143,6 +149,9 @@ def _site_result(name, args, value):
     if (not isinstance(value, dict) or any(key in value for key in ("error", "isError", "structuredContent"))
             or ("content" in value and name != "read_profile")):
         raise ValueError("Native host did not return a decoded successful result")
+    if name in {"read_main_store", "write_main_store", "publish_main_snapshot", "read_site_backup"}:
+        from .d1_native_host import validate_result
+        return validate_result(name, args, value)
     if name == "read_checkpoint_head":
         return _head(value)
     if name == "commit_library_checkpoint":
