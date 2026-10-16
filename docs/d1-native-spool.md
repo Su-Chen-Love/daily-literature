@@ -9,7 +9,17 @@ are a blocker; do not substitute an endpoint, token, or legacy capability.
 Files: `scripts/d1-native-relay.py`, `scripts/d1-native-pump.js`, and
 `tests/test_d1_native_spool.py`. POSIX, Python 3.9+, an explicit trusted Python
 interpreter with the package's dependencies installed, and the reviewed source
-checkout are required. Node is used only by the synthetic pump tests.
+checkout and a local filesystem supporting `flock` are required. Node is used
+only by the synthetic pump tests.
+
+Spool publication remains atomic and no-clobber. An exclusive inode lock covers
+linking the final name, unlinking the temporary name and directory fsync. Readers
+take nonblocking shared locks before the existing single-link, private-file and
+unchanged-byte checks. Only an active exclusive lock means pending: response
+waiting retains the relay deadline, and helper `poll` returns `waiting` for a
+request or result still being published. Other reads fail closed rather than
+waiting or returning partial bytes. A crashed publisher's leftover hardlink and
+unsupported locking remain errors; no lockless fallback is provided.
 
 ## Pin an independently reviewed release
 

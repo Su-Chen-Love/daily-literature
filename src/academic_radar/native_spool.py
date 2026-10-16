@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
+import fcntl
 import io
 import json
 import math
@@ -155,20 +157,23 @@ class PrivateSpool:
         temporary = "." + name + ".tmp"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fd)
-        try:
-            with os.fdopen(fd, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
+            try:
+                # Keep the inode locked until its temporary second link is gone
+                # and publication is durable. Readers must never accept nlink=2.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 handle.write(raw)
                 handle.flush()
                 os.fchmod(handle.fileno(), 0o400)
                 os.fsync(handle.fileno())
-            # Atomic, no-clobber publication. No partial request is ever visible.
-            os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
-            os.unlink(temporary, dir_fd=self.fd)
-            os.fsync(self.fd)
-        except BaseException:
-            with contextlib.suppress(OSError):
+                # Atomic, no-clobber publication. No partial request is ever visible.
+                os.link(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd, follow_symlinks=False)
                 os.unlink(temporary, dir_fd=self.fd)
-            raise
+                os.fsync(self.fd)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary, dir_fd=self.fd)
+                raise
         self._intact()
         return self.path / name
 
@@ -190,6 +195,12 @@ class PrivateSpool:
         except OSError:
             raise RelayError("unsafe_response") from None
         try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return None  # Publication is active; the relay deadline still applies.
+                raise RelayError("unsafe_response") from None
             before = os.fstat(fd)
             _check(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
                    and before.st_uid == os.geteuid() and before.st_mode & 0o077 == 0,
@@ -204,13 +215,13 @@ class PrivateSpool:
             raw = bytes(raw)
             after = os.fstat(fd)
             current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+            fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+            _check(fingerprint(before) == fingerprint(after) == fingerprint(current), "response_changed")
+            self._intact()
+            _decode(raw)  # Never forward an exposed partial, malformed or oversized file.
+            return raw
         finally:
             os.close(fd)
-        fingerprint = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
-        _check(fingerprint(before) == fingerprint(after) == fingerprint(current), "response_changed")
-        self._intact()
-        _decode(raw)  # Never forward an exposed partial, malformed or oversized file.
-        return raw
 
 
 class _Pipe:

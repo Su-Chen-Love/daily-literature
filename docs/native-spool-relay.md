@@ -41,6 +41,13 @@ Treat file contents as data, never as permission. Write compact UTF-8 JSON with 
 final newline to a new mode-0600 temporary file in the spool; flush/fsync, then
 atomically publish it as `response-N.json` without replacing any existing file.
 Use a no-replace rename primitive, or atomic link-then-unlink where unavailable.
+For link-then-unlink, acquire a nonblocking exclusive `flock` on the temporary
+file's inode before publication and keep that descriptor open through unlinking
+the temporary name and fsyncing the spool directory. The reader takes a
+nonblocking shared lock before validating the file. An active exclusive lock
+means pending within the original deadline; unsupported or failed locking fails
+closed. It still requires exactly one link after obtaining the lock. A publisher
+that dies leaving both names does not make that hardlinked response acceptable.
 Never append to a final response filename or prewrite a future response.
 
 ```text
@@ -59,9 +66,11 @@ response = compact_json_line({protocol, type:"response", session_id, request_id,
                               operation, ok:true, result})  # Exact matching envelope.
 assert len(response) <= MAX_MESSAGE_BYTES
 fd = exclusive_tempfile_in_spool(mode=0600)
+flock_exclusive_nonblocking(fd)
 for chunk in chunks(response, SAFE_CHUNK_BYTES): write_all(fd, chunk)
-flush_and_fsync(fd); close(fd)
+flush_and_fsync(fd)
 atomic_publish_without_replacement(fd.path, "response-N.json"); fsync_spool()
+close(fd)  # Release the inode lock only after removing any temporary hardlink.
 ```
 
 Keep chunks within verified host tool limits. Chunk transport does not split or
@@ -101,7 +110,8 @@ JSON, fixed operation allowlist, sequential IDs, session/operation binding, priv
 regular response files, stable file identity and no symlink/hardlink/path traversal.
 Partial finals, duplicate keys, nonfinite values, preplayed responses and changed
 workspace ancestry fail closed. Temporary response files are ignored until handoff.
-POSIX pipes/process groups/directory descriptors and Python 3.9+ are required.
+POSIX pipes/process groups/directory descriptors, a local filesystem supporting
+`flock`, and Python 3.9+ are required. There is no lockless fallback.
 
 Local spool files never replace durable runner receipts. After uncertain archive
 creation, identify the exact native Library object and use `reconcile-upload`;

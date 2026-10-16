@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import errno
+import fcntl
 import hashlib
 import importlib.abc
 import importlib.util
@@ -31,6 +33,10 @@ OPERATIONS = frozenset({
 
 class RelayError(RuntimeError):
     pass
+
+
+class PublicationPending(RelayError):
+    """A live publisher holds the inode lock; only polling may wait for it."""
 
 
 def check(condition, code='invalid_arguments'):
@@ -284,6 +290,12 @@ def read(transport, spool, name, *, heartbeat=False):
     spool._intact()
     fd = os.open(name, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK, dir_fd=spool.fd)
     try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise PublicationPending('publication_pending') from None
+            raise RelayError('unsafe_file') from None
         first = os.fstat(fd)
         transport._check(stat.S_ISREG(first.st_mode) and first.st_nlink == 1 and first.st_uid == os.geteuid()
                          and first.st_mode & 0o077 == 0 and 0 < first.st_size <= MAX, 'unsafe_file')
@@ -298,6 +310,7 @@ def read(transport, spool, name, *, heartbeat=False):
         current = os.stat(name, dir_fd=spool.fd, follow_symlinks=False)
         stamp = lambda s: (s.st_dev,s.st_ino,s.st_size) + (() if heartbeat else (s.st_mtime_ns,s.st_ctime_ns))
         transport._check(stamp(first) == stamp(last) == stamp(current) and len(raw) == first.st_size, 'file_changed')
+        spool._intact()
         return raw
     finally:
         os.close(fd)
@@ -361,12 +374,14 @@ def io_main(transport, argv=None):
             try:
                 value = terminal_metadata(transport, spool)
                 return {'state':'done', 'ok':value['ok'], 'request_id':value['request_id']}
+            except PublicationPending:
+                return {'state':'waiting', 'request_id':args.number}
             except FileNotFoundError:
                 pass
             try:
                 pending(transport, spool, args.number)
                 return {'state':'ready', 'request_id':args.number}
-            except FileNotFoundError:
+            except (FileNotFoundError, PublicationPending):
                 return {'state':'waiting', 'request_id':args.number}
         if args.action == 'result':
             return terminal_metadata(transport, spool)
