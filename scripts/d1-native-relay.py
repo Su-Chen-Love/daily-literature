@@ -170,7 +170,7 @@ class SourceOnlyFinder(importlib.abc.MetaPathFinder):
             submodule_search_locations=[str(filename.parent)] if package else None)
 
 
-def make_transport(manifest, expected, files, root=ROOT):
+def make_transport(manifest, expected, files, root=ROOT, journal=None):
     """Create independent adapter state; importing it never mutates legacy spool."""
     from academic_radar import native_host, d1_native_host
     transport = types.ModuleType('academic_radar._d1_spool_transport')
@@ -201,6 +201,8 @@ def make_transport(manifest, expected, files, root=ROOT):
             and value['type'] == 'result' and type(value['ok']) is bool)
         transport._session(value, session, number)
         if value['ok']:
+            if journal is not None:
+                check(journal.exhausted and journal.replayed == journal.value['prefix'], 'journal_replay_incomplete')
             transport._check(isinstance(value['result'], dict))
             return value  # Private file only; stdout contains metadata.
         transport._check(isinstance(value['error'], dict))
@@ -224,6 +226,25 @@ def make_transport(manifest, expected, files, root=ROOT):
     def announce(spool, output, value, deadline=None):
         nonlocal live
         if value['type'] == 'request_ready':
+            if journal is not None:
+                req = transport._decode(read(transport, spool, 'request-%d.json' % value['request_id']))
+                replay = journal.response(req)
+                if replay is not None:
+                    spool.save('claim-%d.json' % req['request_id'], transport._encode({
+                        'request_sha256': hashlib.sha256(transport._encode(req)).hexdigest()}))
+                    spool.save('replay-%d.json' % req['request_id'], transport._encode({
+                        'journal_sha256': journal.sha, 'original_session_id': journal.value['session_id'],
+                        'original_request_id': req['request_id'], 'new_session_id': req['session_id'],
+                        'original_request_sha256': journal.value['files']['request-%d.json' % req['request_id']]['sha256'],
+                        'new_request_sha256': hashlib.sha256(transport._encode(req)).hexdigest(),
+                        'new_response_sha256': hashlib.sha256(replay).hexdigest(),
+                        'original_response_sha256': journal.value['files']['response-%d.json' % req['request_id']]['sha256']}))
+                    spool.save('response-%d.json' % req['request_id'], replay)
+                    return
+                if req['request_id'] == journal.value['prefix'] + 1:
+                    spool.save('replay-summary.json', transport._encode(journal.summary()))
+                value = {**value, 'replayed_reads': journal.replayed, 'replayed_response_bytes': journal.replayed_bytes,
+                         'cached_response_bytes': journal.value['cached_response_bytes']}
             heartbeat = 'live-%d.json' % value['request_id']
             spool.save(heartbeat, b'{}\n')
             live = spool, heartbeat
@@ -387,6 +408,168 @@ def io_main(transport, argv=None):
         return {'published':True,'request_id':args.number,'response_bytes':len(raw)}
 
 
+JOURNAL_FORMAT = 'academic-radar-read-backup-journal-v1'
+
+
+def _journal_state(transport, path, prefix, original_source):
+    """Read a closed original run; never accept an uncertain native tail."""
+    check(type(prefix) is int and 1 <= prefix < transport.MAX_REQUESTS, 'invalid_journal_prefix')
+    check(type(original_source) is dict and set(original_source) == {'root', 'manifest', 'sha256'}, 'invalid_journal_source')
+    original_files = verify_source(Path(original_source['manifest']), original_source['sha256'], Path(original_source['root']))
+    current_files = inventory()
+    check({k:v for k,v in original_files.items() if k.startswith('src/academic_radar/')} ==
+          {k:v for k,v in current_files.items() if k.startswith('src/academic_radar/')}, 'journal_backup_source_changed')
+    with existing(transport, path) as spool:
+        required = {'result.json'}
+        optional = set()
+        for number in range(1, prefix + 2):
+            required.update('%s-%d.json' % (kind, number) for kind in ('request', 'response', 'pending', 'claim', 'live'))
+            optional.add('response-%d.partial' % number)
+            if number <= prefix:
+                required.add('invoke-%d.json' % number)
+        names = set(os.listdir(spool.fd))
+        check(required <= names <= required | optional, 'invalid_journal_inventory')
+        files = {}
+        def member(name):
+            raw = read(transport, spool, name)
+            entry = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+            check(name not in files or files[name] == entry, 'journal_changed')
+            files[name] = entry
+            return raw
+        session, first = None, None
+        response_bytes = 0
+        for number in range(1, prefix + 2):
+            request_raw = member('request-%d.json' % number)
+            req = transport._decode(request_raw)
+            session = transport._request(req, session, number)
+            check(req['operation'] == 'site.read_site_backup', 'journal_operation_forbidden')
+            expected = {'request_sha256': hashlib.sha256(request_raw).hexdigest()}
+            state = transport._decode(member('pending-%d.json' % number))
+            check(set(state) == {'heartbeat', 'deadline_unix_ms', 'request_sha256'}
+                  and state['heartbeat'] == 'live-%d.json' % number
+                  and type(state['deadline_unix_ms']) is int
+                  and state['request_sha256'] == expected['request_sha256'], 'invalid_journal_pending')
+            check(member('live-%d.json' % number) == b'{}\n', 'invalid_journal_heartbeat')
+            check(transport._decode(member('claim-%d.json' % number)) == expected, 'invalid_journal_claim')
+            response_raw = member('response-%d.json' % number)
+            check(transport._response(response_raw, req) == response_raw, 'noncanonical_journal_response')
+            value = transport._decode(response_raw)
+            if number <= prefix:
+                check(value['ok'] is True, 'journal_response_failed')
+                check(transport._decode(member('invoke-%d.json' % number)) == expected, 'invalid_journal_invocation')
+                response_bytes += len(response_raw)
+                if number == 1:
+                    check(req['arguments'] == {'action': 'begin', 'data': {}}, 'journal_begin_required')
+                    first = value['result']
+                else:
+                    check(req['arguments']['action'] != 'begin', 'journal_snapshot_recapture')
+            else:
+                check(value['ok'] is False and value['error'] == {'code': 'host_action_failed'}, 'journal_tail_not_local_cancel')
+                absent(transport, spool, 'invoke-%d.json' % number)
+            partial = 'response-%d.partial' % number
+            if partial in names:
+                partial_raw = member(partial)
+                if number <= prefix:
+                    check(partial_raw == response_raw, 'journal_partial_mismatch')
+                else:
+                    check(transport._decode(partial_raw).get('error') == {'code': 'host_action_failed'}
+                          and transport._response(partial_raw, req) == response_raw, 'journal_partial_mismatch')
+        terminal_raw = member('result.json')
+        terminal = transport._decode(terminal_raw)
+        check(terminal == {'protocol': transport.PROTOCOL, 'type': 'result', 'session_id': session,
+              'request_id': prefix + 1, 'ok': False, 'error': {'code': 'native_host_failed'}}, 'journal_not_closed_locally')
+        from academic_radar import d1_backup
+        _snapshot, snapshot_sha = d1_backup._capture(lambda action, data: first, require_main=False)
+        captured_at = first.get('captured_at')
+        check(isinstance(captured_at, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z', captured_at), 'journal_capture_time_missing')
+        # Verify all bytes again after validation and bind the complete closed inventory.
+        check(set(os.listdir(spool.fd)) == names, 'journal_changed')
+        for name in sorted(names):
+            member(name)
+        return {'format': JOURNAL_FORMAT, 'source_spool': str(Path(path)), 'original_source': original_source,
+                'session_id': session, 'prefix': prefix, 'files': files, 'snapshot_sha256': snapshot_sha,
+                'captured_at': captured_at, 'cached_response_bytes': response_bytes}
+
+
+def seal_journal(transport, path, prefix, output, original_source):
+    value = _journal_state(transport, path, prefix, original_source)
+    output = Path(output)
+    check(output.is_absolute() and Path(path) not in output.parents, 'journal_must_be_external')
+    raw = canonical(value)
+    check(len(raw) <= MAX, 'journal_manifest_too_large')
+    parent = directory(output.parent)
+    try:
+        fd = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(raw); handle.flush(); os.fchmod(handle.fileno(), 0o400); os.fsync(handle.fileno())
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    return {'journal_sha256': hashlib.sha256(raw).hexdigest(), 'replayed_reads': prefix,
+            'cached_response_bytes': value['cached_response_bytes'], 'captured_at': value['captured_at'],
+            'snapshot_sha256': value['snapshot_sha256'], 'next': prefix + 1}
+
+
+class ReadJournal:
+    def __init__(self, transport, path, expected):
+        check(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected), 'invalid_journal_pin')
+        path = Path(path)
+        raw = file_bytes(path, MAX)
+        parent = directory(path.parent)
+        try:
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            check(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                  and stat.S_IMODE(info.st_mode) == 0o400, 'unsafe_journal_manifest')
+        finally:
+            os.close(parent)
+        check(hashlib.sha256(raw).hexdigest() == expected, 'journal_pin_changed')
+        self.value = json.loads(raw, object_pairs_hook=unique_pairs)
+        check(isinstance(self.value, dict) and set(self.value) == {'format', 'source_spool', 'original_source',
+              'session_id', 'prefix', 'files', 'snapshot_sha256', 'captured_at', 'cached_response_bytes'}
+              and self.value['format'] == JOURNAL_FORMAT, 'invalid_journal_manifest')
+        self.transport, self.sha, self.replayed, self.exhausted = transport, expected, 0, False
+        self.replayed_bytes = 0
+        self.verify()
+
+    def verify(self):
+        check(_journal_state(self.transport, self.value['source_spool'], self.value['prefix'],
+              self.value['original_source']) == self.value, 'journal_changed')
+
+    def response(self, req):
+        check(req['operation'] == 'site.read_site_backup', 'journal_operation_forbidden')
+        number = req['request_id']
+        check(req['session_id'] != self.value['session_id'], 'journal_fresh_session_required')
+        if self.exhausted:
+            check(number > self.value['prefix'] + 1, 'journal_replay_revisited')
+            return None
+        check(number == self.replayed + 1, 'journal_replay_gap')
+        with existing(self.transport, self.value['source_spool']) as old:
+            def bound(name):
+                raw = read(self.transport, old, name)
+                check(self.value['files'].get(name) == {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}, 'journal_changed')
+                return raw
+            previous = self.transport._decode(bound('request-%d.json' % number))
+            expected = dict(previous, session_id=req['session_id'])
+            check(req == expected, 'journal_request_mismatch')
+            if number == self.value['prefix'] + 1:
+                self.verify()
+                self.exhausted = True
+                return None
+            value = self.transport._decode(bound('response-%d.json' % number))
+            check(value['ok'] is True, 'journal_response_failed')
+            value['session_id'] = req['session_id']
+            raw = self.transport._encode(value)
+            self.transport._response(raw, req)
+            self.replayed += 1
+            self.replayed_bytes += len(raw)
+            return raw
+
+    def summary(self):
+        return {'journal_sha256': self.sha, 'replayed_reads': self.replayed,
+                'replayed_response_bytes': self.replayed_bytes, 'cached_response_bytes': self.value['cached_response_bytes'],
+                'captured_at': self.value['captured_at'], 'snapshot_sha256': self.value['snapshot_sha256']}
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse's default diagnostics could echo a private response argument.
@@ -398,7 +581,7 @@ def main(argv=None):
     parser = Parser(description=__doc__)
     parser.add_argument('--source-manifest', type=Path)
     parser.add_argument('--source-manifest-sha256')
-    parser.add_argument('mode', choices=('pin', 'check', 'pump', 'run', 'io', 'host'))
+    parser.add_argument('mode', choices=('pin', 'check', 'pump', 'run', 'io', 'host', 'seal-read-journal', 'resume-backup'))
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.mode == 'pin':
@@ -422,6 +605,33 @@ def main(argv=None):
                 from academic_radar.d1_native_host import main as host_main
                 return host_main(args.arguments)
             transport = make_transport(args.source_manifest, args.source_manifest_sha256, files)
+            if args.mode == 'seal-read-journal':
+                command = Parser()
+                command.add_argument('--spool', type=Path, required=True)
+                command.add_argument('--prefix', type=int, required=True)
+                command.add_argument('--output', type=Path, required=True)
+                command.add_argument('--original-source-root', type=Path, required=True)
+                command.add_argument('--original-source-manifest', type=Path, required=True)
+                command.add_argument('--original-source-manifest-sha256', required=True)
+                opts = command.parse_args(args.arguments)
+                value = seal_journal(transport, opts.spool, opts.prefix, opts.output, {
+                    'root': str(opts.original_source_root), 'manifest': str(opts.original_source_manifest),
+                    'sha256': opts.original_source_manifest_sha256})
+                print(json.dumps(value, separators=(',', ':')))
+                return 0
+            if args.mode == 'resume-backup':
+                command = Parser()
+                command.add_argument('--workspace', type=Path, required=True)
+                command.add_argument('--spool', required=True)
+                command.add_argument('--timeout-seconds', type=float, required=True)
+                command.add_argument('--journal', type=Path, required=True)
+                command.add_argument('--journal-sha256', required=True)
+                command.add_argument('--output', type=Path, required=True)
+                opts = command.parse_args(args.arguments)
+                journal = ReadJournal(transport, opts.journal, opts.journal_sha256)
+                transport = make_transport(args.source_manifest, args.source_manifest_sha256, files, journal=journal)
+                return transport.main(['--workspace', str(opts.workspace), '--spool', opts.spool,
+                    '--timeout-seconds', str(opts.timeout_seconds), '--', 'backup-site', '--output', str(opts.output)])
             if args.mode == 'run':
                 return transport.main(args.arguments)
             value = io_main(transport, args.arguments)
