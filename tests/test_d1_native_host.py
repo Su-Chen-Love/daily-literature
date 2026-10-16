@@ -33,27 +33,85 @@ class WorkerSite:
             + 'import worker from ' + json.dumps((project / 'sites/worker/index.js').as_uri()) + ';\n'
             + "const db=database(),env={DB:db,OWNER_USER_ID:'synthetic-owner'};\n"
             + ("db.sql.prepare('INSERT INTO cloud_profile_events VALUES(1,0,?,?,?,?,?,?,?,?)').run('a'.repeat(64),'b'.repeat(64),'{}','c'.repeat(64),'中文'.repeat(70000),'{}','synthetic large profile','2026-10-16');\n" if large_profile else '')
+            + "process.stdout.write('ready\\n');\n"
             + "for await (const line of createInterface({input:process.stdin})){try{const {name,arguments:args}=JSON.parse(line);"
             + "const response=await worker.fetch(new Request('https://unit.invalid/mcp',{method:'POST',headers:{'Content-Type':'application/json','oai-authenticated-user-id':'synthetic-owner'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:args}})}),env);"
             + "const value=await response.json();process.stdout.write(JSON.stringify(value)+'\\n');}catch(error){process.stdout.write(JSON.stringify({error:String(error)})+'\\n');}}db.sql.close();\n")
-        self.process = subprocess.Popen(['node', str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        # A file avoids stderr pipe backpressure and keeps successful tests quiet.
+        self.stderr = tempfile.TemporaryFile()
+        try:
+            self.process = subprocess.Popen(['node', str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr, text=True)
+        except Exception:
+            self.stderr.close()
+            raise
         self.calls = []
+        if self.process.stdout.readline() != 'ready\n':
+            raise self.failure('startup failed')
+
+    def failure(self, reason):
+        self.stop()
+        self.stderr.seek(0, 2)
+        self.stderr.seek(max(0, self.stderr.tell() - 8192))
+        detail = self.stderr.read().decode('utf-8', errors='replace').strip()
+        self.stderr.close()
+        return AssertionError(
+            f'Local Worker fixture {reason} (exit {self.process.returncode}). '
+            'From the repository root, run: cd sites && npm ci && npm run build. '
+            'This installs Worker dependencies and generates the UI required by these tests.\n'
+            f'Worker stderr (last 8192 bytes):\n{detail or "(empty)"}')
 
     def dispatch(self, operation, arguments):
         if not operation.startswith('site.'):
             raise AssertionError('Library or non-Site capability requested')
         name = operation[5:]; self.calls.append((name, copy.deepcopy(arguments)))
-        self.process.stdin.write(json.dumps({'name': name, 'arguments': arguments}) + '\n'); self.process.stdin.flush()
-        value = json.loads(self.process.stdout.readline())
+        try:
+            self.process.stdin.write(json.dumps({'name': name, 'arguments': arguments}) + '\n'); self.process.stdin.flush()
+        except BrokenPipeError:
+            raise self.failure('closed its input') from None
+        line = self.process.stdout.readline()
+        if not line:
+            raise self.failure('closed its output before replying')
+        value = json.loads(line)
         if 'error' in value or value['result']['isError']:
             raise AssertionError(json.dumps(value))
         return value['result']['structuredContent']
 
+    def stop(self):
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass  # Never mask the original Worker startup/dispatch failure.
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill(); self.process.wait(timeout=10)
+        self.process.stdout.close()
+
     def close(self):
-        self.process.stdin.close(); self.process.wait(timeout=10); self.process.stdout.close()
+        self.stop(); self.stderr.close()
 
 
 class D1NativeWireTests(unittest.TestCase):
+    def test_worker_startup_failure_reports_dependencies_and_stderr(self):
+        popen = subprocess.Popen
+        processes = []
+        def failed_worker(_command, **kwargs):
+            process = popen([sys.executable, '-c',
+                "import sys; sys.stderr.write(\"ERR_MODULE_NOT_FOUND: Cannot find package 'nunjucks'\\n\"); sys.exit(1)"], **kwargs)
+            processes.append((process, kwargs['stderr']))
+            return process
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.object(subprocess, 'run', return_value=SimpleNamespace(returncode=0)), \
+                patch.object(subprocess, 'Popen', side_effect=failed_worker):
+            with self.assertRaisesRegex(AssertionError, 'Local Worker fixture startup failed') as error:
+                WorkerSite(Path(temporary))
+        self.assertIn('cd sites && npm ci && npm run build', str(error.exception))
+        self.assertIn("ERR_MODULE_NOT_FOUND: Cannot find package 'nunjucks'", str(error.exception))
+        process, stderr = processes[0]
+        self.assertEqual(process.returncode, 1)
+        self.assertTrue(process.stdin.closed); self.assertTrue(process.stdout.closed)
+        self.assertTrue(stderr.closed)
+
     def test_exactly_four_capabilities_added(self):
         legacy = {'read_run_status', 'read_feedback', 'read_profile_events', 'read_profile', 'stage_snapshot',
                   'acknowledge_snapshot', 'read_checkpoint_head', 'commit_library_checkpoint'}
