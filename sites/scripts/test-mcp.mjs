@@ -129,3 +129,6 @@ const largeBegin=value(await call('stage_snapshot',{action:'begin',data:{generat
 assert.deepEqual(largeBegin,{generation:longGeneration,active:false});
 assert.equal((await readLibraryHead(env.DB)).publication.publication_id,latest.publication.publication_id);
 console.log('Large incremental manifest safely falls back to full bounded chunk upload.');
+
+// Keep modern protocol regression coverage in the standard MCP test entrypoint.
+await import("./test-mcp-modern.mjs");

@@ -2,10 +2,29 @@
 // OAuth implementation, or identity supplied in tool arguments are accepted.
 import {isOwner} from './profile.js';
 const MAX_BYTES=2_000_000;
-const versions=['2025-11-25','2025-06-18','2025-03-26','2024-11-05'];
+const modernVersion='2026-07-28';
+const legacyVersions=['2025-11-25','2025-06-18','2025-03-26','2024-11-05'];
+const versions=[modernVersion,...legacyVersions];
+const protocolKey='io.modelcontextprotocol/protocolVersion';
+const capabilitiesKey='io.modelcontextprotocol/clientCapabilities';
+const clientInfoKey='io.modelcontextprotocol/clientInfo';
+const serverInfo={name:'academic-radar',version:'1.0.0'};
+const capabilities={tools:{}};
 const headers={'Cache-Control':'private, no-store','Content-Type':'application/json; charset=utf-8','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'};
 const response=(value,status=200)=>new Response(value===null?null:JSON.stringify(value),{status,headers});
-const error=(id,code,message,status=400)=>response({jsonrpc:'2.0',id,error:{code,message}},status);
+const error=(id,code,message,status=400,data)=>response({jsonrpc:'2.0',id,error:{code,message,...(data===undefined?{}:{data})}},status);
+const record=value=>!!value&&typeof value==='object'&&!Array.isArray(value);
+// Decode only routing metadata, never identity. Strict UTF-8/Base64 prevents
+// different intermediaries from interpreting the same header differently.
+function routingName(value){
+ if(value===null)return null;
+ if(value.startsWith('=?base64?')&&value.endsWith('?=')){
+  const encoded=value.slice(9,-2);
+  if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded))return null;
+  try{const binary=atob(encoded);if(btoa(binary)!==encoded)return null;return new TextDecoder('utf-8',{fatal:true}).decode(Uint8Array.from(binary,c=>c.charCodeAt(0)));}catch{return null;}
+ }
+ return /^[\x21-\x7e](?:[\x09\x20-\x7e]*[\x21-\x7e])?$/.test(value)?value:null;
+}
 const object=(properties={},required=Object.keys(properties))=>({type:'object',properties,required,additionalProperties:false});
 const integer={type:'integer',minimum:0,maximum:Number.MAX_SAFE_INTEGER};
 const hash={type:'string',pattern:'^[a-f0-9]{64}$'};
@@ -73,28 +92,59 @@ async function readJSON(request){
  return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
 }
 export async function handleMcp(request,env,handlers){
+ const protocol=request.headers.get('MCP-Protocol-Version');
+ const unreadId=protocol===modernVersion?undefined:null;
  const origin=request.headers.get('Origin');
- if(origin!==null&&origin!==new URL(request.url).origin)return error(null,-32600,'Invalid request origin',403);
+ if(origin!==null&&origin!==new URL(request.url).origin)return error(unreadId,-32600,'Invalid request origin',403);
  if(request.method!=='POST')return new Response(null,{status:405,headers:{...headers,Allow:'POST'}});
- if((request.headers.get('Content-Type')||'').split(';')[0].trim()!=='application/json')return error(null,-32600,'JSON required',415);
- const protocol=request.headers.get('MCP-Protocol-Version');if(protocol&&!versions.includes(protocol))return error(null,-32600,'Unsupported MCP protocol version');
- let message;try{message=await readJSON(request);}catch(cause){return error(null,-32700,'Invalid or oversized JSON request',cause.status||400);}
- if(!message||Array.isArray(message)||message.jsonrpc!=='2.0'||typeof message.method!=='string'||Object.keys(message).some(key=>!['jsonrpc','id','method','params'].includes(key)))return error(null,-32600,'Invalid JSON-RPC request');
+ if((request.headers.get('Content-Type')||'').split(';')[0].trim()!=='application/json')return error(unreadId,-32600,'JSON required',415);
+ let message;try{message=await readJSON(request);}catch(cause){return error(unreadId,-32700,'Invalid or oversized JSON request',cause.status||400);}
+ if(!message||Array.isArray(message)||message.jsonrpc!=='2.0'||typeof message.method!=='string'||Object.keys(message).some(key=>!['jsonrpc','id','method','params'].includes(key)))return error(unreadId,-32600,'Invalid JSON-RPC request');
  const id=message.id??null;
- if(Object.hasOwn(message,'id')&&!(typeof id==='string'&&id.length<=200||Number.isSafeInteger(id)))return error(null,-32600,'Invalid request identifier');
+ if(Object.hasOwn(message,'id')&&!(typeof id==='string'&&id.length<=200||Number.isSafeInteger(id)))return error(unreadId,-32600,'Invalid request identifier');
+ const meta=message.params?._meta;
+ // Modern requests select their own era. No initialization/session state or
+ // caller-supplied clientInfo/capabilities is ever used for authorization.
+ const modern=protocol===modernVersion
+  ||record(meta)&&Object.hasOwn(meta,protocolKey)&&!legacyVersions.includes(meta[protocolKey])
+  ||message.method==='server/discover'&&!legacyVersions.includes(protocol);
+ const errorId=Object.hasOwn(message,'id')?id:(modern?undefined:null);
+ if(modern){
+  // A missing required body field is InvalidParams; missing or conflicting
+  // HTTP mirrors are HeaderMismatch. Validate the body before comparison.
+  if(!record(meta)||typeof meta[protocolKey]!=='string'||!record(meta[capabilitiesKey]))return error(errorId,-32602,'Invalid per-request client metadata');
+  if(!protocol||protocol!==meta[protocolKey])return error(errorId,-32020,'Header mismatch: MCP-Protocol-Version must match request metadata');
+ }
+ if(protocol&&!versions.includes(protocol))return error(errorId,-32022,'Unsupported protocol version',400,{supported:versions,requested:protocol});
  if(!Object.hasOwn(message,'id')){
+  if(modern)return error(undefined,-32600,'Client notifications are not supported by modern Streamable HTTP');
   if(['notifications/initialized','notifications/cancelled'].includes(message.method))return response(null,202);
   return error(null,-32600,'This method requires a request identifier');
  }
- const success=result=>response({jsonrpc:'2.0',id,result});
- if(message.method==='initialize'){
+ if(modern){
+  if(request.headers.get('Mcp-Method')!==message.method||!/^[\x21-\x7e]+$/.test(message.method))return error(id,-32020,'Header mismatch: Mcp-Method must match request method');
+  if(['tools/call','resources/read','prompts/get'].includes(message.method)){
+   const name=message.method==='resources/read'?message.params?.uri:message.params?.name;
+   if(typeof name!=='string'||routingName(request.headers.get('Mcp-Name'))!==name)return error(id,-32020,'Header mismatch: Mcp-Name must match request name');
+  }
+  if(Object.hasOwn(meta,clientInfoKey)&&(!record(meta[clientInfoKey])||typeof meta[clientInfoKey].name!=='string'||typeof meta[clientInfoKey].version!=='string'))return error(id,-32602,'Invalid per-request client metadata');
+ }
+ // Modern discovery/list results require explicit cache hints. Keep them
+ // immediately stale and private, consistent with the HTTP no-store policy.
+ const resultForEra=result=>modern?{...result,...(['server/discover','tools/list'].includes(message.method)?{ttlMs:0,cacheScope:'private'}:{}),resultType:'complete',_meta:{'io.modelcontextprotocol/serverInfo':serverInfo}}:result;
+ const success=result=>response({jsonrpc:'2.0',id,result:resultForEra(result)});
+ if(message.method==='initialize'&&!modern){
   const p=message.params;if(!p||typeof p.protocolVersion!=='string'||!p.capabilities||typeof p.capabilities!=='object'||!p.clientInfo||typeof p.clientInfo.name!=='string'||typeof p.clientInfo.version!=='string')return error(id,-32602,'Invalid initialization parameters');
-  return success({protocolVersion:versions.includes(p.protocolVersion)?p.protocolVersion:versions[0],capabilities:{tools:{}},serverInfo:{name:'academic-radar',version:'1.0.0'}});
+  return success({protocolVersion:legacyVersions.includes(p.protocolVersion)?p.protocolVersion:legacyVersions[0],capabilities,serverInfo});
+ }
+ if(message.method==='server/discover'&&modern){
+  if(Object.keys(message.params).some(key=>key!=='_meta'))return error(id,-32602,'Unexpected discovery parameters');
+  return success({supportedVersions:versions,capabilities});
  }
  if(message.method==='ping')return success({});
  if(message.method==='tools/list'){
-  // RequestParams._meta is a standard MCP extension field, including during
-  // discovery. It is ignored, never used as identity or application input.
+  // RequestParams._meta also carries standard discovery extensions. Modern
+  // protocol fields were checked above; none is identity or application input.
   const p=message.params;
   if(p!==undefined&&(!p||typeof p!=='object'||Array.isArray(p)||Object.keys(p).some(key=>!['_meta','cursor'].includes(key))
    ||Object.hasOwn(p,'_meta')&&(!p._meta||typeof p._meta!=='object'||Array.isArray(p._meta))
@@ -102,7 +152,7 @@ export async function handleMcp(request,env,handlers){
   return success({tools});
  }
  if(message.method!=='tools/call')return error(id,-32601,'Method not found',404);
- // Authorization precedes tool/argument inspection and all database access.
+ // Authorization precedes domain tool/argument validation and all database access.
  // The Sites deployment boundary must strip untrusted identity headers.
  if(!isOwner(request,env))return error(id,-32001,'Site owner sign-in required',403);
  if(!env.DB)return error(id,-32000,'Site database unavailable',503);
@@ -114,7 +164,7 @@ export async function handleMcp(request,env,handlers){
   let result=await handlers[tool.name](args);
   if(result instanceof Response){if(!result.ok)throw Object.assign(new Error('Site operation refused'),{status:result.status});result=await result.json();}
   const envelope=value=>({content:[{type:'text',text:JSON.stringify(value)}],structuredContent:value,isError:false});
-  const size=value=>new TextEncoder().encode(JSON.stringify({jsonrpc:'2.0',id,result:value})).length;
+  const size=value=>new TextEncoder().encode(JSON.stringify({jsonrpc:'2.0',id,result:resultForEra(value)})).length;
   let resultEnvelope=envelope(result);
   if(size(resultEnvelope)>MAX_BYTES&&tool.name==='stage_snapshot'&&args.action==='begin'&&Array.isArray(result.missing)){
    // Incremental negotiation is optional. Omitting this list instructs the
