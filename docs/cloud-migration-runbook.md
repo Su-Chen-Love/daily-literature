@@ -26,6 +26,15 @@ Site/bucket is one owner namespace; a future multi-tenant product needs separate
 per-tenant state, event sequences, object prefixes, authorization and CAS heads.
 Never share this owner's existing state when introducing a new account.
 
+## Final source-state delta
+
+When a verified baseline has already been transferred and the last source run
+only changes a small part of SQLite, use the bounded, typed
+[closed-snapshot delta workflow](sqlite-state-delta.md). It requires exact schema
+and full logical baseline hashes, produces only a new verified database copy,
+and runs before path relocation. It does not replace history-file transfer,
+reference validation, full checkpoints, or cutover approval.
+
 ## Durability and publication contract
 
 A normal cloud task's filesystem is disposable. The canonical state is the
