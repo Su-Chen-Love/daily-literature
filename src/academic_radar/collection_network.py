@@ -170,8 +170,17 @@ class CollectionNetworkState:
         # conservative run-only resolver deferral, not a permanent publisher ban.
         for cause in _causes(error):
             if isinstance(cause, urllib.error.HTTPError):
+                # Python 3.9 leaves addinfourl uninitialized when fp is None;
+                # geturl()/getattr(url) can then enter tempfile's missing-file
+                # proxy and raise KeyError. Both fields below are URL metadata,
+                # without invoking that response/file wrapper.
+                final_url = vars(cause).get("url")
+                if not isinstance(final_url, str) or not final_url:
+                    final_url = cause.filename
+                if not isinstance(final_url, str):
+                    continue
                 try:
-                    final = _origin(cause.geturl())
+                    final = _origin(final_url)
                     if final[0] in ("http", "https") and final[1]:
                         origins.add(final)
                 except (TypeError, ValueError):

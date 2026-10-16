@@ -288,6 +288,51 @@ class CollectionNetworkTests(unittest.TestCase):
             enrichment.MetadataClient({}).request('publisher', 'https://doi.org/10.2/available')
             self.assertEqual(self.network.call_count, 2)
 
+    @staticmethod
+    def legacy_http_error(url):
+        # Reproduce Python 3.9 HTTPError(fp=None): addinfourl/tempfile fields
+        # were never initialized, but filename/code/headers are available.
+        error = urllib.error.HTTPError.__new__(urllib.error.HTTPError)
+        error.code = 429
+        error.msg = "limited"
+        error.hdrs = {"Retry-After": "7200"}
+        error.fp = None
+        error.filename = url
+        return error
+
+    def test_missing_response_file_uses_constructor_url_without_geturl(self):
+        error = self.legacy_http_error('https://publisher-one.test/final')
+        with self.assertRaises(KeyError): error.geturl()
+        client = enrichment.MetadataClient({})
+        self.network.side_effect = urllib.error.URLError(error)
+        with self.assertRaises(policy.ProviderDeferred): client.request('publisher', 'https://doi.org/10.1/one')
+        for url in ('https://publisher-one.test/another', 'https://doi.org/10.2/two'):
+            with self.assertRaises(policy.ProviderDeferred): client.request('publisher', url)
+        self.assertEqual(self.network.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_missing_final_url_metadata_still_gates_requested_origin(self):
+        error = self.legacy_http_error(None)
+        with self.assertRaises(KeyError): error.geturl()
+        with policy.collection_network_scope():
+            self.network.side_effect = error
+            with self.assertRaises(policy.ProviderDeferred): pm.request_json('https://api.openalex.org/one', {}, 10, 1, 1)
+            with self.assertRaises(policy.ProviderDeferred): official._fetch_text('https://api.openalex.org/two')
+        self.assertEqual(self.network.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_stored_final_url_metadata_does_not_call_broken_geturl(self):
+        error = http_error(429, '7200')
+        error.url = 'https://publisher-final.test/article'
+        client = enrichment.MetadataClient({})
+        self.network.side_effect = error
+        with patch.object(error, 'geturl', side_effect=KeyError('file')) as geturl:
+            with self.assertRaises(policy.ProviderDeferred): client.request('publisher', 'https://doi.org/10.1/one')
+            with self.assertRaises(policy.ProviderDeferred): client.request('publisher', 'https://publisher-final.test/another')
+            geturl.assert_not_called()
+        self.assertEqual(self.network.call_count, 1)
+        self.sleep.assert_not_called()
+
     def test_api_denial_does_not_fall_back_or_continue_sources(self):
         for first_type in ('crossref', 'openalex'):
             with tempfile.TemporaryDirectory() as td, contextlib.closing(pm.db_open(Path(td) / 'db')) as db:
