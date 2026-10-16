@@ -18,6 +18,10 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from .collection_network import (
+    NetworkAccessDenied, ProviderDeferred, collection_network_run,
+    current_network_state, http_status, retry_after_seconds, transient_error,
+)
 from .governance import publication_decision
 from .enrichment import clean_abstract
 from .product import manual_identity_for_title
@@ -241,22 +245,26 @@ def _remaining_time() -> float:
     return min(30.0, remaining)
 
 
+@collection_network_run
 def _bounded_map(function, values, workers):
-    deadline = _FETCH_DEADLINE.get()
-    def invoke(value):
-        token = _FETCH_DEADLINE.set(deadline)
-        try:
-            _remaining_time()
-            return function(value)
-        finally:
-            _FETCH_DEADLINE.reset(token)
+    # Context copies share the run-local gate and the per-source deadline.
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(invoke, values))
+        futures = [executor.submit(contextvars.copy_context().run, _bounded_invoke, function, value)
+                   for value in values]
+        return [future.result() for future in futures]
+
+
+def _bounded_invoke(function, value):
+    _remaining_time()
+    return function(value)
 
 
 def _fetch_text(url: str) -> str:
+    network = current_network_state()
+    publisher = urllib.parse.urlsplit(url).hostname not in {"api.crossref.org", "api.openalex.org"}
     request = urllib.request.Request(url, headers={"User-Agent": "PersonalAcademicRadar/0.10 (official issue verifier)"})
     for attempt in range(3):
+        network.check(url)
         try:
             with urllib.request.urlopen(request, timeout=_remaining_time()) as response:
                 # read1 performs at most one underlying buffered read, so a slow
@@ -277,19 +285,24 @@ def _fetch_text(url: str) -> str:
         except OfficialBudgetExceeded:
             raise
         except (urllib.error.URLError, TimeoutError) as exc:
-            status = getattr(exc, "code", None)
-            if attempt == 2 or status not in (None, 408, 429, 500, 502, 503, 504):
+            network.reject_denial(exc)
+            status = http_status(exc)
+            delay = retry_after_seconds(exc)
+            deadline = _FETCH_DEADLINE.get()
+            remaining = 30.0 if deadline is None else deadline - time.monotonic()
+            if delay is not None and transient_error(exc) and (
+                delay > 30 or (deadline is not None and delay >= remaining)
+            ):
+                raise network.defer(url, delay, exc, publisher=publisher) from None
+            if attempt == 2 or not transient_error(exc):
+                if status == 429:
+                    network.defer(url, delay if delay is not None else 600.0, exc, publisher=publisher)
                 raise
-            retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
-            try:
-                delay = float(retry_after) if retry_after else 2 ** attempt
-            except ValueError:
+            if delay is None:
                 delay = 2 ** attempt
-            if delay > 30:
-                raise  # Defer to a later run rather than ignoring a long server cooldown.
             if _FETCH_DEADLINE.get() is not None and delay >= _remaining_time():
                 raise OfficialBudgetExceeded("Official retry exceeds remaining budget") from None
-            time.sleep(max(0, delay))
+            time.sleep(delay)
     raise RuntimeError("官网请求失败")
 
 
@@ -389,6 +402,7 @@ def _metadata_publication_type(title: str) -> str:
     return "journal-article"
 
 
+@collection_network_run
 def _collect_print_metadata_source(
     source: dict[str, Any], spec: dict[str, Any], as_of_date: str,
 ) -> dict[str, Any]:
@@ -464,9 +478,15 @@ def _collect_print_metadata_source(
             )
             try:
                 openalex = _fetch_json(openalex_url)
-            except OfficialBudgetExceeded:
+            except (NetworkAccessDenied, ProviderDeferred, OfficialBudgetExceeded):
                 raise
             except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                network = current_network_state()
+                network.reject_denial(exc)
+                network.check(openalex_url)
+                if http_status(exc) == 429:
+                    delay = retry_after_seconds(exc)
+                    raise network.defer(openalex_url, delay if delay is not None else 600.0, exc) from None
                 openalex = {}
                 fallback_error = f"; exact-DOI OpenAlex lookup failed: {type(exc).__name__}: {str(exc)[:200]}"
             expected_doi = "https://doi.org/" + doi
@@ -678,6 +698,7 @@ def official_collection_budget(config: dict) -> dict:
     return result
 
 
+@collection_network_run
 def collect_supported_official(
     db_path: Path,
     config: dict[str, Any],
@@ -723,12 +744,18 @@ def collect_supported_official(
             else:
                 collected.append(_collect_print_metadata_source(source, item, plan["as_of_date"]))
             _remaining_time()
+        except NetworkAccessDenied:
+            raise
+        except ProviderDeferred as exc:
+            collected = [row for row in collected if row["source_name"] != item["source_name"]]
+            deferred.append({"source_name": item["source_name"], "reason": str(exc)})
         except OfficialBudgetExceeded:
             # Discard a source that did not finish within its bounded evidence
             # window, even if some article requests had already succeeded.
             collected = [row for row in collected if row["source_name"] != item["source_name"]]
             deferred.append({"source_name": item["source_name"], "reason": "Official collection time budget exhausted"})
         except Exception as exc:
+            current_network_state().reject_denial(exc)
             failures.append({"source_name": item["source_name"], "reason": str(exc)[:1000]})
         finally:
             _FETCH_DEADLINE.reset(token)

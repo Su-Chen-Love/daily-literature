@@ -10,6 +10,10 @@ from typing import Any
 
 PROJECT_SRC=Path(__file__).resolve().parents[1]/"src"
 if PROJECT_SRC.exists() and str(PROJECT_SRC) not in sys.path: sys.path.insert(0,str(PROJECT_SRC))
+from academic_radar.collection_network import (
+    NetworkAccessDenied, ProviderDeferred, collection_network_run, current_network_state,
+    http_status, retry_after_seconds, transient_error,
+)
 from academic_radar.enrichment import enrich_abstracts as run_enrichment, clean_abstract
 from academic_radar.governance import (
     publication_decision, should_preserve_publication_metadata, source_kind_from_evidence,
@@ -116,27 +120,31 @@ def date_parts(item: dict[str, Any]) -> str:
 
 def request_json(url: str, headers: dict[str,str], timeout: int, retries: int, backoff: float,
                  payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    network = current_network_state()
     data = json.dumps(payload).encode() if payload is not None else None
     hdr = {**headers, **({"Content-Type":"application/json"} if data else {})}
     for attempt in range(retries + 1):
+        network.check(url)
         try:
             with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=hdr), timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            status = getattr(exc, "code", None)
-            transient = status in (408, 429, 500, 502, 503, 504) or status is None
-            if attempt >= retries or not transient: raise
-            retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
-            delay = None
-            if retry_after:
-                try: delay = max(0.0,float(retry_after))
-                except ValueError:
-                    try:
-                        retry_at=email.utils.parsedate_to_datetime(retry_after)
-                        delay=max(0.0,(retry_at-dt.datetime.now(dt.timezone.utc)).total_seconds())
-                    except (TypeError,ValueError): pass
-            if delay is None: delay = backoff * 2**attempt + random.uniform(0, max(0.1,backoff))
-            time.sleep(min(delay, 60))
+            network.reject_denial(exc)
+            status = http_status(exc)
+            transient = transient_error(exc) or (status is None and isinstance(exc, json.JSONDecodeError))
+            delay = retry_after_seconds(exc)
+            if delay is not None and transient and delay > 60:
+                raise network.defer(url, delay, exc) from None
+            if attempt >= retries or not transient:
+                if status == 429:
+                    network.defer(url, delay if delay is not None else 600.0, exc)
+                raise
+            if delay is None:
+                delay = backoff * 2**attempt + random.uniform(0, max(0.1, backoff))
+            # Never shorten a provider's Retry-After to retry early.
+            if delay > 60:
+                raise network.defer(url, delay, exc) from None
+            time.sleep(delay)
     raise RuntimeError("unreachable")
 
 def config_load(path: Path) -> dict[str, Any]:
@@ -217,6 +225,7 @@ def db_open(path: Path) -> sqlite3.Connection:
     db.execute("INSERT OR REPLACE INTO meta VALUES('schema_version',?)", (str(latest_schema_version()),))
     db.commit(); return db
 
+@collection_network_run
 def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
     c = cfg.get("collection", {}); rows = max(1,min(1000,int(source.get("rows_per_page",c.get("rows_per_page",c.get("rows_per_source",80))))))
     max_pages=max(1,int(source.get("max_pages_per_source",c.get("max_pages_per_source",3))))
@@ -231,8 +240,11 @@ def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
     params["filter"] = ",".join(filters); params["sort"]="created"; params["order"]="desc"; params["cursor"]="*"
     result=[]; seen=set(); cursors={"*"}; downloaded=0
     for page in range(max_pages):
-        data = request_json(url+"?"+urllib.parse.urlencode(params), {"User-Agent":cfg.get("user_agent","ResearchPaperMonitor/1.0")},
-                            int(c.get("timeout_seconds",30)), int(c.get("max_retries",3)), float(c.get("backoff_seconds",2)))
+        try:
+            data = request_json(url+"?"+urllib.parse.urlencode(params), {"User-Agent":cfg.get("user_agent","ResearchPaperMonitor/1.0")},
+                                int(c.get("timeout_seconds",30)), int(c.get("max_retries",3)), float(c.get("backoff_seconds",2)))
+        except ProviderDeferred as exc:
+            raise CollectionIncomplete("Crossref", result, str(exc)) from None
         message=data.get("message",{}); items=message.get("items")
         if not isinstance(items,list):
             raise CollectionIncomplete("Crossref",result,"response has no valid items array")
@@ -271,13 +283,24 @@ def crossref_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
         params["cursor"]=next_cursor
     return result
 
+@collection_network_run
 def openalex_abstract(doi: str, cfg: dict[str,Any]) -> str:
     if not doi or not cfg.get("collection",{}).get("openalex_fallback",True): return ""
     c=cfg.get("collection",{}); url="https://api.openalex.org/works/https://doi.org/"+urllib.parse.quote(doi,safe="")
     mail = re.search(r"mailto:([^\s;)]+)", cfg.get("user_agent",""))
     if mail: url += "?mailto=" + urllib.parse.quote(mail.group(1))
     try: data=request_json(url,{"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),1,1)
-    except Exception: return ""
+    except (NetworkAccessDenied, ProviderDeferred): raise
+    except Exception as exc:
+        network = current_network_state()
+        network.reject_denial(exc)
+        # The last short/headerless 429 already installed a gate in request_json.
+        # Do not turn its first exhausted lookup into an absent abstract.
+        network.check(url)
+        if http_status(exc) == 429:
+            delay = retry_after_seconds(exc)
+            raise network.defer(url, delay if delay is not None else 600.0, exc) from None
+        return ""
     if normalize_doi(str(data.get("doi") or ""))!=normalize_doi(doi): return ""
     inv=data.get("abstract_inverted_index") or {}; words=[]
     for word, positions in inv.items():
@@ -290,6 +313,7 @@ def inverted_abstract(data: dict[str,Any]) -> str:
         words.extend((pos,word) for pos in positions)
     return clean_abstract(" ".join(word for _,word in sorted(words)))
 
+@collection_network_run
 def openalex_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> list[Paper]:
     source_id=source.get("openalex_id")
     if not source_id or (source.get("type")!="openalex" and not cfg.get("collection",{}).get("openalex_fallback",True)): return []
@@ -301,8 +325,11 @@ def openalex_collect(source: dict[str,Any], cfg: dict[str,Any], since: str) -> l
     if mail: params["mailto"]=mail.group(1)
     result=[]; seen=set(); cursors={"*"}; downloaded=0
     for page in range(max_pages):
-        data=request_json("https://api.openalex.org/works?"+urllib.parse.urlencode(params),
-          {"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),int(c.get("max_retries",3)),float(c.get("backoff_seconds",2)))
+        try:
+            data=request_json("https://api.openalex.org/works?"+urllib.parse.urlencode(params),
+              {"User-Agent":cfg.get("user_agent","")},int(c.get("timeout_seconds",30)),int(c.get("max_retries",3)),float(c.get("backoff_seconds",2)))
+        except ProviderDeferred as exc:
+            raise CollectionIncomplete("OpenAlex", result, str(exc)) from None
         items=data.get("results")
         if not isinstance(items,list):
             raise CollectionIncomplete("OpenAlex",result,"response has no valid results array")
@@ -613,7 +640,9 @@ def update_source_health(db: sqlite3.Connection, source: str, status: str, now: 
       last_error=excluded.last_error, updated_at=excluded.updated_at""",
       (source,status,failures,last_success,last_failure,error or None,now))
 
+@collection_network_run
 def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite3.Connection | None=None) -> None:
+    deferred = None
     grouped: dict[str,list[Paper]]={}
     for paper in papers:
         paper.abstract=clean_abstract(paper.abstract)
@@ -629,7 +658,10 @@ def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite
             source=(prior[1] or "existing") if abstract else ""
             source_url=(prior[2] or "") if abstract else ""
         if not abstract:
-            abstract=openalex_abstract(group[0].doi,cfg)
+            try: abstract=openalex_abstract(group[0].doi,cfg)
+            except ProviderDeferred as exc:
+                deferred = exc
+                abstract = ""
             source="openalex-doi" if abstract else ""
             source_url="https://api.openalex.org/works/https://doi.org/"+urllib.parse.quote(group[0].doi,safe="") if abstract else ""
         if abstract:
@@ -643,6 +675,10 @@ def enrich_missing_abstracts(papers: list[Paper], cfg: dict[str,Any], db: sqlite
                 paper.low_priority,paper.low_priority_reason=classify_low_priority(paper.title,paper.venue)
             paper.abstract_source=abstract_source_for(paper.abstract,paper.abstract_source)
 
+    if deferred is not None:
+        raise deferred
+
+@collection_network_run
 def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id: str) -> tuple[list[Paper],list[Paper],list[dict[str,str]]]:
     default_since=(dt.date.today()-dt.timedelta(days=int(cfg.get("lookback_days",14)))).isoformat()
     failures=[]; collected=[]
@@ -659,20 +695,27 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
         if source.get("type") in ("crossref","crossref-query"):
             attempted += 1
             try: papers.extend(crossref_collect(source,cfg,since)); succeeded += 1
+            except NetworkAccessDenied: raise
             except Exception as e:
+                current_network_state().reject_denial(e)
                 if isinstance(e,CollectionIncomplete): papers.extend(e.papers)
                 errors.append("Crossref: "+f"{type(e).__name__}: {str(e)[:200]}")
         if source.get("openalex_id") and (source.get("type")=="openalex" or cfg.get("collection",{}).get("openalex_fallback",True)):
             attempted += 1
             try: papers.extend(openalex_collect(source,cfg,since)); succeeded += 1
+            except NetworkAccessDenied: raise
             except Exception as e:
+                current_network_state().reject_denial(e)
                 if isinstance(e,CollectionIncomplete): papers.extend(e.papers)
                 errors.append("OpenAlex: "+f"{type(e).__name__}: {str(e)[:200]}")
         if not attempted:
             errors.append("No usable collection adapter is enabled for this source")
-        if papers: enrich_missing_abstracts(papers,cfg,db)
+        if papers:
+            try: enrich_missing_abstracts(papers,cfg,db)
+            except ProviderDeferred as exc:
+                errors.append("Abstract lookup: " + str(exc))
         collected.extend(papers)
-        status="healthy" if attempted and succeeded==attempted else ("degraded" if succeeded or papers else "failed")
+        status="healthy" if attempted and succeeded==attempted and not errors else ("degraded" if succeeded or papers else "failed")
         err="; ".join(errors)
         unique_count=len({paper.identity for paper in papers})
         db.execute("""INSERT OR REPLACE INTO source_runs(run_id,source,status,count,error,finished_at,since)
@@ -694,6 +737,7 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
     unique_new=list({paper.identity:paper for paper in new}.values())
     return unique_collected,unique_new,failures
 
+@collection_network_run
 def collect_only(config_path: Path, *, operation_id: str | None=None) -> int:
     """Collect APIs before official checks; optional cloud identity is resumable."""
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
@@ -750,6 +794,7 @@ def collect_only(config_path: Path, *, operation_id: str | None=None) -> int:
         db.close()
 
 
+@collection_network_run
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
                  batch_run: str | None=None, limit: int | None=None,
                  operation_id: str | None=None, collection_report: dict | None=None) -> int:

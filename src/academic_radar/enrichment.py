@@ -20,6 +20,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
+from .collection_network import (
+    NetworkAccessDenied, ProviderDeferred, ProviderTemporarilyUnavailable,
+    collection_network_run, current_network_state, http_status,
+    retry_after_seconds, transient_error,
+)
 from .governance import publication_decision, should_preserve_publication_metadata
 from .storage import connect, utc_now
 
@@ -92,10 +97,6 @@ class OfficialMetaParser(HTMLParser):
             self.values[name] = content
 
 
-class ProviderTemporarilyUnavailable(RuntimeError):
-    """Stop repeated calls after a provider's retries have been exhausted."""
-
-
 class EnrichmentBudgetExceeded(TimeoutError):
     """Defer unfinished enrichment without blocking semantic import."""
 
@@ -106,6 +107,7 @@ class MetadataClient:
         self.user_agent = str(config.get("user_agent", "PersonalAcademicRadar/0.8"))
         self.timeout = int(collection.get("timeout_seconds", 30))
         self.retries = min(3, max(0, int(collection.get("max_retries", 2))))
+        self.network = current_network_state()
         self.last_request: dict[str, float] = {}
         self.provider_backoff_until: dict[str, float] = {}
         self.semantic_scholar_cache: dict[str, dict[str, Any] | None] | None = None
@@ -127,6 +129,7 @@ class MetadataClient:
         content_type: str = "", accept: str = "application/json, application/xml, text/html;q=0.8",
         extra_headers: dict[str, str] | None = None,
     ) -> tuple[bytes, str, str]:
+        self.network.check(url)
         if self.deadline is not None and time.monotonic() >= self.deadline:
             raise EnrichmentBudgetExceeded("摘要补全时间预算已到，剩余项留待后续运行")
         backoff = self.provider_backoff_until.get(provider, 0.0) - time.monotonic()
@@ -137,12 +140,15 @@ class MetadataClient:
         elapsed = time.monotonic() - self.last_request.get(provider, 0.0)
         delay = self.minimum_interval.get(provider, 0.2) - elapsed
         if delay > 0:
+            if self.deadline is not None and delay >= self.deadline - time.monotonic():
+                raise EnrichmentBudgetExceeded("摘要补全请求间隔超过剩余时间预算")
             time.sleep(delay)
         headers = {"User-Agent": self.user_agent, "Accept": accept}
         headers.update(extra_headers or {})
         if content_type:
             headers["Content-Type"] = content_type
         for attempt in range(self.retries + 1):
+            self.network.check(url)
             remaining = self.deadline - time.monotonic() if self.deadline is not None else self.timeout
             if remaining <= 0:
                 raise EnrichmentBudgetExceeded("摘要补全时间预算已到，剩余项留待后续运行")
@@ -157,36 +163,32 @@ class MetadataClient:
                     return data, response.geturl(), content_type
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
                 self.last_request[provider] = time.monotonic()
-                status = getattr(exc, "code", None)
-                transient = status in {408, 429, 500, 502, 503, 504} or status is None
-                retry_after = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
-                try:
-                    wait = float(retry_after) if retry_after else 1.5 * (2 ** attempt)
-                except ValueError:
-                    wait = 1.5 * (2 ** attempt)
+                self.network.reject_denial(exc)
+                status = http_status(exc)
+                transient = transient_error(exc) or (status is None and isinstance(exc, ValueError))
+                wait = retry_after_seconds(exc)
+                remaining = self.deadline - time.monotonic() if self.deadline is not None else 30.0
+                if wait is not None and transient and (wait > 30 or wait >= remaining):
+                    raise self.network.defer(url, wait, exc, publisher=provider == "publisher") from None
                 if attempt >= self.retries or not transient:
                     if status == 429:
-                        # A single enrichment run can contain hundreds of papers.
-                        # After retries are exhausted, do not repeat the same
-                        # rejected call for every remaining record.
+                        self.network.defer(url, wait if wait is not None else 600.0, exc, publisher=provider == "publisher")
+                    elif provider != "publisher" and (
+                        status in {500, 502, 503, 504} or
+                        (status is None and isinstance(exc, (urllib.error.URLError, TimeoutError)))
+                    ):
+                        # Keep the existing central-API outage cooldown. Publisher
+                        # origins stay independent; a 429 is scoped by origin above.
                         self.provider_backoff_until[provider] = max(
                             self.provider_backoff_until.get(provider, 0.0),
-                            time.monotonic() + max(600.0, wait),
-                        )
-                    elif provider!="publisher" and (
-                        status in {500,502,503,504} or
-                        (status is None and isinstance(exc,(urllib.error.URLError,TimeoutError)))
-                    ):
-                        # Central API transport failures should not spend the
-                        # entire daily budget retrying the same outage for each
-                        # DOI. Publisher requests may target different hosts.
-                        self.provider_backoff_until[provider]=max(
-                            self.provider_backoff_until.get(provider,0.0),
-                            time.monotonic()+300.0,
+                            time.monotonic() + 300.0,
                         )
                     raise
-                remaining = self.deadline - time.monotonic() if self.deadline is not None else 30.0
-                time.sleep(min(30.0, max(0.0, remaining), max(0.0, wait)))
+                if wait is None:
+                    wait = 1.5 * (2 ** attempt)
+                if wait >= remaining:
+                    raise EnrichmentBudgetExceeded("摘要补全重试超过剩余时间预算") from None
+                time.sleep(wait)
         raise RuntimeError("metadata request failed")
 
     def json(self, provider: str, url: str) -> tuple[dict[str, Any], str]:
@@ -524,6 +526,7 @@ def _finish_task(db: sqlite3.Connection, task_id: str, status: str, details: dic
         )
 
 
+@collection_network_run
 def enrich_abstracts(
     db_path: Path,
     config: dict[str, Any],
@@ -547,10 +550,16 @@ def enrich_abstracts(
             first_seen DESC LIMIT ?""", (max(1, limit),)
         )]
         task_id = _start_task(db, "abstract_enrichment", len(paper_rows))
+        deferred_providers = set()
         if any(lookup is lookup_semantic_scholar for _, lookup in PROVIDERS):
             try:
                 prime_semantic_scholar_batch(client, paper_rows)
-            except Exception:
+            except NetworkAccessDenied:
+                raise
+            except Exception as exc:
+                client.network.reject_denial(exc)
+                if isinstance(exc, ProviderDeferred) or http_status(exc) == 429:
+                    deferred_providers.add("semantic_scholar")
                 # The ordinary per-paper path remains available and records its own evidence.
                 client.semantic_scholar_cache = None
         updated = 0
@@ -593,14 +602,20 @@ def enrich_abstracts(
                 except EnrichmentBudgetExceeded:
                     budget_exhausted = True
                     break
+                except NetworkAccessDenied:
+                    raise
                 except Exception as exc:
+                    client.network.reject_denial(exc)
+                    if isinstance(exc, ProviderDeferred) or http_status(exc) == 429:
+                        deferred_providers.add(provider)
                     detail = f"{type(exc).__name__}: {str(exc)[:300]}"
                     if isinstance(exc,urllib.error.HTTPError) and exc.code==404:
                         _record_attempt(db,task_id,paper["identity"],provider,"not_found",detail="精确标识未收录（HTTP 404）")
                         db.commit()
                         continue
                     failures.append(f"{PROVIDER_LABELS[provider]}：{detail}")
-                    _record_attempt(db, task_id, paper["identity"], provider, "failed", detail=detail)
+                    _record_attempt(db, task_id, paper["identity"], provider,
+                                    "skipped" if isinstance(exc, ProviderDeferred) else "failed", detail=detail)
                     db.commit()
                     continue
                 if not result:
@@ -702,6 +717,7 @@ def enrich_abstracts(
             "checked": checked,
             "deferred": len(paper_rows) - checked,
             "budget_exhausted": budget_exhausted,
+            "deferred_providers": len(deferred_providers),
             "updated": updated,
             "type_updated": type_updated,
             "unresolved": len(unresolved),
@@ -710,7 +726,7 @@ def enrich_abstracts(
             "evidence_updated": updated,
         }
         status = "succeeded" if not unresolved else ("partial" if updated or type_updated else "failed")
-        if budget_exhausted:
+        if budget_exhausted or deferred_providers:
             status = "partial"
         _finish_task(db, task_id, status, details)
         return details | {"status": status}

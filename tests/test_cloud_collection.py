@@ -121,6 +121,58 @@ class CloudCollectionTests(unittest.TestCase):
         Path(prepared['queue_path']).write_text(json.dumps(queue))
         with self.assertRaisesRegex(ValueError,'changed'): self.prepare()
 
+    def assert_network_denial_stops_stage(self, stage):
+        from academic_radar.collection_network import NetworkAccessDenied
+        from academic_radar.enrichment import MetadataClient
+        operation = 'denied-' + stage
+        self.network.side_effect = urllib.error.URLError('Tunnel connection failed:403 Forbidden private-secret')
+        if stage == 'api':
+            self.api.side_effect = lambda *_: self.pm.request_json('https://api.openalex.org/works', {}, 10, 2, 1)
+        elif stage == 'official':
+            self.adapter.side_effect = lambda *_: official._fetch_json('https://api.openalex.org/works')
+        else:
+            self.enrich.side_effect = lambda *a, **kw: MetadataClient({}).request('openalex', 'https://api.openalex.org/works')
+        with self.assertRaises(NetworkAccessDenied) as raised: self.prepare(operation)
+        self.assertNotIn('private-secret', str(raised.exception))
+        self.assert_no_queue()
+        self.assertNotIn('collection_report', self.journal(operation))
+        self.assertEqual(self.network.call_count, 1)
+
+    def test_api_network_denial_never_freezes_a_queue(self):
+        self.assert_network_denial_stops_stage('api')
+
+    def test_official_network_denial_never_freezes_a_queue(self):
+        self.assert_network_denial_stops_stage('official')
+
+    def test_enrichment_network_denial_never_freezes_a_queue(self):
+        self.assert_network_denial_stops_stage('enrichment')
+
+    def test_network_cooldown_spans_cloud_stages_without_changing_config_fingerprint(self):
+        from academic_radar.collection_network import ProviderDeferred, current_network_state
+        from academic_radar.enrichment import MetadataClient
+        import hashlib
+        config_bytes = self.config.read_bytes()
+        original_config = load_config(self.config)
+        portable = dict(original_config, state_dir='.')
+        expected_fingerprint = hashlib.sha256(runtime._canonical(portable).encode()).hexdigest()
+        self.network.side_effect = urllib.error.HTTPError('https://api.openalex.org/works', 429, 'limited', {'Retry-After':'7200'}, None)
+        self.api.side_effect = lambda *_: self.pm.request_json('https://api.openalex.org/works', {}, 10, 2, 1)
+        self.adapter.side_effect = lambda *_: official._fetch_json('https://api.openalex.org/next')
+        def enrich(*args, **kwargs):
+            with self.assertRaises(ProviderDeferred): MetadataClient({}).request('openalex', 'https://api.openalex.org/abstract')
+            return {'status':'partial', 'checked':0, 'deferred':1, 'budget_exhausted':False}
+        self.enrich.side_effect = enrich
+        prepared = self.prepare('cooldown-fixture')
+        self.assertEqual(self.network.call_count, 1)
+        report = prepared['collection_report']
+        self.assertEqual(report['api']['status'], 'failed')
+        self.assertEqual(report['official']['status'], 'deferred')
+        self.assertEqual(report['enrichment']['status'], 'partial')
+        self.assertNotEqual(report['status'], 'succeeded')
+        self.assertEqual(self.config.read_bytes(), config_bytes)
+        self.assertEqual(self.journal('cooldown-fixture')['collection_progress']['config_sha256'], expected_fingerprint)
+        self.assertEqual(current_network_state().deferred, {})
+
     def test_crash_after_api_rows_preserves_batch_and_new_identity_ledger(self):
         original=self.pm.collect_into_db
         def crash(*args,**kwargs):
@@ -207,7 +259,7 @@ class CloudCollectionTests(unittest.TestCase):
 
     def test_failure_and_unmapped_sources_are_honest_partial_coverage(self):
         self.write_config(extra='[[sources]]\nname="Unknown journal"\ntype="crossref"\nissn="9999-9999"\n')
-        self.adapter.side_effect=urllib.error.HTTPError('https://publisher.example',403,'forbidden',{},None)
+        self.adapter.side_effect=urllib.error.HTTPError('https://publisher.example',404,'not found',{},None)
         prepared=self.prepare(); report=prepared['collection_report']
         self.assertEqual([s['status'] for s in report['official']['sources']],['failed','unsupported'])
         self.assertEqual(report['official']['status'],'partial')

@@ -186,6 +186,35 @@ An explicit `--no-collect` runtime preparation, or native preparation without
 existing candidates without network collection or enrichment and is not proof
 of daily-collection acceptance.
 
+### Collection network failures
+
+Collection stops on HTTP 401/403/407 or an explicit network/access denial,
+including HTTP errors wrapped by `URLError` and proxy tunnel denials. The error
+is sanitized and propagates through source, abstract and batch fallbacks; no
+queue is frozen from a denied run. Ordinary DNS failures, timeouts and retryable
+server failures retain bounded retries.
+
+A valid `Retry-After` is parsed as finite seconds or an HTTP date. Short waits
+are honored in full. A delay above the client's existing wait bound (API: 60
+seconds; official/enrichment: 30 seconds), or beyond an available deadline,
+defers the origin for the remainder of the current run without sleeping and
+retrying early. Malformed/negative/non-finite headers use bounded backoff.
+The same in-memory gate covers API source loops, inline abstracts, official
+worker threads and enrichment. Deferred coverage remains failed/degraded,
+deferred or partial as appropriate; it is not counted as complete coverage.
+
+`urlopen` follows redirects internally. A rate limit on a redirected response
+therefore gates both its actual origin and the requested resolver origin. A
+publisher cooldown also conservatively defers unresolved DOI links, whether
+the first request used a direct publisher URL or `doi.org`. Known
+`dx.doi.org`/`www.doi.org` aliases are included; unrelated direct publisher
+origins remain available. Deferred lookup evidence explicitly identifies this
+resolver precaution. This avoids a hidden redirect retry without replacing urllib's
+transport. Requests already in flight may finish, but later request attempts
+check the shared gate. The gate resets at a later independent invocation. No
+source configuration, configuration fingerprint or permanent provider policy
+is changed; restarting an interrupted operation remains a separate decision.
+
 ### Official collection budgets
 
 The reviewed runtime config may include:

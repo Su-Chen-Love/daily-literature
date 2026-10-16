@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import cloud_runtime as runtime
 from . import official
+from .collection_network import collection_network_run
 from .checkpoints import _absolute, _regular, _relative
 from .product import _atomic_write, load_config, resolve_state
 from .storage import connect, utc_now
@@ -65,6 +66,7 @@ def _official_status(sources):
     return "partial"
 
 
+@collection_network_run
 def run(config_path: Path, operation_id: str, saved: dict, monitor, *, checkpoint=None, hydrate_official=None) -> dict:
     """Resume one original head/config/date/batch, with no queue side effects.
 
