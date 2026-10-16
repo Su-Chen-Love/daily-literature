@@ -1,0 +1,438 @@
+"""Portable local D1 relay; launch with an explicit trusted Python and -I -B.
+
+This file never invokes native tools, discovers credentials, or performs HTTP.
+Only a separately approved host may service its private request files.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.abc
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+import types
+
+ROOT = Path(__file__).absolute().parent.parent
+SOURCE_FORMAT = 'academic-radar-d1-native-source-v1'
+MAX = 2_000_000
+OPERATIONS = frozenset({
+    'site.read_main_store', 'site.write_main_store', 'site.publish_main_snapshot', 'site.read_site_backup',
+    'site.read_run_status', 'site.read_feedback', 'site.read_profile_events', 'site.read_profile', 'site.stage_snapshot',
+})
+
+
+class RelayError(RuntimeError):
+    pass
+
+
+def check(condition, code='invalid_arguments'):
+    if not condition:
+        raise RelayError(code)
+
+
+def directory(path):
+    """Open every absolute ancestor without following symlinks."""
+    path = Path(path)
+    check(path.is_absolute() and '..' not in path.parts, 'unsafe_path')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            following = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = following
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def file_bytes(path, maximum=None):
+    path = Path(path)
+    parent = directory(path.parent)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            before = os.fstat(fd)
+            check(stat.S_ISREG(before.st_mode) and (maximum is None or before.st_size <= maximum), 'unsafe_file')
+            with os.fdopen(fd, 'rb', closefd=False) as handle:
+                raw = handle.read(before.st_size + 1)
+            after = os.fstat(fd)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            stamp = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            check(stamp(before) == stamp(after) == stamp(current) and len(raw) == before.st_size, 'file_changed')
+            return raw
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent)
+
+
+def inventory(root=ROOT):
+    """Relative, reproducible source inventory; bytecode is never executed."""
+    root = Path(root)
+    fd = directory(root)
+    os.close(fd)
+    files = [root/'scripts/d1-native-relay.py', root/'scripts/d1-native-pump.js']
+    package = root/'src/academic_radar'
+    fd = directory(package)
+    os.close(fd)
+    for current, directories, names in os.walk(package, followlinks=False):
+        for name in list(directories):
+            path = Path(current)/name
+            if name == '__pycache__':
+                directories.remove(name)
+            else:
+                check(not path.is_symlink(), 'source_symlink')
+        for name in names:
+            if not name.endswith(('.pyc', '.pyo')):
+                files.append(Path(current)/name)
+    return {str(path.relative_to(root)): hashlib.sha256(file_bytes(path)).hexdigest() for path in sorted(files)}
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode() + b'\n'
+
+
+def pin_source(output, root=ROOT):
+    """Explicit inventory creation, never an implicit repair of a failing pin."""
+    output, root = Path(output), Path(root)
+    check(output.is_absolute() and root not in output.parents, 'pin_must_be_outside_checkout')
+    raw = canonical({'format': SOURCE_FORMAT, 'files': inventory(root)})
+    parent = directory(output.parent)
+    try:
+        fd = os.open(output.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(raw); handle.flush(); os.fchmod(handle.fileno(), 0o400); os.fsync(handle.fileno())
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    return {'source_manifest_sha256': hashlib.sha256(raw).hexdigest(), 'files': len(json.loads(raw)['files'])}
+
+
+def unique_pairs(items):
+    result = {}
+    for key, value in items:
+        check(key not in result, 'duplicate_manifest_key')
+        result[key] = value
+    return result
+
+
+def verify_source(path, expected, root=ROOT):
+    check(isinstance(expected, str) and re.fullmatch('[0-9a-f]{64}', expected), 'invalid_source_pin')
+    raw = file_bytes(path, MAX)
+    check(hashlib.sha256(raw).hexdigest() == expected, 'source_pin_changed')
+    value = json.loads(raw, object_pairs_hook=unique_pairs)
+    check(isinstance(value, dict) and set(value) == {'format', 'files'} and value['format'] == SOURCE_FORMAT,
+          'invalid_source_manifest')
+    check(value['files'] == inventory(root), 'reviewed_source_changed')
+    return value['files']
+
+
+class SourceOnlyLoader(importlib.abc.Loader):
+    """Compile the pinned .py bytes directly; never consult or create a .pyc."""
+    def __init__(self, path, expected):
+        self.path, self.expected = path, expected
+
+    def create_module(self, spec):
+        return None
+
+    def get_code(self, fullname):
+        raw = file_bytes(self.path)
+        check(hashlib.sha256(raw).hexdigest() == self.expected, 'reviewed_source_changed')
+        return compile(raw, str(self.path), 'exec', dont_inherit=True)
+
+    def exec_module(self, module):
+        exec(self.get_code(module.__name__), module.__dict__)
+
+
+class SourceOnlyFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, files, root=ROOT):
+        self.files, self.root = files, Path(root)
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname != 'academic_radar' and not fullname.startswith('academic_radar.'):
+            return None
+        check(re.fullmatch(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*', fullname), 'invalid_module')
+        base = 'src/' + fullname.replace('.', '/')
+        package = base + '/__init__.py' in self.files
+        relative = base + ('/__init__.py' if package else '.py')
+        # Do not fall through to installed/namespace packages for unpinned modules.
+        check(relative in self.files, 'unpinned_module')
+        filename = self.root/relative
+        loader = SourceOnlyLoader(filename, self.files[relative])
+        return importlib.util.spec_from_file_location(fullname, filename, loader=loader,
+            submodule_search_locations=[str(filename.parent)] if package else None)
+
+
+def make_transport(manifest, expected, files, root=ROOT):
+    """Create independent adapter state; importing it never mutates legacy spool."""
+    from academic_radar import native_host, d1_native_host
+    transport = types.ModuleType('academic_radar._d1_spool_transport')
+    transport.__package__ = 'academic_radar'
+    transport.__file__ = str(Path(root)/'src/academic_radar/native_spool.py')
+    loader = SourceOnlyLoader(Path(transport.__file__), files['src/academic_radar/native_spool.py'])
+    exec(loader.get_code(transport.__name__), transport.__dict__)
+    original_request, original_response = transport._request, transport._response
+    original_announce, original_remaining = transport._announce, transport._Pipe.remaining
+    live = None
+
+    def request(value, session, number):
+        result = original_request(value, session, number)
+        native_host._site_arguments(value['operation'][5:], value['arguments'])
+        return result
+
+    def response(raw, req):
+        raw = original_response(raw, req)
+        value = transport._decode(raw)
+        if value['ok']:
+            native_host._site_result(req['operation'][5:], req['arguments'], value['result'])
+        return raw
+
+    def terminal(value, session, number):
+        transport._check(set(value) in (
+            {'protocol', 'type', 'session_id', 'request_id', 'ok', 'result'},
+            {'protocol', 'type', 'session_id', 'request_id', 'ok', 'error'})
+            and value['type'] == 'result' and type(value['ok']) is bool)
+        transport._session(value, session, number)
+        if value['ok']:
+            transport._check(isinstance(value['result'], dict))
+            return value  # Private file only; stdout contains metadata.
+        transport._check(isinstance(value['error'], dict))
+        return {**value, 'error': {'code': 'native_host_failed'}}
+
+    def spawn(arguments, _workspace):
+        verify_source(manifest, expected, root)
+        return subprocess.Popen([sys.executable, '-I', '-B', str(Path(root)/'scripts/d1-native-relay.py'),
+            '--source-manifest', str(manifest), '--source-manifest-sha256', expected, 'host', *arguments],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True, bufsize=0)
+
+    def remaining(pipe):
+        value = original_remaining(pipe)
+        if live is not None:
+            spool, name = live
+            spool._intact()
+            os.utime(name, dir_fd=spool.fd, follow_symlinks=False)
+        return value
+
+    def announce(spool, output, value, deadline=None):
+        nonlocal live
+        if value['type'] == 'request_ready':
+            heartbeat = 'live-%d.json' % value['request_id']
+            spool.save(heartbeat, b'{}\n')
+            live = spool, heartbeat
+            spool.save('pending-%d.json' % value['request_id'], transport._encode({
+                'heartbeat': heartbeat, 'deadline_unix_ms': int((time.time() + deadline - time.monotonic()) * 1000),
+                'request_sha256': hashlib.sha256(file_bytes(value['path'], MAX)).hexdigest()}))
+        return original_announce(spool, output, value, deadline)
+
+    transport.OPERATIONS = OPERATIONS
+    transport.native_parser = d1_native_host.parser
+    transport._request, transport._response = request, response
+    transport._curated_result, transport._spawn_native = terminal, spawn
+    transport._announce, transport._Pipe.remaining = announce, remaining
+    return transport
+
+
+def existing(transport, path):
+    path = Path(path)
+    transport._check(path.is_absolute() and transport.LEAF.fullmatch(path.name), 'unsafe_spool')
+    spool = transport.PrivateSpool.__new__(transport.PrivateSpool)
+    spool.path, spool.name = path, path.name
+    spool.parent_fd = spool.fd = None
+    try:
+        _, spool.parent_fd = transport._absolute_directory(path.parent)
+        spool.parent_identity = os.fstat(spool.parent_fd)
+        spool.fd = os.open(path.name, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=spool.parent_fd)
+        spool.identity = os.fstat(spool.fd)
+        spool._intact()
+        return spool
+    except BaseException:
+        spool.close()
+        raise
+
+def read(transport, spool, name, *, heartbeat=False):
+    spool._intact()
+    fd = os.open(name, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK, dir_fd=spool.fd)
+    try:
+        first = os.fstat(fd)
+        transport._check(stat.S_ISREG(first.st_mode) and first.st_nlink == 1 and first.st_uid == os.geteuid()
+                         and first.st_mode & 0o077 == 0 and 0 < first.st_size <= MAX, 'unsafe_file')
+        chunks = []
+        total = 0
+        while total <= MAX:
+            raw = os.read(fd, min(65536, MAX + 1 - total))
+            if not raw: break
+            chunks.append(raw); total += len(raw)
+        raw = b''.join(chunks)
+        last = os.fstat(fd)
+        current = os.stat(name, dir_fd=spool.fd, follow_symlinks=False)
+        stamp = lambda s: (s.st_dev,s.st_ino,s.st_size) + (() if heartbeat else (s.st_mtime_ns,s.st_ctime_ns))
+        transport._check(stamp(first) == stamp(last) == stamp(current) and len(raw) == first.st_size, 'file_changed')
+        return raw
+    finally:
+        os.close(fd)
+
+def absent(transport, spool, name):
+    try: os.stat(name, dir_fd=spool.fd, follow_symlinks=False)
+    except FileNotFoundError: return
+    raise transport.RelayError('file_already_exists')
+
+def pending(transport, spool, number):
+    transport._check(type(number) is int and 1 <= number <= transport.MAX_REQUESTS)
+    absent(transport, spool, 'result.json'); absent(transport, spool, 'response-%d.json' % number)
+    raw = read(transport, spool, 'request-%d.json' % number)
+    req = transport._decode(raw)
+    transport._request(req, None, number)
+    state = transport._decode(read(transport, spool, 'pending-%d.json' % number))
+    transport._check(set(state) == {'heartbeat', 'deadline_unix_ms', 'request_sha256'}
+                     and type(state['deadline_unix_ms']) is int and time.time() * 1000 < state['deadline_unix_ms'], 'relay_deadline_passed')
+    transport._check(hashlib.sha256(raw).hexdigest() == state['request_sha256'], 'request_changed')
+    heartbeat = 'live-%d.json' % number
+    transport._check(state['heartbeat'] == heartbeat, 'invalid_liveness')
+    check(read(transport, spool, heartbeat, heartbeat=True) == b'{}\n', 'invalid_liveness')
+    info = os.stat(heartbeat, dir_fd=spool.fd, follow_symlinks=False)
+    transport._check(0 <= time.time() - info.st_mtime <= 15, 'relay_not_live')
+    return req, raw, state
+
+def terminal_metadata(transport, spool):
+    value = transport._decode(read(transport, spool, 'result.json'))
+    base = {'protocol', 'type', 'session_id', 'request_id', 'ok'}
+    transport._check(value.get('protocol') == transport.PROTOCOL and type(value.get('ok')) is bool
+        and type(value.get('request_id')) is int and 0 <= value['request_id'] <= transport.MAX_REQUESTS)
+    transport._check(value.get('type') in {'result', 'relay_error'})
+    if value['ok']:
+        transport._check(value['type'] == 'result' and set(value) == base | {'result'} and isinstance(value['result'], dict))
+    else:
+        transport._check(set(value) == base | {'error'} and isinstance(value['error'], dict)
+                         and set(value['error']) == {'code'} and isinstance(value['error']['code'], str)
+                         and re.fullmatch('[a-z_]{1,80}', value['error']['code']))
+    session, number = value['session_id'], value['request_id']
+    transport._check((number == 0 and value['type'] == 'relay_error' and session is None)
+                     or (isinstance(session, str) and transport.SESSION.fullmatch(session)))
+    if number:
+        req = transport._decode(read(transport, spool, 'request-%d.json' % number))
+        transport._request(req, session, number)
+        if value['ok']:
+            transport._response(read(transport, spool, 'response-%d.json' % number), req)
+    return {key:value[key] for key in ('type', 'ok', 'request_id')}
+
+
+def io_main(transport, argv=None):
+    parser = Parser()
+    parser.add_argument('action', choices=('poll','claim','read','preflight','append','publish','result'))
+    parser.add_argument('--spool', type=Path, required=True)
+    parser.add_argument('--number', type=int)
+    parser.add_argument('--offset', type=int, default=0)
+    parser.add_argument('--count', type=int, default=32768)
+    parser.add_argument('--text-json')
+    args = parser.parse_args(argv)
+    with existing(transport, args.spool) as spool:
+        if args.action == 'poll':
+            try:
+                value = terminal_metadata(transport, spool)
+                return {'state':'done', 'ok':value['ok'], 'request_id':value['request_id']}
+            except FileNotFoundError:
+                pass
+            try:
+                pending(transport, spool, args.number)
+                return {'state':'ready', 'request_id':args.number}
+            except FileNotFoundError:
+                return {'state':'waiting', 'request_id':args.number}
+        if args.action == 'result':
+            return terminal_metadata(transport, spool)
+        req, raw, state = pending(transport, spool, args.number)
+        claim_name = 'claim-%d.json' % args.number
+        if args.action == 'claim':
+            spool.save(claim_name, transport._encode({'request_sha256':state['request_sha256']}))
+            return {'request_id':args.number,'operation':req['operation'],'request_bytes':len(raw),
+                    'request_sha256':state['request_sha256']}
+        claim = transport._decode(read(transport, spool, claim_name))
+        transport._check(claim == {'request_sha256':state['request_sha256']}, 'claim_changed')
+        if args.action == 'preflight':
+            transport._check(state['deadline_unix_ms'] - time.time() * 1000 >= 1000, 'relay_deadline_passed')
+            spool.save('invoke-%d.json' % args.number, transport._encode(claim))
+            return {'ready':True, 'request_id':args.number, 'deadline_unix_ms':state['deadline_unix_ms']}
+        if args.action == 'read':
+            text = raw.decode('utf-8')
+            transport._check(0 <= args.offset <= len(text) and 1 <= args.count <= 131072)
+            part = text[args.offset:args.offset + args.count]
+            return {'offset':args.offset,'next':args.offset + len(part),'total':len(text),'text':part}
+        temporary = 'response-%d.partial' % args.number
+        if args.action == 'append':
+            text = json.loads(args.text_json)
+            transport._check(isinstance(text,str) and len(text) <= 32768)
+            part = text.encode('utf-8')
+            transport._check(0 <= args.offset <= MAX and args.offset + len(part) <= MAX, 'response_too_large')
+            flags = os.O_WRONLY|os.O_NOFOLLOW|(os.O_CREAT|os.O_EXCL if args.offset == 0 else 0)
+            fd = os.open(temporary, flags, 0o600, dir_fd=spool.fd)
+            try:
+                info = os.fstat(fd)
+                transport._check(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+                                 and info.st_mode & 0o077 == 0 and info.st_size == args.offset, 'invalid_response_offset')
+                os.lseek(fd, 0, os.SEEK_END)
+                with os.fdopen(fd, 'wb', closefd=False) as handle:
+                    handle.write(part); handle.flush(); os.fsync(fd)
+            finally: os.close(fd)
+            return {'next':args.offset + len(part)}
+        raw = read(transport, spool, temporary)
+        raw = transport._response(raw, req)
+        spool.save('response-%d.json' % args.number, raw)
+        return {'published':True,'request_id':args.number,'response_bytes':len(raw)}
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse's default diagnostics could echo a private response argument.
+        raise RelayError('invalid_arguments')
+
+
+def main(argv=None):
+    check(sys.flags.isolated, 'isolated_python_required')
+    parser = Parser(description=__doc__)
+    parser.add_argument('--source-manifest', type=Path)
+    parser.add_argument('--source-manifest-sha256')
+    parser.add_argument('mode', choices=('pin', 'check', 'pump', 'run', 'io', 'host'))
+    parser.add_argument('arguments', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.mode == 'pin':
+        pin_parser = Parser()
+        pin_parser.add_argument('--output', required=True, type=Path)
+        value = pin_source(pin_parser.parse_args(args.arguments).output)
+    else:
+        check(args.source_manifest is not None and args.source_manifest_sha256 is not None, 'explicit_source_pin_required')
+        files = verify_source(args.source_manifest, args.source_manifest_sha256)
+        if args.mode in {'check', 'pump'}:
+            check(not args.arguments)
+            value = {'verified': True, 'files': len(files)}
+            if args.mode == 'pump':
+                raw = file_bytes(ROOT/'scripts/d1-native-pump.js', MAX)
+                digest = hashlib.sha256(raw).hexdigest()
+                check(digest == files['scripts/d1-native-pump.js'], 'reviewed_source_changed')
+                value = {'source': raw.decode('utf-8'), 'source_sha256': digest, 'bytes': len(raw)}
+        else:
+            sys.meta_path.insert(0, SourceOnlyFinder(files))
+            if args.mode == 'host':
+                from academic_radar.d1_native_host import main as host_main
+                return host_main(args.arguments)
+            transport = make_transport(args.source_manifest, args.source_manifest_sha256, files)
+            if args.mode == 'run':
+                return transport.main(args.arguments)
+            value = io_main(transport, args.arguments)
+    print(json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except Exception:
+        # No argv, private payloads, exception bodies, or tracebacks on any failure.
+        print('{"error":"d1_relay_failed"}')
+        raise SystemExit(1)
