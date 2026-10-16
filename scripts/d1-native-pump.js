@@ -5,9 +5,12 @@ async function pumpD1(options) {
   const bytes = value => { let n=0; for (const ch of String(value)) { const c=ch.codePointAt(0); n += c<128?1:c<2048?2:c<65536?3:4; } return n; };
   const metrics = {native_calls:0, native_request_json_bytes:0, native_result_json_bytes:0, native_elapsed_ms:0,
     local_exec_calls:0, local_exec_request_json_bytes:0, local_exec_result_json_bytes:0, local_exec_elapsed_ms:0,
-    max_local_exec_command_bytes:0,
+    max_local_exec_command_bytes:0, local_poll_calls:0, local_poll_request_json_bytes:0,
+    local_poll_result_json_bytes:0, local_poll_elapsed_ms:0,
     native_by_action:{}};
-  const report = value => ({...value, metrics:{...metrics, elapsed_ms:Date.now()-started}});
+  const report = value => ({...value, metrics:{...metrics, elapsed_ms:Date.now()-started,
+    local_bridge_calls:metrics.local_exec_calls+metrics.local_poll_calls,
+    local_bridge_elapsed_ms:metrics.local_exec_elapsed_ms+metrics.local_poll_elapsed_ms}});
   const absolute = value => typeof value === 'string' && value.startsWith('/') &&
     !value.includes('\0') && !value.split('/').includes('..');
   if (![options.python, options.launcher, options.workspace, options.spool, options.source_manifest].every(absolute) ||
@@ -37,20 +40,81 @@ async function pumpD1(options) {
       '--source-manifest-sha256', options.source_manifest_sha256, 'io', action, '--spool', options.spool, '--number', number, ...extra];
     return argv.map(quote).join(' ');
   };
-  const execute = async cmd => {
+  const executionKey = 'd1_pending_local_exec:' + options.spool;
+  if (typeof store !== 'function' || typeof load !== 'function' || typeof tools.write_stdin !== 'function')
+    throw Error('private_session_recovery_unavailable');
+  if (load(executionKey) != null) throw Error('unreconciled_local_spool_session');
+  const execute = async (cmd, context) => {
     const size = bytes(cmd);
     if (size > commandLimit) throw Error('local_spool_command_too_large');
-    const call = {cmd, max_output_tokens:150000, yield_time_ms:10000};
-    metrics.local_exec_calls++; metrics.local_exec_request_json_bytes += bytes(JSON.stringify(call));
+    const began = Date.now(), deadline = began + 120000;
+    let session = null, exitCode = null, output = '', outputBytes = 0, polls = 0;
+    const ordinal = metrics.local_exec_calls + 1;
+    const retain = stage => {
+      // Diagnostic metadata only: never argv, stdout/stderr or exception bodies.
+      const value = {...context, stage, exec_ordinal:ordinal, command_bytes:size,
+        started_unix_ms:began, deadline_unix_ms:deadline, session_id:session,
+        exit_code:exitCode, output_bytes:outputBytes, polls,
+        counters:{native_calls:metrics.native_calls, native_request_json_bytes:metrics.native_request_json_bytes,
+          native_result_json_bytes:metrics.native_result_json_bytes, local_exec_calls:metrics.local_exec_calls,
+          local_poll_calls:metrics.local_poll_calls, native_elapsed_ms:metrics.native_elapsed_ms,
+          local_exec_elapsed_ms:metrics.local_exec_elapsed_ms, local_poll_elapsed_ms:metrics.local_poll_elapsed_ms,
+          local_exec_request_json_bytes:metrics.local_exec_request_json_bytes,
+          local_exec_result_json_bytes:metrics.local_exec_result_json_bytes,
+          local_poll_request_json_bytes:metrics.local_poll_request_json_bytes,
+          local_poll_result_json_bytes:metrics.local_poll_result_json_bytes}};
+      store(executionKey, value);
+      store('d1_last_local_exec:' + options.spool, value);
+    };
+    const invoke = async (poll, call) => {
+      const prefix = poll ? 'local_poll' : 'local_exec';
+      metrics[prefix + '_calls']++;
+      metrics[prefix + '_request_json_bytes'] += bytes(JSON.stringify(call));
+      const before = Date.now();
+      let out, failed = false;
+      try { out = await (poll ? tools.write_stdin(call) : tools.exec_command(call)); }
+      catch { failed = true; }
+      finally { metrics[prefix + '_elapsed_ms'] += Date.now()-before; }
+      if (failed) { retain('unknown'); throw Error('local_spool_io_failed'); }
+      if (!out || typeof out !== 'object' || Array.isArray(out)) {
+        retain('invalid_result'); throw Error('local_spool_io_failed');
+      }
+      metrics[prefix + '_result_json_bytes'] += bytes(JSON.stringify(out));
+      return out;
+    };
     metrics.max_local_exec_command_bytes = Math.max(metrics.max_local_exec_command_bytes, size);
-    const before = Date.now();
-    let out;
-    try { out = await tools.exec_command(call); }
-    catch { throw Error('local_spool_io_failed'); }
-    finally { metrics.local_exec_elapsed_ms += Date.now()-before; }
-    metrics.local_exec_result_json_bytes += bytes(JSON.stringify(out));
-    if (out.exit_code !== 0 || out.session_id) throw Error('local_spool_io_failed');
-    return out.output;
+    retain('starting');
+    let out = await invoke(false, {cmd, max_output_tokens:150000, yield_time_ms:10000});
+    while (true) {
+      if (out.session_id != null) {
+        if (!Number.isSafeInteger(out.session_id) || out.session_id < 1 ||
+            (session !== null && session !== out.session_id)) {
+          retain('invalid_session'); throw Error('local_spool_io_failed');
+        }
+        session = out.session_id;
+        if (out.exit_code != null) { retain('contradictory_result'); throw Error('local_spool_io_failed'); }
+      }
+      if (typeof out.output !== 'string') { retain('invalid_output'); throw Error('local_spool_io_failed'); }
+      outputBytes += bytes(out.output);
+      if (outputBytes > 2000000) { retain('output_limit'); throw Error('local_spool_io_failed'); }
+      output += out.output;
+      if (Number.isSafeInteger(out.exit_code)) {
+        exitCode = out.exit_code; retain('terminal');
+        if (exitCode !== 0) throw Error('local_spool_io_failed');
+        store(executionKey, null);
+        return output;
+      }
+      if (out.exit_code != null || session === null) { retain('invalid_result'); throw Error('local_spool_io_failed'); }
+      retain('running');
+      const remaining = deadline - Date.now();
+      if (remaining < 5000 || polls >= 12) {
+        retain('bounded_stop'); throw Error('local_spool_session_unresolved');
+      }
+      polls++;
+      // Observe the same already-started process. Never repeat its command or send input.
+      out = await invoke(true, {session_id:session, chars:'', max_output_tokens:150000,
+        yield_time_ms:Math.min(10000, remaining)});
+    }
   };
   const decode = output => {
     let value;
@@ -58,7 +122,9 @@ async function pumpD1(options) {
     if (value.error) throw Error('local_spool_io_failed');
     return value;
   };
-  const io = async (action, number, extra=[]) => decode(await execute(command(action, number, extra)));
+  const io = async (action, number, extra=[]) => decode(await execute(command(action, number, extra), {
+    action, request_id:number, offset_start:action === 'read' ? extra[1] : null,
+    offset_end:action === 'read' ? extra[1] + extra[3] : null}));
   const normalize = raw => {
     let value = typeof raw === 'string' ? JSON.parse(raw) : raw;
     if (!value || typeof value !== 'object' || Array.isArray(value) || value.isError === true || 'error' in value)
@@ -75,10 +141,11 @@ async function pumpD1(options) {
     const raw = JSON.stringify(value) + '\n';
     // Batch fixed append helpers, preserving every original validation. The whole
     // shell -c argument stays below Linux MAX_ARG_STRLEN, including UTF-8/quoting.
-    let offset = 0, batch = 'set -e;\n', expected = [];
+    let offset = 0, batch = 'set -e;\n', expected = [], batchStart = 0;
     const flush = async () => {
       if (!expected.length) return;
-      const output = await execute(batch);
+      const output = await execute(batch, {action:'append_batch', request_id:number,
+        offset_start:batchStart, offset_end:expected[expected.length-1]});
       const lines = output.trim().split('\n');
       if (lines.length !== expected.length) throw Error('invalid_local_write_progress');
       for (let i = 0; i < lines.length; i++) {
@@ -86,7 +153,7 @@ async function pumpD1(options) {
         if (Object.keys(result).length !== 1 || result.next !== expected[i])
           throw Error('invalid_local_write_progress');
       }
-      batch = 'set -e;\n'; expected = [];
+      batch = 'set -e;\n'; expected = []; batchStart = offset;
     };
     for (let at = 0; at < raw.length;) {
       let end = Math.min(at + 16384, raw.length), frame, next;

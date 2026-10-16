@@ -25,9 +25,22 @@ spec.loader.exec_module(relay)
 NODE = r'''
 const fs=require('node:fs'),vm=require('node:vm'),cp=require('node:child_process');
 const options=JSON.parse(process.argv[1]),mode=process.argv[2];let calls=0;
-let maxCommand=0,appendBatches=0,pendingReply=null;
+let maxCommand=0,appendBatches=0,pendingReply=null,execCalls=0,pollCalls=0,sessionOutput='';
+const saved=new Map();let clockOffset=0;
 const pendingExact=()=>!!(pendingReply&&pendingReply.number===1&&pendingReply.value.ok===true&&pendingReply.value.result.padding==='x'.repeat(365000));
-const ctx={store:(key,value)=>{pendingReply=value;},tools:{exec_command:async args=>{
+const ctx={Date:class extends Date{static now(){return Date.now()+clockOffset;}},store:(key,value)=>{saved.set(key,value);if(key.startsWith('d1_pending_reply:'))pendingReply=value;},load:key=>saved.get(key),tools:{
+write_stdin:async args=>{
+  pollCalls++;
+  if(args.session_id!==4321||args.chars!=='')throw Error('WRONG_SESSION_OR_INPUT');
+  if(mode==='session_exception')throw Error('PRIVATE_WAIT_EXCEPTION_SENTINEL');
+  if(mode==='session_running')return {session_id:4321,output:''};
+  if(mode==='session_changed')return {session_id:4322,output:''};
+  if(mode==='session_poll_contradiction')return {session_id:4321,exit_code:0,output:sessionOutput.slice(3)};
+  if(mode==='session_oversize')return {session_id:4321,output:'PRIVATE_OUTPUT_SENTINEL'+'x'.repeat(2000000)};
+  if(pollCalls===1)return {session_id:4321,output:sessionOutput.slice(3,13)};
+  return {exit_code:mode==='session_nonzero'?17:0,output:sessionOutput.slice(13)};
+},exec_command:async args=>{
+execCalls++;
 maxCommand=Math.max(maxCommand,Buffer.byteLength(args.cmd));
 if(Buffer.byteLength(args.cmd)>98304)throw Error('COMMAND_TOO_LARGE');
 if(args.cmd.startsWith('set -e;')){
@@ -41,11 +54,22 @@ if(args.cmd.startsWith('set -e;')){
 }
 const r=cp.spawnSync('/bin/sh',['-c',args.cmd],{encoding:'utf8',maxBuffer:3000000});
 if(mode==='expired_preflight' && args.cmd.includes("'preflight'") && r.status===0){const value=JSON.parse(r.stdout);value.deadline_unix_ms=Date.now()-1;r.stdout=JSON.stringify(value);}
+if(mode.startsWith('session_')&&args.cmd.startsWith('set -e;')&&appendBatches===1){
+  if(mode==='session_deadline')clockOffset=116000;
+  sessionOutput=r.stdout;
+  if(mode==='session_initial_contradiction')return {session_id:4321,exit_code:0,output:sessionOutput};
+  return {session_id:4321,output:sessionOutput.slice(0,3)};
+}
 return {exit_code:r.status,output:r.stdout};
 },mcp__codex_apps__app_read_main_store:async args=>{calls++;if(args.action!=='head')throw Error('wrong action');return {structuredContent:{head:{revision:0,import_id:null,manifest_sha256:null,watermarks:{feedback_cursor:0,profile_cursor:0,request_id:0}}}};},
-mcp__codex_apps__app_write_main_store:async args=>{calls++;if(mode==='reject')throw Error('PRIVATE_REJECTION_SENTINEL');if(args.data.chunks[0].data_base64!=='x'.repeat(500000))throw Error('payload mismatch');return {content:[{type:'text',text:JSON.stringify({ok:true,padding:mode==='ascii'||mode==='batch_failure'||mode==='bad_progress'||mode==='exec_throw'?'x'.repeat(365000):mode==='special'?('\\\"\'\n\t\u0000😀中文'.repeat(25000)):'中文😀'.repeat(60000)})}]};}}};
+mcp__codex_apps__app_write_main_store:async args=>{calls++;if(mode==='reject')throw Error('PRIVATE_REJECTION_SENTINEL');if(args.data.chunks[0].data_base64!=='x'.repeat(500000))throw Error('payload mismatch');return {content:[{type:'text',text:JSON.stringify({ok:true,padding:mode==='ascii'||mode==='batch_failure'||mode==='bad_progress'||mode==='exec_throw'||mode.startsWith('session_')?'x'.repeat(365000):mode==='special'?('\\\"\'\n\t\u0000😀中文'.repeat(25000)):'中文😀'.repeat(60000)})}]};}}};
 vm.createContext(ctx);vm.runInContext(fs.readFileSync(process.env.PUMP,'utf8'),ctx);
-ctx.pumpD1(options).then(result=>process.stdout.write(JSON.stringify({result,calls,maxCommand,appendBatches,pendingExact:pendingExact()})+'\n')).catch(error=>process.stdout.write(JSON.stringify({error:error.message,calls,maxCommand,appendBatches,pendingExact:pendingExact()})+'\n'));
+const diagnostic=()=>saved.get('d1_pending_local_exec:'+options.spool)??null;
+ctx.pumpD1(options).then(result=>process.stdout.write(JSON.stringify({result,calls,maxCommand,appendBatches,pendingExact:pendingExact(),execCalls,pollCalls,diagnostic:diagnostic()})+'\n')).catch(async error=>{
+  let blocked=null,unchanged=true;
+  if(mode.startsWith('session_')){const before=[execCalls,pollCalls,calls];try{await ctx.pumpD1(options);}catch(e){blocked=e.message;}unchanged=JSON.stringify(before)===JSON.stringify([execCalls,pollCalls,calls]);}
+  process.stdout.write(JSON.stringify({error:error.message,calls,maxCommand,appendBatches,pendingExact:pendingExact(),execCalls,pollCalls,diagnostic:diagnostic(),blocked,unchanged})+'\n');
+});
 '''
 
 
@@ -78,9 +102,11 @@ class D1NativeSpoolTests(unittest.TestCase):
         env = {**os.environ, 'PUMP':str(pump)}
         out = subprocess.run(['node','-e',NODE,json.dumps(options),mode], capture_output=True,text=True,env=env,timeout=60)
         self.assertEqual(out.returncode,0,out.stderr)
-        self.assertLess(len(out.stdout),1500)
+        self.assertLess(len(out.stdout),5000)
         self.assertNotIn('PRIVATE_REJECTION_SENTINEL',out.stdout+out.stderr)
         self.assertNotIn('PRIVATE_LOCAL_ARGV_SENTINEL',out.stdout+out.stderr)
+        self.assertNotIn('PRIVATE_WAIT_EXCEPTION_SENTINEL',out.stdout+out.stderr)
+        self.assertNotIn('PRIVATE_OUTPUT_SENTINEL',out.stdout+out.stderr)
         return json.loads(out.stdout)
 
     def stop(self, process):
@@ -194,6 +220,65 @@ class D1NativeSpoolTests(unittest.TestCase):
         self.assertEqual(out['calls'],1)
         self.assertEqual(self.transport._decode(spool.response(1))['result']['padding'],'x'*365000)
         self.assertEqual(relay.verify_source(manifest,sha,root)['scripts/d1-native-pump.js'],hashlib.sha256(helper_pump.read_bytes()).hexdigest())
+
+    def test_yielded_local_exec_polls_same_session_to_exact_success(self):
+        spool,_=self.make_pending()
+        out=self.pump(spool.path,'session_success')
+        self.assertEqual(out['calls'],1);self.assertEqual(out['pollCalls'],2)
+        self.assertEqual(out['appendBatches'],5)
+        self.assertIsNone(out['diagnostic'])
+        self.assertEqual(self.transport._decode(spool.response(1))['result']['padding'],'x'*365000)
+        metrics=out['result']['metrics']
+        self.assertEqual(metrics['local_exec_calls'],out['execCalls'])
+        self.assertEqual(metrics['local_poll_calls'],2)
+        self.assertEqual(metrics['local_bridge_calls'],out['execCalls']+2)
+
+    def session_failure(self,mode,stage,polls):
+        spool,_=self.make_pending()
+        out=self.pump(spool.path,mode)
+        self.assertEqual(out['calls'],1);self.assertEqual(out['appendBatches'],1)
+        self.assertEqual(out['pollCalls'],polls);self.assertTrue(out['pendingExact'])
+        self.assertEqual(out['blocked'],'unreconciled_local_spool_session');self.assertTrue(out['unchanged'])
+        info=out['diagnostic'];self.assertEqual(info['stage'],stage)
+        self.assertEqual(info['session_id'],4321);self.assertEqual(info['action'],'append_batch')
+        self.assertGreater(info['counters']['native_request_json_bytes'],500000)
+        self.assertGreater(info['counters']['native_result_json_bytes'],365000)
+        self.assertEqual(info['request_id'],1);self.assertEqual(info['offset_start'],0)
+        self.assertGreater(info['offset_end'],0);self.assertLessEqual(info['command_bytes'],98304)
+        self.assertEqual(info['counters']['native_calls'],1)
+        self.assertEqual(info['counters']['local_exec_calls'],out['execCalls'])
+        self.assertFalse((spool.path/'response-1.json').exists())
+        self.assertFalse({'cmd','argv','stdout','stderr','output','exception'} & set(info))
+        return out
+
+    def test_still_running_session_stops_at_fixed_poll_bound(self):
+        out=self.session_failure('session_running','bounded_stop',12)
+        self.assertEqual(out['error'],'local_spool_session_unresolved')
+        self.assertEqual(out['diagnostic']['polls'],12)
+
+    def test_session_wait_is_not_started_below_minimum_remaining_time(self):
+        self.session_failure('session_deadline','bounded_stop',0)
+
+    def test_yielded_session_later_nonzero_exit_never_reexecutes(self):
+        out=self.session_failure('session_nonzero','terminal',2)
+        self.assertEqual(out['diagnostic']['exit_code'],17)
+
+    def test_yielded_session_exception_is_unknown_redacted_and_retained(self):
+        out=self.session_failure('session_exception','unknown',1)
+        self.assertIsNone(out['diagnostic']['exit_code'])
+
+    def test_changed_poll_session_fails_without_switching_target(self):
+        self.session_failure('session_changed','invalid_session',1)
+
+    def test_initial_running_and_terminal_metadata_is_rejected(self):
+        self.session_failure('session_initial_contradiction','contradictory_result',0)
+
+    def test_poll_running_and_terminal_metadata_is_rejected(self):
+        self.session_failure('session_poll_contradiction','contradictory_result',1)
+
+    def test_yielded_session_output_is_bounded_without_body_logging(self):
+        out=self.session_failure('session_oversize','output_limit',1)
+        self.assertGreater(out['diagnostic']['output_bytes'],2000000)
 
     def test_library_capability_is_rejected(self):
         spool,_=self.make_pending('library.create_archive',{'path':'/synthetic/nope'})

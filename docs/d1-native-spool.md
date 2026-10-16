@@ -134,10 +134,27 @@ a remote transaction lease or an exactly-once network guarantee.
 
 If local response transport fails after a native call, preserve all claims/partial
 files and the private `d1_pending_reply:` plus spool-path orchestration-store entry
-when available. Reconcile the exact action and authoritative state; do not remove
+until durable handoff. Reconcile the exact action and authoritative state; do not remove
 claims, restart at request 1, or issue the native call again. No uncertain-native
 retry helper is provided. Terminal errors and argument errors emit fixed generic
 codes, never raw exception bodies, argv, profiles, or tool replies.
+
+The pump requires private orchestration `store`/`load` and the local tool's
+`write_stdin`. When an exec yields a session ID, it observes only that same session;
+it never repeats the command. Initial output and poll output are accumulated in
+order, with a 2,000,000-byte cap, at most 12 polls, and a 120-second local budget.
+A poll is not started with less than the tool's five-second minimum remaining.
+An already-started tool call or shell can outlive that budget.
+
+Before launching a command, the pump retains metadata under `d1_pending_local_exec:`
+plus the spool path. It records only fixed action/stage, request/offset range,
+command byte count, session ID, exit code, byte counts, times, and numeric counters.
+A tool exception marks the outcome unknown. An unresolved or failed command blocks
+a new pump invocation using that store; reconcile the same process and retained
+response before explicitly clearing the marker. Never clear it merely to retry.
+`d1_last_local_exec:` retains the last diagnostic metadata after successful handoff.
+These entries are private orchestration state, not a durable recovery journal;
+preserve them across invocations and do not start a separate store to evade a block.
 
 Request/response bodies stay in private files and orchestration variables rather
 than model-visible output. The local bridge transmits response chunks as quoted
@@ -156,9 +173,10 @@ bridge's guarantees. It must run only in the approved private execution environm
   Responses pass the existing native argument/result validators before handoff.
 - Native metrics: attempted calls, counts by action, serialized request/result JSON
   bytes, and call elapsed milliseconds; a thrown call counts but has no result bytes.
-- Local metrics: exec calls, serialized local-tool request/result bytes including
-  framing, and elapsed time. Envelope byte counts and total batch elapsed time are
-  reported separately. Add batch totals for the whole run.
+- Local metrics distinguish initial exec calls from same-session polls, with
+  separate serialized request/result bytes and elapsed time. `local_bridge_calls`
+  and `local_bridge_elapsed_ms` sum both. Envelope byte counts and total batch
+  elapsed time are reported separately. Add batch totals for the whole run.
 
 These are measured tool-boundary bytes, not inferred HTTP wire traffic. The current
 local daily-run benchmark uses 89 logical native calls, plus many local exec calls
@@ -177,4 +195,6 @@ mock native replies, large exact Unicode round trips, count/byte/timing metrics,
 forbidden capabilities, duplicate claims, malformed/session-swapped responses,
 expired/stale preflight, malformed terminal results, no-retry uncertainty, explicit
 source pins, relocation, symlink rejection, poisoned `.pyc`, `src/argparse.py`
-shadowing, and injected `PYTHONPATH`. No real native tool is called.
+shadowing, injected `PYTHONPATH`, ordered yielded-session success, bounded polling,
+late nonzero exits, unknown tool errors, session changes, and private-output bounds.
+No real native tool is called.
