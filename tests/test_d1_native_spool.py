@@ -25,14 +25,27 @@ spec.loader.exec_module(relay)
 NODE = r'''
 const fs=require('node:fs'),vm=require('node:vm'),cp=require('node:child_process');
 const options=JSON.parse(process.argv[1]),mode=process.argv[2];let calls=0;
-const ctx={tools:{exec_command:async args=>{
+let maxCommand=0,appendBatches=0,pendingReply=null;
+const pendingExact=()=>!!(pendingReply&&pendingReply.number===1&&pendingReply.value.ok===true&&pendingReply.value.result.padding==='x'.repeat(365000));
+const ctx={store:(key,value)=>{pendingReply=value;},tools:{exec_command:async args=>{
+maxCommand=Math.max(maxCommand,Buffer.byteLength(args.cmd));
+if(Buffer.byteLength(args.cmd)>98304)throw Error('COMMAND_TOO_LARGE');
+if(args.cmd.startsWith('set -e;')){
+  appendBatches++;
+  if(mode==='exec_throw')throw Error('PRIVATE_LOCAL_ARGV_SENTINEL');
+  if(mode==='batch_failure'){
+    const at=args.cmd.indexOf('_d1_output=$(',args.cmd.indexOf('_d1_output=$(')+1);
+    if(at!==-1)args.cmd=args.cmd.slice(0,at)+'exit 17;\n'+args.cmd.slice(at);
+  }
+  if(mode==='bad_progress')args.cmd=args.cmd.replace('test "$_d1_output"', '_d1_output=INVALID; test "$_d1_output"');
+}
 const r=cp.spawnSync('/bin/sh',['-c',args.cmd],{encoding:'utf8',maxBuffer:3000000});
 if(mode==='expired_preflight' && args.cmd.includes("'preflight'") && r.status===0){const value=JSON.parse(r.stdout);value.deadline_unix_ms=Date.now()-1;r.stdout=JSON.stringify(value);}
 return {exit_code:r.status,output:r.stdout};
 },mcp__codex_apps__app_read_main_store:async args=>{calls++;if(args.action!=='head')throw Error('wrong action');return {structuredContent:{head:{revision:0,import_id:null,manifest_sha256:null,watermarks:{feedback_cursor:0,profile_cursor:0,request_id:0}}}};},
-mcp__codex_apps__app_write_main_store:async args=>{calls++;if(mode==='reject')throw Error('PRIVATE_REJECTION_SENTINEL');if(args.data.chunks[0].data_base64!=='x'.repeat(500000))throw Error('payload mismatch');return {content:[{type:'text',text:JSON.stringify({ok:true,padding:'中文😀'.repeat(60000)})}]};}}};
+mcp__codex_apps__app_write_main_store:async args=>{calls++;if(mode==='reject')throw Error('PRIVATE_REJECTION_SENTINEL');if(args.data.chunks[0].data_base64!=='x'.repeat(500000))throw Error('payload mismatch');return {content:[{type:'text',text:JSON.stringify({ok:true,padding:mode==='ascii'||mode==='batch_failure'||mode==='bad_progress'||mode==='exec_throw'?'x'.repeat(365000):mode==='special'?('\\\"\'\n\t\u0000😀中文'.repeat(25000)):'中文😀'.repeat(60000)})}]};}}};
 vm.createContext(ctx);vm.runInContext(fs.readFileSync(process.env.PUMP,'utf8'),ctx);
-ctx.pumpD1(options).then(result=>process.stdout.write(JSON.stringify({result,calls})+'\n')).catch(error=>process.stdout.write(JSON.stringify({error:error.message,calls})+'\n'));
+ctx.pumpD1(options).then(result=>process.stdout.write(JSON.stringify({result,calls,maxCommand,appendBatches,pendingExact:pendingExact()})+'\n')).catch(error=>process.stdout.write(JSON.stringify({error:error.message,calls,maxCommand,appendBatches,pendingExact:pendingExact()})+'\n'));
 '''
 
 
@@ -55,18 +68,19 @@ class D1NativeSpoolTests(unittest.TestCase):
     def io(self, action, spool, *extra):
         return relay.io_main(self.transport, [action, '--spool', str(spool.path), '--number', '1', *extra])
 
-    def pump(self, spool, mode):
+    def pump(self, spool, mode, *, launcher=LAUNCHER, manifest=None, sha=None, pump=PUMP):
         if shutil.which('node') is None:
             self.skipTest('Node is required for the synthetic host-pump fixture')
-        options = {'python':sys.executable, 'launcher':str(LAUNCHER), 'workspace':str(self.root),
-                   'spool':str(spool), 'source_manifest':str(self.manifest), 'source_manifest_sha256':self.sha,
+        options = {'python':sys.executable, 'launcher':str(launcher), 'workspace':str(self.root),
+                   'spool':str(spool), 'source_manifest':str(manifest or self.manifest), 'source_manifest_sha256':sha or self.sha,
                    'start':1, 'max_requests':1,
                    'operations':['site.read_main_store' if mode == 'status' else 'site.write_main_store']}
-        env = {**os.environ, 'PUMP':str(PUMP)}
+        env = {**os.environ, 'PUMP':str(pump)}
         out = subprocess.run(['node','-e',NODE,json.dumps(options),mode], capture_output=True,text=True,env=env,timeout=60)
         self.assertEqual(out.returncode,0,out.stderr)
         self.assertLess(len(out.stdout),1500)
         self.assertNotIn('PRIVATE_REJECTION_SENTINEL',out.stdout+out.stderr)
+        self.assertNotIn('PRIVATE_LOCAL_ARGV_SENTINEL',out.stdout+out.stderr)
         return json.loads(out.stdout)
 
     def stop(self, process):
@@ -117,6 +131,70 @@ class D1NativeSpoolTests(unittest.TestCase):
         self.assertGreater(out['result']['response_bytes'],600000)
         self.assertTrue((spool.path/'invoke-1.json').exists())
 
+
+    def test_ascii_response_batches_reduce_exec_roundtrips(self):
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'ascii')
+        self.assertEqual(out['calls'],1)
+        self.assertEqual(self.transport._decode(spool.response(1))['result']['padding'],'x'*365000)
+        self.assertLessEqual(out['maxCommand'],98304)
+        self.assertLessEqual(out['appendBatches'],5)
+        self.assertLessEqual(out['result']['metrics']['local_exec_calls'],14)
+        self.assertEqual(out['maxCommand'],out['result']['metrics']['max_local_exec_command_bytes'])
+
+    def test_quoted_control_unicode_response_roundtrips_under_command_cap(self):
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'special')
+        self.assertEqual(out['calls'],1)
+        value=self.transport._decode(spool.response(1))
+        self.assertEqual(value['result']['padding'], '\\\"\'\n\t\x00😀中文'*25000)
+        self.assertLessEqual(out['maxCommand'],98304)
+
+    def test_partial_batch_failure_never_repeats_native_call(self):
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'batch_failure')
+        self.assertEqual(out['calls'],1)
+        self.assertEqual(out['error'],'local_spool_io_failed')
+        self.assertTrue(out['pendingExact'])
+        self.assertFalse((spool.path/'response-1.json').exists())
+        self.assertGreater((spool.path/'response-1.partial').stat().st_size,0)
+        self.assertLess((spool.path/'response-1.partial').stat().st_size,32768)
+        self.assertEqual(self.pump(spool.path,'batch_failure')['calls'],0)
+
+    def test_thrown_local_error_is_redacted_and_retains_exact_reply(self):
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'exec_throw')
+        self.assertEqual(out['calls'],1)
+        self.assertEqual(out['error'],'local_spool_io_failed')
+        self.assertTrue(out['pendingExact'])
+        self.assertFalse((spool.path/'response-1.json').exists())
+        self.assertTrue((spool.path/'invoke-1.json').exists())
+        self.assertEqual(self.pump(spool.path,'exec_throw')['calls'],0)
+
+    def test_wrong_intermediate_progress_stops_before_next_append(self):
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'bad_progress')
+        self.assertEqual(out['calls'],1)
+        self.assertEqual(out['error'],'local_spool_io_failed')
+        self.assertTrue(out['pendingExact'])
+        self.assertFalse((spool.path/'response-1.json').exists())
+        self.assertGreater((spool.path/'response-1.partial').stat().st_size,0)
+        self.assertLess((spool.path/'response-1.partial').stat().st_size,32768)
+        self.assertEqual(self.pump(spool.path,'bad_progress')['calls'],0)
+
+    def test_replacement_pump_works_with_separately_pinned_original_helper(self):
+        root=self.checkout_copy(); manifest=self.root/'copy-source.json'
+        helper_pump=root/'scripts/d1-native-pump.js'
+        # Simulate an independently pinned helper release; its Python is identical.
+        helper_pump.write_bytes(helper_pump.read_bytes()+b'// Independent helper release fixture.\n')
+        sha=relay.pin_source(manifest,root)['source_manifest_sha256']
+        self.assertNotEqual(sha,self.sha)
+        spool,req=self.make_pending()
+        out=self.pump(spool.path,'ascii',launcher=root/'scripts/d1-native-relay.py',manifest=manifest,sha=sha)
+        self.assertEqual(out['calls'],1)
+        self.assertEqual(self.transport._decode(spool.response(1))['result']['padding'],'x'*365000)
+        self.assertEqual(relay.verify_source(manifest,sha,root)['scripts/d1-native-pump.js'],hashlib.sha256(helper_pump.read_bytes()).hexdigest())
+
     def test_library_capability_is_rejected(self):
         spool,_=self.make_pending('library.create_archive',{'path':'/synthetic/nope'})
         with self.assertRaises(self.transport.RelayError): self.io('claim',spool)
@@ -153,7 +231,7 @@ class D1NativeSpoolTests(unittest.TestCase):
     def test_preflight_delivered_after_deadline_never_invokes_native(self):
         spool,_=self.make_pending()
         out=self.pump(spool.path,'expired_preflight')
-        self.assertEqual(out,{'error':'native_preflight_failed','calls':0})
+        self.assertEqual(out['error'],'native_preflight_failed'); self.assertEqual(out['calls'],0)
         self.assertTrue((spool.path/'invoke-1.json').exists())
         self.assertFalse((spool.path/'response-1.json').exists())
 
