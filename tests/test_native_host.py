@@ -450,10 +450,13 @@ class NativeHostLifecycleTests(unittest.TestCase):
         with patch.object(cloud_runtime, 'prepare', wraps=cloud_runtime.prepare) as prepare:
             result = self.run_command('prepare')
         self.assertTrue(prepare.call_args.kwargs['no_collect'])
-        with patch.object(cloud_runtime, 'prepare', return_value={**result, 'resumed': False}) as prepare:
+        with patch.object(cloud_runtime, 'prepare', return_value={**result, 'resumed': False, 'collection_performed': True}) as prepare:
             collected = self.run_command('prepare', collect=True)
         self.assertFalse(prepare.call_args.kwargs['no_collect'])
         self.assertTrue(collected['collection_performed'])
+        with patch.object(cloud_runtime, 'prepare', return_value={**result, 'resumed': False, 'collection_performed': False}):
+            resumed_stages = self.run_command('prepare', collect=True)
+        self.assertFalse(resumed_stages['collection_performed'])
 
     def test_subprocess_json_lines_integration_and_redacted_failure(self):
         self.prepare_import()

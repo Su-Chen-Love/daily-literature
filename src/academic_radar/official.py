@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import concurrent.futures
+import contextvars
 import html
 import json
 import re
@@ -221,12 +222,60 @@ def write_official_plan(db_path: Path, config: dict[str, Any], output: Path) -> 
     return {"output": str(path), "sources": len(payload["sources"]), "fallback": len(payload["api_fallback"])}
 
 
+# Cooperative deadline is inherited by every worker. No new request/read starts
+# after expiry; an active urllib/socket operation can overrun until its timeout
+# (at most 30 seconds, apart from platform DNS resolution). Metadata precedence
+# stays unchanged. Budget exhaustion means incomplete coverage, never success.
+_FETCH_DEADLINE = contextvars.ContextVar("official_fetch_deadline", default=None)
+
+
+class OfficialBudgetExceeded(TimeoutError):
+    pass
+
+
+def _remaining_time() -> float:
+    deadline = _FETCH_DEADLINE.get()
+    remaining = 30.0 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise OfficialBudgetExceeded("Official collection time budget exhausted")
+    return min(30.0, remaining)
+
+
+def _bounded_map(function, values, workers):
+    deadline = _FETCH_DEADLINE.get()
+    def invoke(value):
+        token = _FETCH_DEADLINE.set(deadline)
+        try:
+            _remaining_time()
+            return function(value)
+        finally:
+            _FETCH_DEADLINE.reset(token)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(invoke, values))
+
+
 def _fetch_text(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "PersonalAcademicRadar/0.10 (official issue verifier)"})
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return response.read().decode("utf-8", "replace")
+            with urllib.request.urlopen(request, timeout=_remaining_time()) as response:
+                # read1 performs at most one underlying buffered read, so a slow
+                # trickle cannot hide indefinitely inside an unbounded read().
+                # Keep the original response intact or reject it, never parse a
+                # truncated body as successful evidence.
+                chunks = []; size = 0; maximum = 32 * 1024 * 1024
+                while True:
+                    _remaining_time()
+                    chunk = response.read1(min(65536, maximum + 1 - size))
+                    _remaining_time()
+                    if not chunk:
+                        return b"".join(chunks).decode("utf-8", "replace")
+                    size += len(chunk)
+                    if size > maximum:
+                        raise ValueError("Official response exceeds the 32 MiB evidence limit")
+                    chunks.append(chunk)
+        except OfficialBudgetExceeded:
+            raise
         except (urllib.error.URLError, TimeoutError) as exc:
             status = getattr(exc, "code", None)
             if attempt == 2 or status not in (None, 408, 429, 500, 502, 503, 504):
@@ -238,6 +287,8 @@ def _fetch_text(url: str) -> str:
                 delay = 2 ** attempt
             if delay > 30:
                 raise  # Defer to a later run rather than ignoring a long server cooldown.
+            if _FETCH_DEADLINE.get() is not None and delay >= _remaining_time():
+                raise OfficialBudgetExceeded("Official retry exceeds remaining budget") from None
             time.sleep(max(0, delay))
     raise RuntimeError("官网请求失败")
 
@@ -413,6 +464,8 @@ def _collect_print_metadata_source(
             )
             try:
                 openalex = _fetch_json(openalex_url)
+            except OfficialBudgetExceeded:
+                raise
             except (urllib.error.URLError, TimeoutError, ValueError) as exc:
                 openalex = {}
                 fallback_error = f"; exact-DOI OpenAlex lookup failed: {type(exc).__name__}: {str(exc)[:200]}"
@@ -471,8 +524,7 @@ def _collect_print_metadata_source(
 
     output_issues: list[dict[str, Any]] = []
     for volume, issue in selected:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            papers = list(executor.map(enrich, grouped[(volume, issue)]))
+        papers = _bounded_map(enrich, grouped[(volume, issue)], 6)
         output_issues.append({
             "issue_key": f"volume-{volume}-issue-{issue}" if issue else f"volume-{volume}",
             "issue_url": _metadata_issue_url(spec, volume, issue),
@@ -602,8 +654,7 @@ def _collect_nature_source(source: dict[str, Any], spec: dict[str, Any], as_of_d
                 ),
             }
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            papers = list(executor.map(fetch_article, links.links))
+        papers = _bounded_map(fetch_article, links.links, 4)
         output_issues.append({
             "issue_key": f"volume-{volume_match.group(1)}-issue-{volume_match.group(2)}",
             "issue_url": issue_url,
@@ -612,19 +663,39 @@ def _collect_nature_source(source: dict[str, Any], spec: dict[str, Any], as_of_d
     return {"source_name": source["name"], "issues": output_issues}
 
 
+def official_collection_budget(config: dict) -> dict:
+    configured = config.get("official_collection", {})
+    defaults = {"time_budget_seconds": 900, "per_source_time_budget_seconds": 120, "max_sources": 20}
+    ceilings = {"time_budget_seconds": 900, "per_source_time_budget_seconds": 120, "max_sources": 100}
+    result = {}
+    for key, default in defaults.items():
+        value = configured.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= ceilings[key]:
+            raise ValueError("Invalid bounded official collection configuration")
+        if key == "max_sources" and type(value) is not int:
+            raise ValueError("Official source budget must be an integer")
+        result[key] = value
+    return result
+
+
 def collect_supported_official(
     db_path: Path,
     config: dict[str, Any],
     output: Path,
-    source_name: str = "",
+    source_name: str = "", *, plan: dict | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Collect strict official-page evidence for publishers with deterministic adapters."""
+    """Collect bounded original evidence; incomplete sources stay explicit."""
 
-    plan = build_official_plan(db_path, config)
+    plan = plan if plan is not None else build_official_plan(db_path, config)
+    budget = official_collection_budget(config)
+    deadline = min(deadline if deadline is not None else float("inf"), time.monotonic() + budget["time_budget_seconds"])
     configured = {item["name"]: item for item in config.get("sources", [])}
     collected: list[dict[str, Any]] = []
     unsupported: list[dict[str, str]] = []
     failures: list[dict[str, str]] = []
+    deferred: list[dict[str, str]] = []
+    attempted = 0
     matched = False
     for item in plan["sources"]:
         if source_name and item["source_name"] != source_name:
@@ -641,13 +712,26 @@ def collect_supported_official(
                 "reason": "该出版商仍需浏览器逐篇核验",
             })
             continue
+        if attempted >= budget["max_sources"] or time.monotonic() >= deadline:
+            deferred.append({"source_name": item["source_name"], "reason": "Official collection budget exhausted"})
+            continue
+        attempted += 1
+        token = _FETCH_DEADLINE.set(min(deadline, time.monotonic() + budget["per_source_time_budget_seconds"]))
         try:
             if item["provider"] == "Springer Nature":
                 collected.append(_collect_nature_source(source, item, plan["as_of_date"]))
             else:
                 collected.append(_collect_print_metadata_source(source, item, plan["as_of_date"]))
+            _remaining_time()
+        except OfficialBudgetExceeded:
+            # Discard a source that did not finish within its bounded evidence
+            # window, even if some article requests had already succeeded.
+            collected = [row for row in collected if row["source_name"] != item["source_name"]]
+            deferred.append({"source_name": item["source_name"], "reason": "Official collection time budget exhausted"})
         except Exception as exc:
-            failures.append({"source_name": item["source_name"], "reason": str(exc)})
+            failures.append({"source_name": item["source_name"], "reason": str(exc)[:1000]})
+        finally:
+            _FETCH_DEADLINE.reset(token)
     if source_name and not matched:
         raise ValueError("指定来源不在官网核验计划中")
     payload = {
@@ -657,10 +741,12 @@ def collect_supported_official(
         "sources": collected,
         "unsupported": unsupported,
         "failures": failures,
+        "deferred": deferred,
     }
     path = output.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .product import _atomic_write
+    _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
     return {
         "output": str(path),
         "sources": len(collected),
@@ -668,6 +754,7 @@ def collect_supported_official(
         "papers": sum(len(issue["papers"]) for item in collected for issue in item["issues"]),
         "unsupported": unsupported,
         "failures": failures,
+        "deferred": deferred,
     }
 
 
@@ -1004,15 +1091,30 @@ def preview_official_import(
         db.close()
 
 
-def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, Any]:
+def apply_official_import(db_path: Path, preview: dict[str, Any], *,
+                          idempotency_key: str | None = None, package_sha256: str | None = None) -> dict[str, Any]:
     if preview.get("errors"):
         raise ValueError("官网导入预览仍有错误，未写入任何数据")
+    if idempotency_key is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,159}", idempotency_key) or not re.fullmatch(r"[a-f0-9]{64}", package_sha256 or ""):
+            raise ValueError("Invalid official import operation binding")
+    elif package_sha256 is not None:
+        raise ValueError("Official package hash requires an operation binding")
     db = connect(db_path)
     inserted = 0
     updated = 0
     try:
         now = utc_now()
         with db:
+            db.execute("BEGIN IMMEDIATE")
+            receipt_key = "cloud_official_import:" + idempotency_key if idempotency_key is not None else None
+            if receipt_key:
+                prior = db.execute("SELECT value FROM meta WHERE key=?", (receipt_key,)).fetchone()
+                if prior:
+                    receipt = json.loads(prior[0])
+                    if receipt["package_sha256"] != package_sha256:
+                        raise ValueError("Official import already consumed different evidence")
+                    return receipt["result"]
             for issue in preview["accepted"]:
                 imported = 0
                 for paper in issue["papers"]:
@@ -1195,13 +1297,17 @@ def apply_official_import(db_path: Path, preview: dict[str, Any]) -> dict[str, A
                     (refresh["source_name"],refresh["issue_key"],refresh["issue_url"],
                      sum(issue["article_count"] for issue in refresh["issues"]),
                      json.dumps(refresh,ensure_ascii=False,sort_keys=True),now))
-        return {
-            "issues": len(preview["accepted"]),
-            "papers": sum(len(item["papers"]) for item in preview["accepted"]),
-            "inserted": inserted,
-            "abstracts_updated": updated,
-            "skipped": len(preview.get("skipped", [])),
-            "metadata_refreshed":len(preview.get("metadata_refreshes",[])),
-        }
+            result = {
+                "issues": len(preview["accepted"]),
+                "papers": sum(len(item["papers"]) for item in preview["accepted"]),
+                "inserted": inserted,
+                "abstracts_updated": updated,
+                "skipped": len(preview.get("skipped", [])),
+                "metadata_refreshed":len(preview.get("metadata_refreshes",[])),
+            }
+            if receipt_key:
+                db.execute("INSERT INTO meta(key,value) VALUES(?,?)", (receipt_key, json.dumps({
+                    "package_sha256": package_sha256, "result": result}, ensure_ascii=False, sort_keys=True)))
+        return result
     finally:
         db.close()

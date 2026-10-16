@@ -307,6 +307,13 @@ def verify_installation(config_path: Path) -> dict[str, Any]:
             "完成今日 collect-only、官网核验和 agent-import；本地定时任务需要电脑开机且 Codex 保持运行",
         )
 
+        from .cloud_collection import latest_report, coverage_detail
+        collection_report = latest_report(database)
+        if collection_report:
+            check("daily_collection_coverage", collection_report["status"] == "succeeded",
+                  coverage_detail(collection_report), "warning",
+                  "查看本轮分阶段覆盖；未执行、失败或预算延期不代表完整采集")
+
         coverage = screening_coverage(database)
         check(
             "semantic_coverage",

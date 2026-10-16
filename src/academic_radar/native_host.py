@@ -458,10 +458,12 @@ class NativeHostRunner:
                 raise ValueError("Prepared operation has a different captured head")
             result = runtime.prepare(config, operation, no_collect=not args.collect, limit=args.limit,
                                      expected_head=captured, sync_client=self.site)
+            from .cloud_collection import compact_report
             return {key: result[key] for key in ("operation_id", "phase", "run_id", "queue_path", "queue_sha256", "candidates", "resumed")} | {
-                "collection_performed": bool(args.collect and not result["resumed"]),
+                "collection_performed": bool(result.get("collection_performed", False)),
                 "collection_exit_code": result.get("collection_exit_code"),
-                "source_failure_count": len(result.get("source_failures", []))}
+                "source_failure_count": len(result.get("source_failures", [])),
+                "collection_report": compact_report(result.get("collection_report"))}
         if command == "import-results":
             saved = _local_operation(config, operation)
             head = _head(self.site.read_checkpoint_head())

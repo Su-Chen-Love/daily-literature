@@ -289,6 +289,11 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     job = _row(db, "SELECT run_id,status FROM agent_jobs ORDER BY created_at DESC LIMIT 1")
     check("latest_semantic_job", bool(job) and job["status"] == "imported", f"最近任务状态={job['status'] if job else '尚未运行'}", action="完成待判断队列并原子导入")
     check("recommendation_freshness", not freshness["overdue"] and not freshness["pending_collection"], "最近完整更新：" + freshness["last_import"] + ("；存在尚未完成评分导入的采集" if freshness["pending_collection"] else ""), action="执行今日完整更新；本地定时任务需要电脑开机且 Codex 运行")
+    from .cloud_collection import latest_report, coverage_detail
+    collection_report = latest_report(db)
+    if collection_report:
+        check("daily_collection_coverage", collection_report["status"] == "succeeded",
+              coverage_detail(collection_report), action="查看本轮分阶段覆盖；未执行、失败或预算延期不代表完整采集")
     coverage = screening_coverage(db)
     pending = coverage["pending"]
     check("semantic_coverage", pending == 0,
@@ -313,6 +318,7 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
         "完成后运行安装与数据检查；有内容变化时同步云端，报告新增论文、补全摘要、推荐结果、来源失败及剩余待处理项。",
     ])
     return {"db_state": db_state, "quality": quality, "recommendation_quality": metrics,
+            "collection_report": collection_report,
             "history_artifacts": history_artifact_availability(db),
             "checks": needed, "all_checks": checks, "healthy_count": len(checks) - len(needed),
             "pending_screening": pending, "update_summary": summary, "update_prompt": prompt,

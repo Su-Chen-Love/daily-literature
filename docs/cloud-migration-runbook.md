@@ -2,9 +2,10 @@
 
 ## Status and scope
 
-This is a tested implementation candidate based on upstream commit
-`05822bc41e70dab312122c3e23f1ab4cf1325352`. It does not provision credentials,
-activate a scheduler, move the personal database, publish a Site, or stop Mac
+This is an implementation candidate based on upstream commit
+`05822bc41e70dab312122c3e23f1ab4cf1325352`. The recoverable daily-collection parity
+change is still subject to focused tests and live acceptance below. It does not
+provision credentials, activate a scheduler, move the personal database, publish a Site, or stop Mac
 jobs. Synthetic tests are not production acceptance. The previous temporary
 proof-of-concept directory was not present in this executor; this candidate was
 recovered from GitHub with every original file checked against its Git blob SHA.
@@ -94,8 +95,10 @@ The publication order is:
 1. Capture the current cloud head **before** restoring its checkpoint.
 2. Restore and verify the complete checkpoint into a fresh directory.
 3. Pull Site feedback and profile events without activating a display snapshot.
-4. Collect/enrich and freeze one queue, profile, preference version, threshold,
-   feedback cursor and evidence. The actual host model returns all judgments.
+4. Run the recoverable daily stages below: API collection, the frozen
+   latest-two-issue plan, per-source strict issue import, then enrichment.
+   Freeze one queue, profile, preference version, threshold, feedback cursor,
+   evidence and collection report. The actual host model returns all judgments.
 5. Validate and import the entire queue atomically; no publication side effect.
 6. Pull any newer Site edits and stage a complete D1 display snapshot.
 7. Create/verify the matching full-state checkpoint and upload immutable chunks.
@@ -116,6 +119,127 @@ import, and rejects different results after import. A **lost uncommitted
 workspace** restarts from the last durable head and may repeat collection and
 model work; it cannot lose already committed history or overwrite a newer
 head. This version does not persist an in-progress model invocation.
+
+## Recoverable daily collection and coverage
+
+Online `cloud prepare` performs these ordered stages before a queue can exist:
+
+1. Invoke the existing API `collect-only` with a stable operation-bound batch ID.
+   Retain its source health and failures separately from issue coverage.
+2. Freeze one `official plan`, including its as-of date, verified source mappings
+   and latest-two-issue target. Retain the plan and its checksum in private state.
+3. Run `official collect-supported` separately for each planned source, using
+   that frozen plan and the remaining official-stage budget. Save each evidence
+   package and checksum before attempting import.
+4. Run the existing strict official preview. Apply only a package with no
+   validation errors, using the existing atomic importer. Its operation/source
+   receipt and package checksum commit in the same SQLite transaction as the
+   imported evidence, so a retry cannot duplicate that package's import.
+5. Run abstract enrichment against the resulting state and retain its terminal
+   outcome, including unresolved and deferred work.
+6. Invoke `agent-export(no_collect=True, batch_run=API_RUN)` once, with the full
+   `collection_report`. Export reuses the API batch; it does not recollect or
+   rerun enrichment. Daily screening still considers only unjudged eligible
+   identities, including backlog, up to the existing queue limit.
+
+A completed stage is not necessarily a successful source check. Failed,
+partial, unsupported and deferred outcomes are terminal evidence that can be
+frozen for review; they must not become success merely because export or
+publication worked. A nonterminal interrupted stage blocks queue creation.
+
+### Evidence and status meanings
+
+Nature reads its verified official issue and article pages. All other currently
+mapped publishers (Taylor & Francis, IEEE Xplore, ACM Digital Library, SAGE,
+ScienceDirect and INFORMS) use publisher-deposited Crossref print issue metadata,
+with exact-DOI OpenAlex fallback for missing complete abstracts. Report these as
+`publisher_deposited_metadata`, not official-page visits. The existing source
+mapping, evidence validation and abstract precedence remain authoritative;
+this orchestration adds no weaker importer or guessed publisher mappings.
+Coarse month/year publication dates retain their precision and uncertainty.
+Missing abstracts stay empty with a traceable reason when permitted by the
+existing strict validator; no generated summaries substitute for source text.
+
+The frozen queue's full `collection_report` separates:
+
+- `api`: batch identity and status, source health, collected/new counts, and
+  per-source results. The existing `source_failures` remains the API failure
+  envelope used by queue/result validation.
+- `official`: frozen as-of date and per-source outcome, reason, issue/paper
+  counts, evidence types and import result. `succeeded` denotes validated
+  latest-two coverage using the stated evidence type; `partial`, `failed`,
+  `unsupported` and `deferred` are visible gaps. Non-issue sources can be
+  `not_applicable`; an unmapped journal is not silently counted as covered.
+- `enrichment`: its own status, checked/updated/unresolved/deferred counts and
+  budget outcome.
+
+The native response and Site snapshot status expose compact aggregate outcomes
+and distinguish official-page evidence from publisher-deposited metadata.
+These coverage summaries exclude detailed packages, raw failure bodies, profile
+content and local paths. `read_run_status` includes the compact report; the
+`daily_collection_coverage` verification check preserves partial, failed and
+`not_exercised` coverage after results import. Do not infer full collection
+success from a zero API exit code, successful queue import, or successful Site
+publication alone.
+An explicit `--no-collect` runtime preparation, or native preparation without
+`--collect`, marks the report and all three stages `not_exercised`. It freezes
+existing candidates without network collection or enrichment and is not proof
+of daily-collection acceptance.
+
+### Official collection budgets
+
+The reviewed runtime config may include:
+
+```toml
+[official_collection]
+time_budget_seconds = 900
+per_source_time_budget_seconds = 120
+max_sources = 20
+```
+
+These are the defaults. Time budgets must be positive numbers and `max_sources`
+a positive integer; the maximums are 900 seconds total, 120 seconds per source
+and 100 sources. The stage-wide
+budget and source limit bound issue collection, independently of the existing
+API and enrichment settings. A source or remaining work that exhausts a budget
+is `deferred`; partial request success does not create a successful issue check.
+
+Deadlines are cooperative and propagate to worker requests. Requests, response
+chunk reads and retry waits use the remaining budget. They are not a hard kill
+or an exact wall-clock promise: a socket operation already in progress may
+finish after the deadline within its bounded timeout; platform DNS resolution is not a hard wall-clock guarantee. Full coverage is not guaranteed when networks stall. No new work should start
+once the deadline has expired. The saved official-stage deadline does not reset
+on a retry. New daily plans schedule the oldest attempted sources first, using
+durable attempt history. Sources deferred before an attempt therefore move
+ahead of recently attempted sources on a later run; a slow early source cannot
+permanently monopolize the budget. A retry retains its existing frozen order.
+
+### Interrupted preparation
+
+Resume with the same operation ID, captured head, collection mode and reviewed
+configuration. The journal binds the original configuration and API batch;
+changing them to continue an unfinished run is rejected. Another operation
+cannot start while a prior operation is `preparing`, or while its exported queue
+still awaits results. Keep the retained state and journal intact. Journal
+artifact references are state-relative. The config fingerprint normalizes only
+state/profile relocation, and evidence checksums use canonical JSON so checkpoint
+serialization whitespace changes do not invalidate the same evidence. This does
+not authorize changing collection settings or evidence content during recovery.
+
+A completed API batch is reused. A recorded official package is rechecked
+against its checksum and frozen plan before strict preview; it is not fetched
+again to obtain different evidence. If a crash occurs after atomic import but
+before the stage journal advances, the saved package's idempotency receipt
+returns the original import result. A missing or changed artifact is a blocker,
+not permission to recreate it silently or mark the stage complete. An
+interrupted request with no durable completed package may be retried within
+the original remaining budget. Completed enrichment and an already-frozen queue
+are reused. The publication receipt/reconciliation flow remains separate.
+
+These guarantees apply to retained state. Losing an uncommitted workspace
+still requires restoring the last durable head, as described above; no synthetic
+fixture pass proves live source access, timing, native integration or scheduled
+execution.
 
 ## Optional native Library publication path
 
@@ -188,8 +312,12 @@ academic-radar cloud commit --config CONFIG --operation daily-YYYY-MM-DD --check
 academic-radar cloud status --config CONFIG --operation daily-YYYY-MM-DD
 ```
 
-`--no-collect` supports offline synthetic tests; do not use it for the daily
-production collection. `--rescreen` is not exposed by the daily runner. Profile
+The core `cloud prepare` command collects by default. `--no-collect` supports
+offline synthetic tests or explicitly requested existing-candidate work and
+reports `not_exercised`; do not use it for daily production collection. The
+[native host runner](native-host-runner.md) instead defaults to no collection and
+requires explicit `prepare --collect` for the daily stages. `--rescreen` is not
+exposed by the daily runner. Profile
 or preference edits affect future unjudged papers; already completed scores and
 historical recommendations are retained. The frozen threshold is used when
 importing, even if the configured threshold changes during model work.
@@ -251,6 +379,19 @@ Mac publishers before enabling the single cloud publisher. Do not run both.
   The prepared local package is only an input until this is verified.
 - Run collection, actual host-model judgment, import, checkpoint publication,
   Site rendering/search and feedback/profile round-trip on a staging copy.
+  Check the queue's full collection report and the compact native/Site status:
+  API health, actual issue evidence and enrichment must remain distinguishable.
+  A no-collect `not_exercised` run does not satisfy this gate.
+- Interrupt API completion, per-source package save and official atomic import;
+  retry the same operation and verify batch/package reuse and no duplicate
+  import. Reject a changed head, configuration or evidence checksum and a
+  competing operation while preparation remains incomplete. Exercise a source
+  failure, unsupported source and exhausted budget without turning them into
+  successful coverage. Verify deferred, unattempted sources move ahead on the
+  next daily plan while same-operation retries keep their frozen order. Verify
+  the collection journal and canonical evidence hashes survive a supported
+  checkpoint relocation. Measure real request behavior separately; cooperative
+  timeouts are not a hard wall-clock bound.
 - Edit feedback and profile concurrently with an interrupted publish; verify
   the newest unacknowledged events remain pending and are applied next time.
 - Kill/recreate the cloud executor and restore using only GitHub + durable

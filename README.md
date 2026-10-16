@@ -32,9 +32,9 @@ Linux 和 Windows 会完成初始化与验证，但不会自动安装后台服�
 - 偏好反馈：编辑兴趣、理由、收藏和阅读状态；历史审计不作为用户模块展示。
 - 更新与检查：根据当前缺口生成一份可交给 Codex 的完整更新任务。
 
-本项目的 [云端站点](https://personal-academic-radar.thuscuf.chatgpt.site) 与本地复用同一套六页面模板、样式、脚本与图标。全部页面和反馈操作均免登录，包括完整研究兴趣、当前偏好和检查信息；访问者可以直接保存兴趣、理由、收藏、阅读状态及清除操作。来源编辑、画像确认、手动文献/摘要和 PDF 管理在本地执行。
+本项目的 [云端站点](https://personal-academic-radar.thuscuf.chatgpt.site) 与本地复用同一套六页面模板、样式、脚本与图标。当前迁移版本要求网站平台与应用同时校验所有者身份；全部页面、数据读取、反馈与研究兴趣/筛选偏好编辑均仅限所有者。未配置可信所有者身份时拒绝访问，不能把知道站点链接当作访问授权。来源编辑、手动文献/摘要和 PDF 管理仍通过已支持的本地流程执行；云端迁移不会自动提供这些写入功能。
 
-反馈双向同步：本地保存后立即安排后台同步，云端保存后立即可见并在本机在线时回传。每 5 分钟只检查变化；没有新内容时不重新上传快照。两端侧边栏都有“同步更新”：本地立即排队，云端登记请求等待下一次本机检查。同步不会启动新一轮采集或评分，完整机制见 [云端部署与同步](docs/cloud-sync.md)。
+迁移前的本地主库兼容流程支持反馈双向同步：本地保存后立即安排后台同步，云端保存后立即可见并在本机在线时回传。每 5 分钟只检查变化；没有新内容时不重新上传快照。两端侧边栏都有“同步更新”：本地立即排队，云端登记请求等待下一次本机检查。同步不会启动新一轮采集或评分，完整机制见 [云端部署与同步](docs/cloud-sync.md)。
 
 所有用户可见筛选都排除 Editorial、Corrigendum、Extended Abstract 等非正式研究内容，以及低于相关性阈值的记录。被排除记录只在内部保留最小身份和审计证据，避免反复抓取。
 
@@ -44,7 +44,7 @@ Linux 和 Windows 会完成初始化与验证，但不会自动安装后台服�
 
 摘要补全默认使用 180 秒预算，优先检查尚未尝试或较久未检查的记录；预算耗尽会保存进度并返回 `partial` 与 `deferred`，应继续评分导入。可通过配置的 `[enrichment] time_budget_seconds` 调整预算。官网临时网络错误会有限重试；无法核验的来源必须保留失败记录，不能将其报告为完整覆盖。
 
-每天一次的本地 Codex 自动任务先以 14 天窗口调用元数据 API，再按已验证映射核验每种期刊截至当天已经出版的最近两期。确定性流程覆盖 Springer Nature、Taylor & Francis、IEEE Xplore、ACM Digital Library 与 SAGE；摘要按官网原文、出版商提交的 Crossref 完整摘要、DOI 精确匹配的 OpenAlex 完整摘要顺序回退并保留 provenance。ScienceDirect 与 INFORMS 使用官网卷期页批量展开摘要并逐篇补漏。所有结果先严格预览、去重并原子导入；搜索片段、Highlights 或生成式改写不会被当作摘要。之后才按需检查画像反馈、建立一次冻结队列、逐篇判断并原子导入结果。核心命令为：
+每天一次的本地 Codex 自动任务先以 14 天窗口调用元数据 API，再按已验证映射检查每种期刊截至当天的最近两期。Nature 适配器读取官网卷期与论文页；其余已映射出版商（Taylor & Francis、IEEE Xplore、ACM Digital Library、SAGE、ScienceDirect 与 INFORMS）使用出版商提交的 Crossref 印刷卷期元数据，缺失摘要时回退到 DOI 完全一致的 OpenAlex 完整摘要。这些元数据结果不代表访问或完整核验了官网页面，必须保留证据类型、来源 URL 与日期精度；仅有月/年日期时不能据此确认具体出版日。现有摘要来源优先顺序和严格导入规则不变，不能把搜索片段、Highlights 或生成式改写当作摘要。结果先严格预览、去重并原子导入，再补全摘要，最后建立一次冻结队列、逐篇判断并原子导入结果。核心命令为：
 
 ```bash
 python scripts/paper_monitor.py collect-only \
@@ -58,13 +58,16 @@ academic-radar official collect-supported \
   --config ~/.local/share/personal-academic-radar/config.toml \
   --output ~/.local/share/personal-academic-radar/official/supported-latest.json
 
-# 按计划完成官网核验并生成严格 JSON 后：
+# 按计划完成卷期证据采集并生成严格 JSON 后：
 academic-radar official import \
   --config ~/.local/share/personal-academic-radar/config.toml \
   --file /path/to/official-results.json
 academic-radar official import \
   --config ~/.local/share/personal-academic-radar/config.toml \
   --file /path/to/official-results.json --apply
+
+academic-radar abstracts enrich \
+  --config ~/.local/share/personal-academic-radar/config.toml
 
 python scripts/paper_monitor.py agent-export \
   --config ~/.local/share/personal-academic-radar/config.toml \
@@ -79,9 +82,9 @@ python scripts/paper_monitor.py agent-import \
 
 只有用户明确要求重新判断旧论文时，才在该次手动 `agent-export` 中使用 `--rescreen`；每日自动任务不得使用此参数，也不因旧标准、画像、反馈或摘要变化自行追加重评。
 
-官网卷期导入要求同一期中的研究论文具有完整官网摘要，Editorial 等非研究内容可无摘要并由治理规则排除。队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。我的文献只显示相关性分数大于或等于 0.70 的论文，低分记录留在内部用于去重和审计。
+卷期导入要求研究论文提供完整、可追溯的原始摘要；穷尽可用证据后仍不可得时，必须显式标记缺失并记录原因，不得补写摘要。Editorial 等非研究内容可无摘要并由治理规则排除。队列与结果必须覆盖相同的全部 identity；画像哈希、反馈快照、运行编号或来源失败信息不一致时，导入会整体拒绝。我的文献只显示相关性分数大于或等于 0.70 的论文，低分记录留在内部用于去重和审计。
 
-确定性官网适配器会直接读取出版商的卷期目录与论文结构化元数据；尚需浏览器的出版商继续逐篇核验。受阻卷期使用 `academic-radar official fail` 留下可恢复的失败证据，并可用 `academic-radar official status` 查看，不会把不完整卷期伪装成成功。
+已验证的来源映射不等于已完成该来源的采集。没有映射、没有支持的适配器、请求失败或预算耗尽都必须显式保留；不能仅凭 API 成功报告最近两期覆盖成功。需要另行浏览器核验的来源不会自动被当作已完成。受阻卷期可使用 `academic-radar official fail` 留下可恢复的失败证据，并用 `academic-radar official status` 查看。
 
 ## 摘要补全与人工证据
 
@@ -119,7 +122,7 @@ academic-radar service logs --config ~/.local/share/personal-academic-radar/conf
 
 - GitHub 只保存代码、测试、迁移和通用示例。
 - 不提交 `state/`、配置、SQLite/WAL、备份、队列、结果、PDF、日志、`.env` 或任何密钥。
-- 本地网页默认只绑定 `127.0.0.1`。本站按用户授权公开全部六页面及反馈操作，同步应用记录到 D1；发布凭据留在私有配置，不进入页面或 GitHub。参见 [云端部署与同步](docs/cloud-sync.md)。
+- 本地网页默认只绑定 `127.0.0.1`。云端迁移要求所有页面与反馈操作通过所有者授权，同步应用记录到私有访问的 D1 视图；发布凭据留在私有配置，不进入页面或 GitHub。正式迁移不得启用匿名兼容模式 `SITE_ACCESS=public-legacy`。参见 [云端部署与同步](docs/cloud-sync.md)。
 - 来源配置以原子方式写入并先备份；SQLite 恢复要求显式 `--replace`，且会先保存当前库。
 - PDF 保存在私有目录，校验类型和大小，并用 SHA-256 去重。
 
@@ -151,4 +154,8 @@ python scripts/paper_monitor.py backfill-history --config ~/.local/share/persona
 
 ## Cloud-primary migration candidate
 
-The optional checkpointed cloud runner, private chunk transport and owner-only profile editing are described in [the migration runbook](docs/cloud-migration-runbook.md). This code does not provision credentials, enable cloud scheduling, or cut over existing jobs. Complete the runbook acceptance gates before using it with personal production state.
+The optional checkpointed cloud runner, private transport and owner-only Site are described in [the migration runbook](docs/cloud-migration-runbook.md). The daily-collection parity change is an implementation candidate: online preparation journals an operation-bound API batch, freezes the latest-two-issue plan, collects each supported source, runs strict preview and atomic idempotent import, enriches abstracts, then freezes one queue with `agent-export(no_collect=True, batch_run=API_RUN)`. It preserves existing source/evidence precedence and does not run a second collection during export.
+
+The frozen queue retains a full `collection_report`: API health, per-source issue outcomes and evidence types, and enrichment are separate. Native output and the Site snapshot status use a compact summary. Partial, failed, unsupported and budget-deferred coverage remain visible; an offline/no-collect run is `not_exercised`, never evidence of online collection success. [The native host runner](docs/native-host-runner.md) defaults to no collection; daily work must explicitly request `prepare --collect`.
+
+`[official_collection]` defaults to `time_budget_seconds = 900`, `per_source_time_budget_seconds = 120`, and `max_sources = 20` (maximums: 900, 120 and 100). Deadlines are cooperative across worker requests and chunk reads, not a hard process kill; an active socket operation can finish after the deadline within its bounded timeout; platform DNS resolution is not a hard wall-clock guarantee. Full coverage is not guaranteed when networks stall. Retry the same saved operation, head and configuration to reuse completed work and checked evidence packages. This code does not provision credentials, enable cloud scheduling, or cut over existing jobs. Complete the runbook acceptance gates before using it with personal production state.

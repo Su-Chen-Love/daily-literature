@@ -152,14 +152,23 @@ def prepare(config_path: Path, operation_id: str, *, no_collect: bool = False, l
                 raise ValueError("Cloud operation job was abandoned or rejected; investigate before starting another")
             phase = "awaiting_judgment" if job["status"] == "exported" else "imported"
             result = _save(db_path, operation_id, {**(saved or {}), "phase": phase, "run_id": run_id,
+                           "collection_report": queue.get("collection_report", (saved or {}).get("collection_report")),
                            "queue_sha256": digest, "candidates": len(queue["papers"])})
-            return {**result, "queue_path": str(queue_path), "resumed": True}
+            return {**result, "queue_path": str(queue_path), "resumed": True, "collection_performed": False}
+        if saved and saved.get("expected_head") != expected_head:
+            raise ValueError("Cannot substitute a different head during preparation")
+        mode = "offline" if no_collect else "daily"
+        if saved and saved.get("collection_mode", mode) != mode:
+            raise ValueError("Cannot change collection mode during a resumable operation")
         if config.get("cloud_runtime", {}).get("role") == "primary" and expected_head is None:
             raise ValueError("Primary preparation requires the head captured before checkpoint restore")
         with contextlib.closing(connect(db_path)) as db:
             active = db.execute("SELECT run_id FROM agent_jobs WHERE status='exported'").fetchall()
             if active:
                 raise Busy("An exported queue is still awaiting results; resume its operation before starting another")
+            pending = db.execute("SELECT key,value FROM meta WHERE key LIKE 'cloud_runtime_operation:%'").fetchall()
+            if any(row["key"] != "cloud_runtime_operation:" + operation_id and json.loads(row["value"]).get("phase") == "preparing" for row in pending):
+                raise Busy("Another collection is incomplete; resume its original operation")
         if config.get("cloud_sync", {}).get("transport") == "managed" and sync_client is None:
             raise ValueError("Managed Site transport requires the approved host tool bridge")
         if sync_client is not None or config.get("cloud_sync", {}).get("enabled"):
@@ -170,16 +179,27 @@ def prepare(config_path: Path, operation_id: str, *, no_collect: bool = False, l
                 raise Busy("Feedback/profile pull did not finish; refusing to freeze a stale queue")
         else:
             pull = {"status": "disabled"}
-        _save(db_path, operation_id, {"phase": "preparing", "started_at": (saved or {}).get("started_at", utc_now()),
-                                     "pull_status": pull.get("status"), "expected_head": expected_head})
-        code, summary = _invoke(_monitor().agent_export, config_path, no_collect=no_collect,
-                                limit=limit, operation_id=operation_id)
+        saved = _save(db_path, operation_id, {**(saved or {}), "phase": "preparing", "started_at": (saved or {}).get("started_at", utc_now()),
+                                     "pull_status": pull.get("status"), "expected_head": expected_head, "collection_mode": mode})
+        from .cloud_collection import offline_report, run as collect_daily
+        monitor = _monitor()
+        if no_collect:
+            saved = _save(db_path, operation_id, {**saved, "collection_report": offline_report(), "collection_performed": False})
+            batch_run = None
+        else:
+            saved = collect_daily(config_path, operation_id, saved, monitor)
+            batch_run = saved["collection_progress"]["api"]["run_id"]
+            if saved["collection_progress"]["phase"] != "completed":
+                raise ValueError("Daily collection stages are incomplete; queue cannot be frozen")
+        code, summary = _invoke(monitor.agent_export, config_path, no_collect=True,
+                                batch_run=batch_run, limit=limit, operation_id=operation_id,
+                                collection_report=saved["collection_report"])
         job = _job(db_path, summary["run_id"])
         queue_path, queue, digest = _verified_queue(state, job)
-        result = _save(db_path, operation_id, {"phase": "awaiting_judgment", "run_id": summary["run_id"],
+        result = _save(db_path, operation_id, {**saved, "phase": "awaiting_judgment", "run_id": summary["run_id"],
                        "queue_sha256": digest, "candidates": len(queue["papers"]),
                        "expected_head": expected_head,
-                       "collection_exit_code": code, "source_failures": summary.get("source_failures", [])})
+                       "collection_exit_code": saved.get("collection_exit_code", code), "source_failures": summary.get("source_failures", [])})
         return {**result, "queue_path": str(queue_path), "profile_path": queue.get("profile_path"),
                 "deferred_candidates": queue.get("deferred_candidates", 0), "resumed": False}
 

@@ -10,8 +10,10 @@ actual approved native tools and honor their acceptance/denial responses.
 JSON-lines stdin/stdout pipes. It reuses `ManagedSiteClient`, `cloud_runtime`,
 `LibraryCheckpointAdapter` and the existing checkpoint verifier. It does not
 implement HTTP, credential discovery, auth synthesis, installation or deployment.
-The optional `prepare --collect` flag invokes only the existing configured
-public research-source collector; it is not a Site/Library HTTP fallback.
+The optional `prepare --collect` flag runs the recoverable daily sequence using
+the existing configured research-source collectors and strict importers. It is
+not a Site/Library HTTP fallback. The official-stage parity change remains an
+implementation candidate pending the focused and live acceptance gates below.
 
 ## Configuration and local paths
 
@@ -96,6 +98,7 @@ python -m academic_radar.native_host prepare \
   --head-file HEAD_RECORD --operation STABLE_OPERATION_ID
 # For an explicitly approved daily collection, append --collect.
 # Default: freeze existing candidates only; collection_performed=false.
+# API, official and enrichment report status: not_exercised.
 # The actual host reads queue_path and follows that queue's evaluation policy.
 python -m academic_radar.native_host import-results \
   --config RUNTIME_CONFIG --state STATE --role primary \
@@ -110,14 +113,78 @@ judgments were performed in that case, and the host must not claim an LLM
 reviewed papers. An empty envelope for a nonempty queue is invalid; do not add
 synthetic paper results or change the queue merely to enable publication.
 
-`prepare` reports the queue path, frozen hash, run ID, candidate count and whether
-collection was performed in this invocation. It omits profile text, source
-failure bodies and raw remote responses. The host judges every queued item using
-the existing queue/result format, not a second model API. `--collect` on a retry
-never recollects an already-frozen queue. A collection exit code or nonzero source
-failure count still requires review, just as in the existing runtime.
+`prepare` reports the queue path, frozen hash, run ID, candidate count, whether
+collection was performed in this invocation, and a compact `collection_report`.
+It omits profile text, source failure bodies and raw remote responses. The host
+judges every queued item using the existing queue/result format, not a second
+model API. `--collect` on a retry never recollects an already-frozen queue.
+`collection_performed` means a collector or enrichment stage was invoked in this
+invocation, not that network requests succeeded or coverage was complete. Reusing
+completed stages before freeze reports false. The API collection exit code alone cannot establish
+success for all daily stages.
 
-Publish and acknowledge:
+### Explicit daily collection
+
+Native `prepare` defaults to no collection. With explicit `--collect`, the
+runtime completes these stages before freezing a queue:
+
+1. Operation-bound API `collect-only`, retaining its batch ID and source health.
+2. One frozen official latest-two-issue plan and as-of date.
+3. Per-source `official collect-supported`, saving evidence packages/checksums,
+   then existing strict preview and atomic apply with an idempotency receipt.
+4. Existing abstract enrichment, retaining unresolved/deferred work.
+5. `agent-export(no_collect=True, batch_run=API_RUN)` with the full report.
+
+The queue therefore binds the exact API batch without performing another API
+collection during export. A stage must reach a recorded terminal outcome before
+export; source failure or budget deferral can be a truthful terminal outcome,
+not a success. Existing source mapping, strict evidence validation, abstract
+precedence and the unjudged-only daily screening policy remain unchanged.
+
+The full `collection_report` lives in the frozen queue. Its API section reports
+source health; the official section reports per-source evidence type and
+`succeeded`, `partial`, `failed`, `unsupported`, `deferred` or `not_applicable`
+coverage; the enrichment section reports its own status and counts. Native output
+and the Site snapshot `read_run_status` carry compact aggregate outcomes; the
+`daily_collection_coverage` verification check keeps non-successful coverage
+visible after results import. The existing queue/result `source_failures`
+contract remains separate. Default no-collect
+preparation records `not_exercised` for all stages, not successful online work.
+
+Nature reads official pages. Other currently mapped publishers use
+publisher-deposited Crossref print issue metadata and exact-DOI OpenAlex abstract
+fallback. That evidence must remain labeled as metadata, including for
+ScienceDirect and INFORMS; it is not proof of visiting official pages. A verified
+mapping alone is not evidence of successful current coverage.
+
+Optional `[official_collection]` settings default to `time_budget_seconds = 900`,
+`per_source_time_budget_seconds = 120` and `max_sources = 20`, with respective
+maximums of 900, 120 and 100. Deadlines propagate cooperatively across worker
+requests; requests, chunk reads and retries use the remaining time. An already
+active socket operation can finish after the deadline within its bounded
+timeout (at most 30 seconds per active socket operation; platform DNS resolution is not bounded by that timeout). This is not a hard process kill or an exact wall-clock guarantee, and full coverage is not guaranteed when networks stall.
+Budget-exhausted sources are deferred, and the saved deadline is not reset on
+retry. New daily plans use durable oldest-attempt-first source ordering so
+unattempted sources deferred by the budget can move ahead next time. A retry
+keeps its frozen order. API and enrichment retain their separate collection
+settings.
+
+Resume interrupted preparation with the same operation, head, collection mode
+and configuration. A completed API batch and completed enrichment are reused;
+saved official packages are checksum-verified and passed through strict preview
+again as needed. The atomic package receipt prevents duplicate import even when
+the process stopped after apply but before recording stage completion. An
+unfinished source without a saved completed package can be retried within the
+original remaining budget. Changed evidence or configuration must be
+investigated; do not alter the journal to bypass the check. A new operation is
+blocked while a prior one is still `preparing`, and an exported queue must be
+resolved before starting another. State-relative artifact paths, canonical JSON
+evidence hashes and state/profile relocation normalization keep this journal
+portable through supported checkpoint restore without weakening content checks.
+See the [daily collection contract and
+acceptance checklist](cloud-migration-runbook.md#recoverable-daily-collection-and-coverage).
+
+### Publish and acknowledge
 
 ```sh
 python -m academic_radar.native_host publish \
@@ -276,7 +343,12 @@ lines: staged records and event pages can contain private research information.
 Verify approved native connector invocation, real structured metadata mapping,
 private immutable upload and isolated materialization for the real archive size,
 retention, owner-only Site access, CAS and ACK round-trip, a lost-workspace
-restore, and an actual fresh scheduled host execution. Validate public-source
-collection separately when enabling `--collect`. A working host subprocess,
-local fixture pass, connected plugin, or pending permission is not proof of
-unattended acceptance. No scheduler or primary cutover is performed here.
+restore, and an actual fresh scheduled host execution. Validate real API,
+latest-two issue evidence, strict import and enrichment separately when enabling
+`--collect`; inspect both full and compact reports, including failures,
+unsupported sources and budget deferrals. Test interruption after batch/package
+save and atomic import, same-operation recovery, and rejection of changed
+configuration/checksums or a competing unfinished operation. A no-collect run
+must remain `not_exercised`. A working host subprocess, local fixture pass,
+connected plugin, or pending permission is not proof of unattended acceptance.
+No scheduler or primary cutover is performed here.

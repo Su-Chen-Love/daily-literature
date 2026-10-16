@@ -684,49 +684,75 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
     new=[]
     for p in collected:
         with db:
-            if upsert(db,p,now): new.append(p)
+            inserted = upsert(db,p,now)
+            if inserted: new.append(p)
+            # Keep the same batch identity across an interrupted cloud collect.
+            db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'collected')", (run_id,p.identity))
+            if inserted:
+                db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'new')", (run_id,p.identity))
     unique_collected=list({paper.identity:paper for paper in collected}.values())
     unique_new=list({paper.identity:paper for paper in new}.values())
     return unique_collected,unique_new,failures
 
-def collect_only(config_path: Path) -> int:
-    """Collect the 14-day API window before official issue checks and queue freezing."""
-
+def collect_only(config_path: Path, *, operation_id: str | None=None) -> int:
+    """Collect APIs before official checks; optional cloud identity is resumable."""
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
-    now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id="collect-"+now.replace(":","-")
+    now=dt.datetime.now(dt.timezone.utc).isoformat()
+    run_id="collect-"+now.replace(":","-")
+    if operation_id is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", operation_id):
+            raise ValueError("Invalid cloud collection operation")
+        run_id="collect-cloud-"+hashlib.sha256(operation_id.encode()).hexdigest()
     db=db_open(state/"papers.sqlite3")
-    collected,new,failures=collect_into_db(cfg,db,now,run_id)
-    required={s["name"] for s in cfg["sources"] if s.get("required",True)}
-    failed_required={x["source"] for x in failures if x.get("status")=="failed" and x["source"] in required}
-    status="partial" if failures else "succeeded"
-    if required and failed_required==required: status="failed"
-    summary={
-        "run_id":run_id,
-        "started_at":now,
-        "collected":len(collected),
-        "new":len(new),
-        "new_identities":[paper.identity for paper in new],
-        "source_failures":failures,
-        "next_step":"Run official two-issue imports, then agent-export --no-collect --batch-run " + run_id,
-    }
-    with db:
-        db.execute("""INSERT OR REPLACE INTO pipeline_runs(
-          run_id,kind,status,started_at,finished_at,collected_count,candidate_count,relevant_count,error_summary,details_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-        (run_id,"collection",status,now,dt.datetime.now(dt.timezone.utc).isoformat(),len(collected),0,0,
-         "; ".join(x["error"] for x in failures) or None,json.dumps(summary,ensure_ascii=False)))
-        for paper in collected:
-            db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'collected')",(run_id,paper.identity))
-        for paper in new:
-            db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'new')",(run_id,paper.identity))
-    db.close()
-    print(json.dumps(summary,ensure_ascii=False,indent=2))
-    return 1 if required and failed_required==required else 0
+    try:
+        if operation_id is not None:
+            existing=db.execute("SELECT * FROM pipeline_runs WHERE run_id=?", (run_id,)).fetchone()
+            if existing:
+                details=json.loads(existing["details_json"])
+                if existing["kind"]!="collection" or details.get("operation_id")!=operation_id:
+                    raise ValueError("Cloud collection identity mismatch")
+                if existing["status"] in {"succeeded","partial","failed"}:
+                    print(json.dumps({**details, "collection_performed":False},ensure_ascii=False,indent=2))
+                    return details["exit_code"]
+                if existing["status"]!="running":
+                    raise ValueError("Cloud collection is no longer resumable")
+                now=existing["started_at"]
+            else:
+                with db:
+                    db.execute("INSERT INTO pipeline_runs(run_id,kind,status,started_at,details_json) VALUES(?,'collection','running',?,?)",
+                               (run_id,now,json.dumps({"operation_id":operation_id})))
+        collected,new,failures=collect_into_db(cfg,db,now,run_id)
+        required={source["name"] for source in cfg["sources"] if source.get("required",True)}
+        failed_required={item["source"] for item in failures if item.get("status")=="failed" and item["source"] in required}
+        status="partial" if failures else "succeeded"
+        exit_code=int(bool(required and failed_required==required))
+        if exit_code: status="failed"
+        with db:
+            for paper in collected:
+                db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'collected')",(run_id,paper.identity))
+            for paper in new:
+                db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'new')",(run_id,paper.identity))
+            # Includes writes made before an interruption of this same batch.
+            collected_count=db.execute("SELECT COUNT(*) FROM run_papers WHERE run_id=? AND role='collected'",(run_id,)).fetchone()[0]
+            new_ids=[row[0] for row in db.execute("SELECT identity FROM run_papers WHERE run_id=? AND role='new' ORDER BY identity",(run_id,))]
+            summary={"run_id":run_id,"started_at":now,"collected":collected_count,"new":len(new_ids),
+                     "new_identities":new_ids,"source_failures":failures,"status":status,"exit_code":exit_code,
+                     "next_step":"Run official two-issue imports, then agent-export --no-collect --batch-run " + run_id}
+            if operation_id is not None: summary["operation_id"]=operation_id
+            db.execute("""INSERT OR REPLACE INTO pipeline_runs(
+              run_id,kind,status,started_at,finished_at,collected_count,candidate_count,relevant_count,error_summary,details_json
+              ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+              (run_id,"collection",status,now,dt.datetime.now(dt.timezone.utc).isoformat(),collected_count,0,0,
+               "; ".join(item["error"] for item in failures) or None,json.dumps(summary,ensure_ascii=False)))
+        print(json.dumps({**summary, "collection_performed":True},ensure_ascii=False,indent=2))
+        return exit_code
+    finally:
+        db.close()
 
 
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
                  batch_run: str | None=None, limit: int | None=None,
-                 operation_id: str | None=None) -> int:
+                 operation_id: str | None=None, collection_report: dict | None=None) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
     from academic_radar.profile_sync import effective_config
     cfg=effective_config(cfg,state/"papers.sqlite3")
@@ -800,12 +826,15 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
              "total_candidates":total_candidates,"deferred_candidates":total_candidates-len(papers),
              "evaluation_policy":evaluation_policy()}
+    if collection_report is not None:
+        payload["collection_report"] = collection_report
     queue_path.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
     summary={"run_id":run_id,"collected":len(collected),"new":len(new),"candidates":len(papers),
              "queue_path":str(queue_path),"profile_path":str(profile_path),"source_failures":failures,
              "collection_run_id":batch_run,"total_candidates":total_candidates,
              "deferred_candidates":total_candidates-len(papers),"batch_limit":batch_limit}
     if enrichment is not None: summary["enrichment"]=enrichment
+    if collection_report is not None: summary["collection_report"]=collection_report
     run_status="running"  # An exported queue is not a completed recommendation update.
     profile_row=db.execute("SELECT id FROM profile_versions WHERE profile_hash=? AND status='active'",(phash,)).fetchone()
     with db:
@@ -928,8 +957,14 @@ def agent_import(config_path: Path, results_path: Path, *, sync_after: bool=True
                         db.execute("INSERT OR IGNORE INTO run_papers(run_id,identity,role) VALUES(?,?,'selected_new')",(run_id,identity_value))
             snapshot_run(db, run_id)
             imported=len(validated)
+            collection_report = queue.get("collection_report")
+            collection_status = (collection_report or {}).get("status")
+            run_status = "partial" if queue.get("source_failures") or collection_status in {"partial", "failed"} else "succeeded"
+            if collection_status == "failed": run_status = "failed"
+            details = {"results_path":str(results_path),"digest_path":str(digest_path),"collection_run_id":queue.get("collection_run_id")}
+            if collection_report is not None: details["collection_report"] = collection_report
             db.execute("""UPDATE pipeline_runs SET status=?,finished_at=?,relevant_count=?,details_json=?
-              WHERE run_id=?""",("partial" if queue.get("source_failures") else "succeeded",now,len(selected),json.dumps({"results_path":str(results_path),"digest_path":str(digest_path),"collection_run_id":queue.get("collection_run_id")},ensure_ascii=False),run_id))
+              WHERE run_id=?""",(run_status,now,len(selected),json.dumps(details,ensure_ascii=False),run_id))
             db.execute("""UPDATE agent_jobs SET status='imported',results_path=?,imported_count=?,imported_at=?
               WHERE run_id=?""",(str(results_path),imported,now,run_id))
             os.replace(digest_tmp,digest_path); digest_replaced=True
