@@ -900,6 +900,248 @@ class CombinedReadJournal:
                 'diagnostic_success_replayed':1,'first_fresh_request':self.value['prefix']+1}
 
 
+TIMEOUT_JOURNAL_FORMAT = 'academic-radar-timeout-backup-journal-v1'
+MAX_TIMEOUT_CHAIN = 16
+
+
+def _timeout_state(transport, path, prefix, original_source, previous=None, *, ancestors=()):
+    """Seal successful reads only; an expired, never-invoked tail is not retried."""
+    check(type(prefix) is int and 3 <= prefix < transport.MAX_REQUESTS, 'invalid_timeout_prefix')
+    check(type(original_source) is dict and set(original_source) == {'root','manifest','sha256'}, 'invalid_journal_source')
+    original_files = verify_source(Path(original_source['manifest']), original_source['sha256'], Path(original_source['root']))
+    check({k:v for k,v in original_files.items() if k != 'scripts/d1-native-relay.py'} ==
+          {k:v for k,v in inventory().items() if k != 'scripts/d1-native-relay.py'}, 'journal_backup_source_changed')
+    path = Path(path)
+    check(str(path) not in ancestors and len(ancestors) < MAX_TIMEOUT_CHAIN, 'timeout_journal_cycle_or_limit')
+    parent = None
+    if previous is not None:
+        check(type(previous) is dict and set(previous) == {'path','sha256'}, 'invalid_previous_journal')
+        parent = TimeoutReadJournal(transport, previous['path'], previous['sha256'], ancestors=(*ancestors,str(path)))
+        check(original_source == parent.value['original_source'], 'timeout_source_anchor_changed')
+        check(prefix > parent.value['prefix'], 'timeout_resume_made_no_progress')
+        reservation = json.loads(private_external(parent.value['resume_fence']), object_pairs_hook=unique_pairs)
+        check(reservation == parent.reservation(path), 'timeout_resume_binding_changed')
+    with existing(transport,path) as spool:
+        required, optional = {'result.json'}, set()
+        for number in range(1,prefix+2):
+            required.add('request-%d.json' % number)
+            if parent is not None and number <= parent.value['prefix']:
+                required.update('%s-%d.json' % (kind,number) for kind in ('claim','replay','response'))
+            elif number <= prefix:
+                required.update('%s-%d.json' % (kind,number) for kind in ('pending','live','claim','invoke','response'))
+                optional.add('response-%d.partial' % number)
+            else:
+                # Timeout may occur before announcement, after publication, or
+                # after claim. An invocation/response is NEVER optional here.
+                optional.update('%s-%d.json' % (kind,number) for kind in ('pending','live','claim'))
+        if parent is not None: required.add('replay-summary.json')
+        names = set(os.listdir(spool.fd))
+        check(required <= names <= required|optional, 'invalid_timeout_inventory')
+        files = {}
+        def member(name):
+            raw = read(transport,spool,name)
+            entry = {'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}
+            check(name not in files or files[name] == entry, 'journal_changed')
+            files[name] = entry
+            return raw
+        session, begin, initial_head, response_bytes = None,None,None,0
+        for number in range(1,prefix+2):
+            request_raw = member('request-%d.json' % number)
+            req = transport._decode(request_raw)
+            session = transport._request(req,session,number)
+            check(request_raw == transport._encode(req) and req['operation'] in COMBINED_READS, 'journal_operation_forbidden')
+            claim = {'request_sha256':hashlib.sha256(request_raw).hexdigest()}
+            if 'pending-%d.json' % number in names:
+                state = transport._decode(member('pending-%d.json' % number))
+                check(set(state) == {'heartbeat','deadline_unix_ms','request_sha256'} and
+                      state['heartbeat'] == 'live-%d.json' % number and type(state['deadline_unix_ms']) is int and
+                      state['deadline_unix_ms'] >= 0 and state['request_sha256'] == claim['request_sha256'], 'invalid_journal_pending')
+                check(member('live-%d.json' % number) == b'{}\n', 'invalid_journal_heartbeat')
+                if number > prefix: check(state['deadline_unix_ms'] <= time.time()*1000, 'timeout_deadline_not_elapsed')
+            else:
+                check('live-%d.json' % number not in names, 'invalid_journal_pending')
+            if 'claim-%d.json' % number in names:
+                check(transport._decode(member('claim-%d.json' % number)) == claim, 'invalid_journal_claim')
+                if number > prefix: check('pending-%d.json' % number in names, 'invalid_journal_pending')
+            if number > prefix:
+                check(req['operation'] == 'site.read_site_backup' and req['arguments']['action'] != 'begin', 'timeout_tail_must_be_site_read')
+                tail = {key:req[key] for key in ('operation','arguments')}
+                continue
+            response_raw = member('response-%d.json' % number)
+            check(transport._response(response_raw,req) == response_raw, 'noncanonical_journal_response')
+            value = transport._decode(response_raw)
+            check(value['ok'] is True, 'journal_response_failed')
+            response_bytes += len(response_raw)
+            if parent is not None and number <= parent.value['prefix']:
+                old_req,old_raw = parent.bound_pair(number)
+                check(req == dict(old_req,session_id=session) and
+                      value == dict(transport._decode(old_raw),session_id=session), 'timeout_replay_changed')
+                receipt = {'journal_sha256':parent.sha,'original_session_id':parent.value['session_id'],
+                    'original_request_id':number,'new_session_id':session,
+                    'original_request_sha256':parent.value['files']['request-%d.json' % number]['sha256'],
+                    'new_request_sha256':claim['request_sha256'],
+                    'new_response_sha256':hashlib.sha256(response_raw).hexdigest(),
+                    'original_response_sha256':parent.value['files']['response-%d.json' % number]['sha256']}
+                check(transport._decode(member('replay-%d.json' % number)) == receipt, 'timeout_replay_changed')
+            else:
+                check(transport._decode(member('invoke-%d.json' % number)) == claim, 'invalid_journal_invocation')
+                partial = 'response-%d.partial' % number
+                if partial in names: check(member(partial) == response_raw, 'journal_partial_mismatch')
+                if parent is not None:
+                    if number == parent.value['prefix']+1:
+                        check({key:req[key] for key in ('operation','arguments')} == parent.value['first_fresh_call'], 'timeout_first_fresh_changed')
+                    parent._fresh(req)
+            if number == 1:
+                check(req['operation'] == 'site.read_main_store' and req['arguments'] == {'action':'head','data':{}}, 'combined_schema_sequence_changed')
+                initial_head = value['result']['head']
+            elif number == 2:
+                check(req['operation'] == 'site.read_main_store' and req['arguments'] ==
+                      {'action':'read_manifest','data':{'revision':initial_head['revision']}}, 'combined_schema_sequence_changed')
+            elif number == 3:
+                check(req['operation'] == 'site.read_site_backup' and req['arguments'] == {'action':'begin','data':{}}, 'journal_begin_required')
+                begin = value['result']
+            else:
+                check(req['operation'] != 'site.read_site_backup' or req['arguments']['action'] != 'begin', 'journal_snapshot_recapture')
+        check(transport._decode(member('result.json')) == {'protocol':transport.PROTOCOL,'type':'relay_error',
+              'session_id':session,'request_id':prefix+1,'ok':False,'error':{'code':'relay_timeout'}}, 'journal_not_closed_timeout')
+        from academic_radar import d1_backup
+        snapshot,snapshot_sha = d1_backup._capture(lambda action,data:begin,require_main=True)
+        check(initial_head['revision'] == snapshot['main_head']['revision'] and
+              initial_head['import_id'] == snapshot['main_head']['import_id'], 'combined_initial_head_changed')
+        captured_at = begin.get('captured_at')
+        check(recovery_timestamp(captured_at), 'journal_capture_time_missing')
+        if parent is not None:
+            check(session not in {v['session_id'] for v in parent.lineage()}, 'journal_fresh_session_required')
+            check(snapshot == parent.value['snapshot'] and captured_at == parent.value['captured_at'], 'timeout_snapshot_changed')
+            summary = transport._decode(member('replay-summary.json'))
+            expected_summary = parent.summary()
+            expected_summary['replayed_reads'] = parent.value['prefix']
+            expected_summary['replayed_response_bytes'] = sum(files['response-%d.json'%i]['bytes'] for i in range(1,parent.value['prefix']+1))
+            check(summary == expected_summary, 'timeout_replay_changed')
+        check(set(os.listdir(spool.fd)) == names, 'journal_changed')
+        for name in sorted(names): member(name)
+    value = {'format':TIMEOUT_JOURNAL_FORMAT,'source_spool':str(path),'original_source':original_source,
+             'session_id':session,'prefix':prefix,'files':files,'snapshot_sha256':snapshot_sha,'captured_at':captured_at,
+             'snapshot':snapshot,'cached_response_bytes':response_bytes,'first_fresh_call':tail,'previous':previous,
+             'resume_fence':str(Path(original_source['manifest']).parent/('timeout-resume-'+session+'.json'))}
+    # Apply the same closed capture scope to the pending boundary before sealing.
+    probe = object.__new__(TimeoutReadJournal);probe.value = value;probe._fresh(req)
+    return value
+
+
+def seal_timeout_journal(transport,path,prefix,output,original_source,previous=None):
+    value = _timeout_state(transport,path,prefix,original_source,previous)
+    output = Path(output)
+    check(output.is_absolute() and Path(path) not in output.parents, 'journal_must_be_external')
+    probe = object.__new__(TimeoutReadJournal);probe.value = value
+    probe.validate_destinations(output)
+    raw = canonical(value);check(len(raw) <= MAX, 'journal_manifest_too_large')
+    write_once_external(output,raw)
+    return {'journal_sha256':hashlib.sha256(raw).hexdigest(),'replayed_reads':prefix,'next':prefix+1,
+            'cached_response_bytes':value['cached_response_bytes'],'snapshot_sha256':value['snapshot_sha256'],
+            'captured_at':value['captured_at'],'boundary':'never_invoked'}
+
+
+class TimeoutReadJournal:
+    """One finite continuation; successful continuations can form a sealed chain."""
+    _fresh = CombinedReadJournal._fresh
+
+    def __init__(self,transport,path,expected,*,ancestors=()):
+        raw = private_external(path,expected)
+        check(stat.S_IMODE(os.stat(path,follow_symlinks=False).st_mode) == 0o400, 'unsafe_journal_manifest')
+        self.value = json.loads(raw,object_pairs_hook=unique_pairs)
+        check(type(self.value) is dict and set(self.value) == {'format','source_spool','original_source','session_id',
+              'prefix','files','snapshot_sha256','captured_at','snapshot','cached_response_bytes','first_fresh_call',
+              'previous','resume_fence'} and self.value['format'] == TIMEOUT_JOURNAL_FORMAT, 'invalid_timeout_journal')
+        self.transport,self.sha,self.ancestors = transport,expected,ancestors
+        self.replayed,self.replayed_bytes,self.exhausted = 0,0,False
+        self.reserved,self.new_session = False,None
+        self.next_fresh = self.value['prefix']+1
+        self.verify()
+        self.old_sessions = {v['session_id'] for v in self.lineage()}
+
+    def verify(self):
+        v = self.value
+        check(_timeout_state(self.transport,v['source_spool'],v['prefix'],v['original_source'],v['previous'],
+                             ancestors=self.ancestors) == v, 'journal_changed')
+
+    def lineage(self):
+        values = [self.value]
+        while values[-1]['previous'] is not None:
+            check(len(values) < MAX_TIMEOUT_CHAIN, 'timeout_journal_cycle_or_limit')
+            previous = values[-1]['previous']
+            value = json.loads(private_external(previous['path'],previous['sha256']), object_pairs_hook=unique_pairs)
+            check(value['source_spool'] not in {v['source_spool'] for v in values}, 'timeout_journal_cycle_or_limit')
+            values.append(value)
+        return values
+
+    def validate_destinations(self,*paths):
+        for path in map(Path,paths):
+            check(path.is_absolute() and '..' not in path.parts, 'invalid_resume_paths')
+            fd = directory(path.parent);os.close(fd)
+            for value in self.lineage():
+                anchor = Path(value['source_spool'])
+                check(path != anchor and anchor not in path.parents, 'resume_inside_evidence')
+
+    def reservation(self,new_spool):
+        return {'format':'academic-radar-timeout-resume-once-v1','journal_sha256':self.sha,
+                'original_session_id':self.value['session_id'],'new_spool':str(Path(new_spool)),
+                'first_fresh_request':self.value['prefix']+1}
+
+    def reserve(self,new_spool):
+        check(not self.reserved, 'timeout_resume_already_reserved')
+        new_spool = Path(new_spool)
+        self.validate_destinations(new_spool)
+        check(self.transport.LEAF.fullmatch(new_spool.name) is not None, 'unsafe_spool')
+        fd = directory(new_spool.parent)
+        try:
+            try: os.stat(new_spool.name,dir_fd=fd,follow_symlinks=False)
+            except FileNotFoundError: pass
+            else: raise RelayError('timeout_resume_spool_exists')
+        finally: os.close(fd)
+        self.verify()
+        write_once_external(self.value['resume_fence'],canonical(self.reservation(new_spool)))
+        self.reserved = True
+
+    def bound_pair(self,number):
+        with existing(self.transport,self.value['source_spool']) as old:
+            values = []
+            for kind in ('request','response'):
+                name = '%s-%d.json' % (kind,number);raw = read(self.transport,old,name)
+                check(self.value['files'].get(name) == {'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}, 'journal_changed')
+                values.append(raw)
+            return self.transport._decode(values[0]),values[1]
+
+    def response(self,req):
+        check(self.reserved, 'explicit_timeout_resume_reservation_required')
+        check(req['operation'] in COMBINED_READS, 'journal_operation_forbidden')
+        number = req['request_id']
+        check(req['session_id'] not in self.old_sessions, 'journal_fresh_session_required')
+        if self.new_session is None: self.new_session = req['session_id']
+        check(req['session_id'] == self.new_session, 'journal_session_changed')
+        if number > self.value['prefix']:
+            check(self.replayed == self.value['prefix'] and number == self.next_fresh, 'journal_replay_gap')
+            if not self.exhausted:
+                self.verify()
+                check({key:req[key] for key in ('operation','arguments')} == self.value['first_fresh_call'], 'timeout_first_fresh_changed')
+            self._fresh(req);self.next_fresh += 1;self.exhausted = True
+            return None
+        check(not self.exhausted and number == self.replayed+1, 'journal_replay_gap')
+        old,raw = self.bound_pair(number)
+        check(req == dict(old,session_id=req['session_id']), 'journal_request_mismatch')
+        value = self.transport._decode(raw);check(value['ok'] is True, 'journal_response_failed')
+        value['session_id'] = req['session_id'];raw = self.transport._encode(value)
+        self.transport._response(raw,req)
+        self.replayed += 1;self.replayed_bytes += len(raw)
+        return raw
+
+    def summary(self):
+        return {'journal_sha256':self.sha,'replayed_reads':self.replayed,'replayed_response_bytes':self.replayed_bytes,
+                'cached_response_bytes':self.value['cached_response_bytes'],'captured_at':self.value['captured_at'],
+                'snapshot_sha256':self.value['snapshot_sha256'],'first_fresh_request':self.value['prefix']+1,
+                'boundary':'never_invoked'}
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # argparse's default diagnostics could echo a private response argument.
@@ -911,7 +1153,7 @@ def main(argv=None):
     parser = Parser(description=__doc__)
     parser.add_argument('--source-manifest', type=Path)
     parser.add_argument('--source-manifest-sha256')
-    parser.add_argument('mode', choices=('pin', 'check', 'pump', 'run', 'io', 'host', 'seal-read-journal', 'resume-backup', 'seal-combined-journal', 'resume-combined-backup'))
+    parser.add_argument('mode', choices=('pin', 'check', 'pump', 'run', 'io', 'host', 'seal-read-journal', 'resume-backup', 'seal-combined-journal', 'resume-combined-backup', 'seal-timeout-journal', 'resume-timeout-backup'))
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.mode == 'pin':
@@ -935,6 +1177,43 @@ def main(argv=None):
                 from academic_radar.d1_native_host import main as host_main
                 return host_main(args.arguments)
             transport = make_transport(args.source_manifest, args.source_manifest_sha256, files)
+            if args.mode == 'seal-timeout-journal':
+                command = Parser()
+                command.add_argument('--spool',type=Path,required=True)
+                command.add_argument('--prefix',type=int,required=True)
+                command.add_argument('--output',type=Path,required=True)
+                command.add_argument('--original-source-root',type=Path,required=True)
+                command.add_argument('--original-source-manifest',type=Path,required=True)
+                command.add_argument('--original-source-manifest-sha256',required=True)
+                command.add_argument('--previous-journal',type=Path)
+                command.add_argument('--previous-journal-sha256')
+                opts = command.parse_args(args.arguments)
+                check((opts.previous_journal is None) == (opts.previous_journal_sha256 is None), 'incomplete_previous_journal')
+                previous = None if opts.previous_journal is None else {
+                    'path':str(opts.previous_journal),'sha256':opts.previous_journal_sha256}
+                value = seal_timeout_journal(transport,opts.spool,opts.prefix,opts.output,
+                    {'root':str(opts.original_source_root),'manifest':str(opts.original_source_manifest),
+                     'sha256':opts.original_source_manifest_sha256},previous)
+                print(json.dumps(value,separators=(',',':')))
+                return 0
+            if args.mode == 'resume-timeout-backup':
+                command = Parser()
+                command.add_argument('--workspace',type=Path,required=True)
+                command.add_argument('--spool',required=True)
+                command.add_argument('--timeout-seconds',type=float,required=True)
+                command.add_argument('--journal',type=Path,required=True)
+                command.add_argument('--journal-sha256',required=True)
+                command.add_argument('--output',type=Path,required=True)
+                opts = command.parse_args(args.arguments)
+                check(0 < opts.timeout_seconds <= 86400, 'invalid_resume_timeout')
+                check(opts.workspace.is_absolute() and opts.output.is_absolute() and not opts.output.exists(), 'invalid_resume_paths')
+                check(transport.LEAF.fullmatch(opts.spool) is not None, 'unsafe_spool')
+                journal = TimeoutReadJournal(transport,opts.journal,opts.journal_sha256)
+                journal.validate_destinations(opts.workspace/opts.spool,opts.output)
+                journal.reserve(opts.workspace/opts.spool)
+                transport = make_transport(args.source_manifest,args.source_manifest_sha256,files,journal=journal)
+                return transport.main(['--workspace',str(opts.workspace),'--spool',opts.spool,
+                    '--timeout-seconds',str(opts.timeout_seconds),'--','backup-export','--output',str(opts.output)])
             if args.mode == 'seal-combined-journal':
                 command = Parser()
                 command.add_argument('--spool',type=Path,required=True)
