@@ -29,8 +29,12 @@ class NativeFixture:
         upgrade_database(self.db)
         self.profile='Original synthetic research profile.'
         self.profile_hash=sha(self.profile.encode())
-        with sqlite3.connect(self.db) as db:
-            db.execute('PRAGMA journal_mode=DELETE')
+        # A transaction context does not close SQLite connections. Both fixture
+        # snapshots must be closed and checkpointed before strict export.
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            with contextlib.closing(db.execute('PRAGMA journal_mode=DELETE')) as cursor:
+                if cursor.fetchall() != [('delete',)]:
+                    raise AssertionError('Synthetic fixture requires DELETE journal mode')
             db.execute("INSERT INTO papers(identity,title,first_seen,updated_at) VALUES('doi:synthetic','original','2026-01-01','2026-01-01')")
             db.execute("INSERT INTO profile_versions(profile_hash,content,status,source,created_at) VALUES(?,?,'active','test','2026-01-01')",(self.profile_hash,self.profile))
         (self.state/'research-profile.md').write_text(self.profile)
@@ -41,7 +45,7 @@ class NativeFixture:
         self.source_manifest_sha=original['manifest_sha256']
         self.core={k:v for k,v in original['manifest'].items() if k not in ('objects','files','statistics')}
         # A newer revision deliberately differs from the original inventory.
-        with sqlite3.connect(self.db) as db:
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
             db.execute("UPDATE papers SET title='new current title' WHERE identity='doi:synthetic'")
             db.execute("INSERT INTO papers(identity,title,first_seen,updated_at) VALUES('doi:new','new paper','2026-01-02','2026-01-02')")
         (self.state/'history'/'new.txt').write_bytes(b'new artifact'*20000)
@@ -120,6 +124,96 @@ class NativeFixture:
             cursor=events[-1]['seq'] if events else data['after']
             return {'until':data['until'],'events':events,'next':cursor,'done':not events or cursor==data['until']}
         raise AssertionError('Unexpected or mutating Site action: '+action)
+
+
+class NativeFixtureLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def test_writer_connections_are_closed_before_each_export_without_gc(self):
+        real_connect, real_export = sqlite3.connect, package.export_package
+        database = self.root/'source'/'papers.sqlite3'
+        retained, boundaries = [], []
+
+        def connect(path, *args, **kwargs):
+            connection = real_connect(path, *args, **kwargs)
+            if str(path) == str(database):
+                retained.append(connection)  # Strong references prevent GC cleanup.
+            return connection
+
+        def export(*args, **kwargs):
+            boundaries.append(len(retained))
+            for connection in retained:
+                with self.assertRaisesRegex(sqlite3.ProgrammingError, 'closed'):
+                    connection.execute('SELECT 1')
+            self.assertFalse(any(Path(str(database)+suffix).exists()
+                                 for suffix in ('-wal', '-shm', '-journal')))
+            return real_export(*args, **kwargs)
+
+        try:
+            with patch.object(sqlite3, 'connect', connect), patch.object(package, 'export_package', export):
+                fixture = NativeFixture(self.root)
+            self.assertEqual(boundaries, [2, 3])  # Migration + first writer, then second writer.
+            self.assertNotEqual(fixture.core['inventory'], fixture.current_manifest['inventory'])
+        finally:
+            for connection in retained:
+                connection.close()
+
+    def test_fixture_writer_exception_rolls_back_and_closes(self):
+        real_connect = sqlite3.connect
+        for phase in ('initial', 'current'):
+            with self.subTest(phase=phase):
+                root = self.root/phase
+                root.mkdir()
+                database = root/'source'/'papers.sqlite3'
+                retained = []
+                marker = 'INSERT INTO profile_versions' if phase == 'initial' else 'INSERT INTO papers(identity,title,first_seen,updated_at) VALUES(\'doi:new\''
+
+                class FailingConnection(sqlite3.Connection):
+                    def execute(self, sql, *args, **kwargs):
+                        if sql.startswith(marker):
+                            raise RuntimeError('synthetic fixture write failure')
+                        return super().execute(sql, *args, **kwargs)
+
+                def connect(path, *args, **kwargs):
+                    if str(path) == str(database):
+                        kwargs['factory'] = FailingConnection
+                    connection = real_connect(path, *args, **kwargs)
+                    if str(path) == str(database):
+                        retained.append(connection)
+                    return connection
+
+                try:
+                    with patch.object(sqlite3, 'connect', connect):
+                        with self.assertRaisesRegex(RuntimeError, 'synthetic fixture write failure'):
+                            NativeFixture(root)
+                    for connection in retained:
+                        with self.assertRaisesRegex(sqlite3.ProgrammingError, 'closed'):
+                            connection.execute('SELECT 1')
+                    with contextlib.closing(real_connect(database)) as connection:
+                        rows = connection.execute('SELECT identity,title FROM papers').fetchall()
+                    self.assertEqual(rows, [] if phase == 'initial' else [('doi:synthetic', 'original')])
+                    self.assertFalse((root/('initial' if phase == 'initial' else 'current')).exists())
+                finally:
+                    for connection in retained:
+                        connection.close()
+
+    def test_live_wal_sidecars_still_reject_export_until_last_connection_closes(self):
+        database = self.root/'live.sqlite3'
+        upgrade_database(database)
+        with contextlib.closing(sqlite3.connect(database)) as connection:
+            connection.execute('PRAGMA journal_mode=WAL').fetchall()
+            with connection:
+                connection.execute("INSERT INTO papers(identity,title,first_seen,updated_at) VALUES('doi:live','live','now','now')")
+            self.assertTrue(Path(str(database)+'-wal').exists())
+            with self.assertRaisesRegex(package.PackageError, 'SQLite sidecars present'):
+                package.export_package(database, self.root/'rejected')
+            self.assertFalse((self.root/'rejected').exists())
+        self.assertFalse(any(Path(str(database)+suffix).exists()
+                             for suffix in ('-wal', '-shm', '-journal')))
+        package.export_package(database, self.root/'closed')
 
 
 class D1BackupTests(unittest.TestCase):
