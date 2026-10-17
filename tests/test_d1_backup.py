@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'))
 from academic_radar import d1_backup as backup,d1_package as package,sqlite_delta
@@ -146,6 +147,102 @@ class D1BackupTests(unittest.TestCase):
         self.assertGreater(result['transport_call_count'],0)
         self.assertIn('read_objects',result['transport_calls']['main'])
         self.assertTrue(all(data.get('revision',2)==2 for _,data in self.fixture.calls))
+
+    def test_sqlite_build_without_extension_loading_api_full_roundtrip(self):
+        original_connect=sqlite3.connect
+        connections=[]
+        def close_connections():
+            for db in connections:db.connection.close()
+        self.addCleanup(close_connections)
+        class NoExtensions:
+            def __init__(self,*args,**kwargs):
+                self.connection=original_connect(*args,**kwargs)
+                connections.append(self)
+            def __getattr__(self,name):
+                if name=='enable_load_extension':raise AttributeError(name)
+                return getattr(self.connection,name)
+            def __enter__(self):
+                self.connection.__enter__()
+                return self
+            def __exit__(self,*args):return self.connection.__exit__(*args)
+        with patch.object(sqlite3,'connect',side_effect=NoExtensions):
+            result=self.export()
+            verified=backup.verify_backup(self.output,expected_backup_sha256=result['backup_sha256'])
+            report=backup.restore_backup(self.output,self.restored,trusted_schema_database=self.fixture.db,
+                                         expected_backup_sha256=result['backup_sha256'],apply_pending=False)
+            current=sqlite_delta.inspect_snapshot(self.fixture.db)
+            self.assertEqual(verified['main_manifest']['inventory'],current)
+            self.assertEqual(sqlite_delta.inspect_snapshot(self.restored/'state'/'papers.sqlite3'),current)
+        self.assertTrue(connections)
+        self.assertTrue(all(not hasattr(db,'enable_load_extension') for db in connections))
+        self.assertTrue(report['exact_main_state'])
+        self.assertGreater(result['rows'],0)
+        self.assertIn('export_rows',[action for action,_ in self.fixture.calls])
+        self.assertEqual((self.restored/'state'/'history'/'new.txt').read_bytes(),
+                         (self.fixture.state/'history'/'new.txt').read_bytes())
+        self.assertEqual((self.restored/'site'/'generations'/(self.fixture.generation+'.jsonl')).read_bytes(),
+                         package.canonical(self.fixture.site_record)+b'\n')
+
+    def test_schema_connection_disables_extension_loading_and_schema_trust(self):
+        path=self.root/'schema.sqlite3'
+        db=sqlite3.connect(path);self.addCleanup(db.close)
+        probe=Mock(wraps=db)
+        # Keep the synthetic present-API case runnable on builds without it too.
+        disable=getattr(db,'enable_load_extension',None)
+        probe.enable_load_extension=Mock(side_effect=disable)
+        def check_before_commit():
+            self.assertEqual(db.execute('PRAGMA trusted_schema').fetchone(),(0,))
+            with self.assertRaisesRegex(sqlite3.OperationalError,'not authorized|no such function'):
+                db.execute("SELECT load_extension('synthetic-extension-never-installed')")
+            db.commit()
+        probe.commit.side_effect=check_before_commit
+        with patch.object(backup,'sqlite3',SimpleNamespace(connect=Mock(return_value=probe))):
+            tables=backup._schema_database(path,self.fixture.db,self.fixture.core)
+        self.assertEqual(tables,[backup._metadata(table) for table in self.fixture.core['inventory']['tables']])
+        probe.enable_load_extension.assert_called_once_with(False)
+        self.assertEqual(probe.method_calls[0],call.enable_load_extension(False))
+        probe.execute.assert_any_call('PRAGMA trusted_schema=OFF')
+        probe.close.assert_called_once_with()
+        with self.assertRaisesRegex(sqlite3.ProgrammingError,'closed'):
+            db.execute('SELECT 1')
+
+    def test_extension_disable_errors_fail_closed_before_exporting_rows(self):
+        for error_type in (RuntimeError,AttributeError,sqlite3.OperationalError):
+            with self.subTest(error_type=error_type.__name__):
+                self.fixture.calls.clear()
+                db=sqlite3.connect(':memory:');self.addCleanup(db.close)
+                probe=Mock(wraps=db)
+                error=error_type('synthetic extension-disable failure')
+                probe.enable_load_extension=Mock(side_effect=error)
+                with patch.object(backup,'sqlite3',SimpleNamespace(connect=Mock(return_value=probe))):
+                    with self.assertRaises(error_type) as raised:self.export()
+                self.assertIs(raised.exception,error)
+                probe.enable_load_extension.assert_called_once_with(False)
+                probe.execute.assert_not_called()
+                probe.close.assert_called_once_with()
+                with self.assertRaisesRegex(sqlite3.ProgrammingError,'closed'):
+                    db.execute('SELECT 1')
+                self.assertEqual([action for action,_ in self.fixture.calls],['read_manifest','export_summary'])
+                self.assertFalse(self.output.exists())
+                self.assertFalse(list(self.root.glob('.d1-backup-*')))
+
+    def test_schema_fingerprint_and_table_metadata_checked_before_rows(self):
+        original=copy.deepcopy(self.fixture.core)
+        for mismatch in ('hash','schema','tables'):
+            with self.subTest(mismatch=mismatch):
+                self.fixture.core=copy.deepcopy(original);self.fixture.calls.clear()
+                if mismatch=='hash':self.fixture.core['schema_sha256']='0'*64
+                elif mismatch=='schema':
+                    self.fixture.core['schema']['objects'][0][3]="SELECT load_extension('untrusted')"
+                    self.fixture.core['schema_sha256']=package.digest(self.fixture.core['schema'])
+                else:self.fixture.core['inventory']['tables'][0]['columns'].append('untrusted_column')
+                connect=Mock(side_effect=AssertionError('Untrusted schema reached writable connection'))
+                with patch.object(backup,'sqlite3',SimpleNamespace(connect=connect)):
+                    with self.assertRaisesRegex(backup.BackupError,'trusted schema'):self.export()
+                connect.assert_not_called()
+                self.assertEqual([action for action,_ in self.fixture.calls],['read_manifest','export_summary'])
+                self.assertFalse(self.output.exists())
+                self.assertFalse(list(self.root.glob('.d1-backup-*')))
 
     def test_operational_restore_replays_pending_events_and_retains_exact_base(self):
         result=self.export();before=(self.output/'main'/'manifest.json').read_bytes()

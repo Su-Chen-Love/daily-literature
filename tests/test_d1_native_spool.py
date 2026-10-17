@@ -349,6 +349,43 @@ class D1NativeSpoolTests(unittest.TestCase):
         self.assertNotIn('library.create_archive',self.transport.OPERATIONS)
         self.assertIsNot(legacy._Pipe,self.transport._Pipe)
 
+    def test_terminal_keeps_only_closed_error_classifications(self):
+        for code in sorted(relay.TERMINAL_ERROR_CODES):
+            value={'protocol':self.transport.PROTOCOL,'type':'result','session_id':'a'*32,
+                   'request_id':5,'ok':False,'error':{'code':code,
+                   'message':'PRIVATE_BODY_SENTINEL','path':'PRIVATE_PATH_SENTINEL'}}
+            result=self.transport._curated_result(value,'a'*32,5)
+            self.assertEqual(result['error'],{'code':code})
+            self.assertNotIn('PRIVATE_',json.dumps(result))
+        for code in ('private_payload_as_code', 'PRIVATE_BODY_SENTINEL', None, 3, [], {}):
+            value={'protocol':self.transport.PROTOCOL,'type':'result','session_id':'a'*32,
+                   'request_id':5,'ok':False,'error':{'code':code}}
+            self.assertEqual(self.transport._curated_result(value,'a'*32,5)['error'],
+                             {'code':'native_host_failed'})
+
+    def test_terminal_classification_does_not_relax_bindings(self):
+        value={'protocol':self.transport.PROTOCOL,'type':'result','session_id':'a'*32,
+               'request_id':5,'ok':False,'error':{'code':'operation_failed'}}
+        for changes in ({'session_id':'b'*32},{'request_id':4},{'ok':0},
+                        {'protocol':'wrong'},{'error':[]},{'extra':'private'}):
+            with self.assertRaises(self.transport.RelayError):
+                self.transport._curated_result({**value,**changes},'a'*32,5)
+        success={key:item for key,item in value.items() if key!='error'}
+        success.update(ok=True,result={'status':'synthetic'})
+        self.assertEqual(self.transport._curated_result(success,'a'*32,5),success)
+
+    def test_failed_terminal_safe_code_reaches_opaque_pump_without_native_call(self):
+        spool,req=self.make_pending()
+        spool.save('result.json',self.transport._encode({'protocol':self.transport.PROTOCOL,
+            'type':'result','session_id':req['session_id'],'request_id':1,'ok':False,
+            'error':{'code':'operation_failed'}}))
+        self.assertEqual(self.io('poll',spool)['error_code'],'operation_failed')
+        out=self.pump(spool.path,'ascii')
+        self.assertEqual(out['calls'],0)
+        self.assertEqual(out['result']['state'],'done')
+        self.assertFalse(out['result']['ok'])
+        self.assertEqual(out['result']['error_code'],'operation_failed')
+
     def test_verified_pump_loader_and_pin_mismatch(self):
         loaded=subprocess.run(self.command('pump'),capture_output=True,text=True,timeout=10)
         self.assertEqual(loaded.returncode,0,loaded.stderr)

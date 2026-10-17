@@ -185,7 +185,15 @@ async function pumpD1(options) {
   let number = options.start, completed = 0, reads = 0, writes = 0;
   while (completed < maximum) {
     const status = await io('poll', number);
-    if (status.state === 'done') return report({state:'done', ok:status.ok, completed, next:number, request_bytes:reads, response_bytes:writes});
+    if (status.state === 'done') {
+      const result = {state:'done', ok:status.ok, completed, next:number, request_bytes:reads, response_bytes:writes};
+      if (status.ok === false) {
+        const allowed = new Set(['operation_failed', 'native_host_failed', 'runtime_busy', 'interrupted']);
+        if (!allowed.has(status.error_code)) throw Error('invalid_terminal_error_code');
+        result.error_code = status.error_code;
+      }
+      return report(result);
+    }
     if (status.state === 'waiting') return report({state:'waiting', completed, next:number, request_bytes:reads, response_bytes:writes});
     // Persistent claim BEFORE any native call: a crash/timeout never permits blind replay.
     const metadata = await io('claim', number);

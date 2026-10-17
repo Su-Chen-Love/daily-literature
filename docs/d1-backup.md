@@ -5,6 +5,21 @@ Library, token, credential, deployment, or remote-write fallback. Downloading a
 backup does not acknowledge Site events, advance a remote cursor, or change the
 main-store head.
 
+## SQLite portability and safe failure diagnosis
+
+Python builds that omit SQLite extension loading (including some system Python
+builds on macOS) do not expose `Connection.enable_load_extension`. Backup creation
+supports those builds without enabling extension loading. When the disabling API
+exists it must successfully accept `False`; an error is fatal and the connection
+is closed. `trusted_schema=OFF` and the independent schema/table checks still
+apply before any downloaded rows are inserted.
+
+An interrupted or failed backup is not a completed recovery point. Preserve its
+closed spool and source pin. Diagnose already captured response envelopes and
+the local runtime without replaying a native request. A code fix requires a new
+reviewed source manifest and a new bounded read-only run; do not relabel the old
+spool as successful or reuse its one-use claims.
+
 ## What a backup contains
 
 ```

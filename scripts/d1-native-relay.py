@@ -25,6 +25,9 @@ import types
 ROOT = Path(__file__).absolute().parent.parent
 SOURCE_FORMAT = 'academic-radar-d1-native-source-v1'
 MAX = 2_000_000
+# Closed, non-sensitive classifications only. Never forward exception text,
+# callback fields, paths, or an arbitrary RunnerError code from a child.
+TERMINAL_ERROR_CODES = frozenset({'operation_failed', 'native_host_failed', 'runtime_busy', 'interrupted'})
 OPERATIONS = frozenset({
     'site.read_main_store', 'site.write_main_store', 'site.publish_main_snapshot', 'site.read_site_backup',
     'site.read_run_status', 'site.read_feedback', 'site.read_profile_events', 'site.read_profile', 'site.stage_snapshot',
@@ -213,7 +216,9 @@ def make_transport(manifest, expected, files, root=ROOT, journal=None):
             transport._check(isinstance(value['result'], dict))
             return value  # Private file only; stdout contains metadata.
         transport._check(isinstance(value['error'], dict))
-        return {**value, 'error': {'code': 'native_host_failed'}}
+        code = value['error'].get('code')
+        code = code if isinstance(code, str) and code in TERMINAL_ERROR_CODES else 'native_host_failed'
+        return {**value, 'error': {'code': code}}
 
     def spawn(arguments, _workspace):
         verify_source(manifest, expected, root)
@@ -357,7 +362,11 @@ def terminal_metadata(transport, spool):
         transport._request(req, session, number)
         if value['ok']:
             transport._response(read(transport, spool, 'response-%d.json' % number), req)
-    return {key:value[key] for key in ('type', 'ok', 'request_id')}
+    result = {key:value[key] for key in ('type', 'ok', 'request_id')}
+    if not value['ok']:
+        code = value['error']['code']
+        result['error_code'] = code if code in TERMINAL_ERROR_CODES else 'native_host_failed'
+    return result
 
 
 def io_main(transport, argv=None):
@@ -373,7 +382,8 @@ def io_main(transport, argv=None):
         if args.action == 'poll':
             try:
                 value = terminal_metadata(transport, spool)
-                return {'state':'done', 'ok':value['ok'], 'request_id':value['request_id']}
+                return {'state':'done', 'ok':value['ok'], 'request_id':value['request_id'],
+                        **({'error_code': value['error_code']} if not value['ok'] else {})}
             except PublicationPending:
                 return {'state':'waiting', 'request_id':args.number}
             except FileNotFoundError:

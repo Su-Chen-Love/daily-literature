@@ -196,6 +196,17 @@ this bridge observable and measure actual native and local costs before optimizi
 
 ## Synthetic acceptance
 
+Failed child results retain only four fixed public classifications:
+`operation_failed` (local operation failure), `native_host_failed` (host protocol
+failure or unrecognized classification), `runtime_busy`, and `interrupted`.
+The closed `result.json` and pump completion metadata preserve that code, but
+discard child exception messages, paths, callback bodies, and extra error fields.
+Unknown or non-string classifications become `native_host_failed`; session,
+request, protocol, and terminal-shape checks are unchanged. This is diagnostic
+metadata, never permission to retry a request. A successful tool response followed
+by `operation_failed` must not be described as a provider or access denial without
+separate evidence.
+
 ```sh
 PYTHONPATH=src python -m unittest discover -s tests -p 'test_d1_native_spool.py' -v
 ```

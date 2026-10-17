@@ -191,7 +191,9 @@ def _schema_database(path, trusted_path, core):
         _fail('Remote table metadata differs from trusted schema')
     db = sqlite3.connect(path)
     try:
-        db.enable_load_extension(False)
+        disable_extensions = getattr(db, 'enable_load_extension', None)
+        if disable_extensions is not None:
+            disable_extensions(False)
         db.execute('PRAGMA trusted_schema=OFF')
         db.execute('PRAGMA foreign_keys=OFF')
         db.execute('PRAGMA journal_mode=DELETE')
