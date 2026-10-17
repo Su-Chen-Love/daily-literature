@@ -62,6 +62,20 @@ class ProfileSyncTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM applied_cloud_profile_events').fetchone()[0], 1)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM profile_versions').fetchone()[0], 2)
 
+    def test_caller_owned_reconciliation_keeps_connection_and_rolls_back_failure(self):
+        from academic_radar.profile_sync import _reconcile_profile_file
+        apply_remote_profiles(self.db,[self.event()],1,self.config)
+        before=self.db.execute('PRAGMA journal_mode').fetchone()[0]
+        with patch('academic_radar.profile_sync._atomic_write',side_effect=OSError('synthetic write failure')):
+            with self.assertRaises(OSError):
+                _reconcile_profile_file(self.db,self.profile)
+        self.assertFalse(self.db.in_transaction)
+        self.assertIsNotNone(self.db.execute("SELECT value FROM meta WHERE key='cloud_profile_file_pending'").fetchone())
+        self.assertTrue(_reconcile_profile_file(self.db,self.profile))
+        self.assertFalse(_reconcile_profile_file(self.db,self.profile))
+        self.assertEqual(self.db.execute('SELECT 1').fetchone()[0],1)
+        self.assertEqual(self.db.execute('PRAGMA journal_mode').fetchone()[0],before)
+
     def test_failed_file_write_is_reconciled_after_restart(self):
         apply_remote_profiles(self.db, [self.event()], 1, self.config)
         with patch('academic_radar.profile_sync._atomic_write', side_effect=OSError('Disk full')):

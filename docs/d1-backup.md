@@ -277,3 +277,32 @@ full export/recovery acceptance and private backup storage before it can be
 considered operational. Synthetic tests and an offline private-data package
 roundtrip do not establish remote deployment, scheduling, credentials, availability
 or successful daily execution.
+
+
+## SQLite builds that retain shared-memory files
+
+Some SQLite/VFS builds retain a `-shm` file after connection close and even after
+SQLite completes a checkpoint and switches the database to DELETE journal mode.
+Neither close nor garbage collection is therefore a portable proof that a
+snapshot has no sidecars. The strict source-sidecar rejection remains unchanged;
+never remove sidecars to force an arbitrary user database through that check.
+
+The trusted-schema builder now stays separate from the empty schema supplied to
+backup and restore. Migrations can use their normal WAL workspace. After the
+current or bundled historical DDL has passed the existing fingerprint checks,
+that DDL is materialized into a new DELETE-mode database containing no seed rows.
+Explicit trusted-schema inputs still require their exact file hash, stable stamp,
+safe path and absent sidecars before their independently trusted DDL is used.
+
+Pending-profile restoration reuses the fresh restore-owned DELETE connection for
+the existing transactional profile-file reconciliation. Ordinary application
+callers retain their previous connection behavior. No external Site event is
+acknowledged by restoring a backup.
+
+Synthetic tests use SQLite's backup API to create independent, absent snapshot
+files from their owned test writers, while preserving any retained writer sidecar.
+They also prove that a sidecar-bearing source remains rejected, that schema
+snapshots contain no seed rows, and that pending-profile restore never enables WAL.
+Actual isolated CLI tests cover exact-main and pending-event restores with both
+bundled and explicitly pinned schemas. A platform-specific synthetic gate must
+pass before beginning a new live read-only backup.

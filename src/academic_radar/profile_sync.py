@@ -136,28 +136,33 @@ def apply_remote_profiles(db, events: list[dict], cursor: int, config: dict) -> 
     return changed
 
 
+def _reconcile_profile_file(db, profile_path: Path) -> bool:
+    """Use the caller-owned connection without changing its journal mode."""
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        pending = db.execute("SELECT value FROM meta WHERE key='cloud_profile_file_pending'").fetchone()
+        if not pending:
+            return False
+        active = db.execute("SELECT content,profile_hash FROM profile_versions WHERE status='active'").fetchone()
+        if not active:
+            raise ValueError("Pending cloud profile has no active profile")
+        expected = active["content"].encode()
+        actual = profile_path.read_bytes() if profile_path.exists() else None
+        if active["profile_hash"] != pending[0] and actual != expected:
+            raise ValueError("Profile changed while cloud file reconciliation was pending")
+        base = db.execute("SELECT value FROM meta WHERE key='cloud_profile_file_base'").fetchone()
+        if actual is not None and actual != expected and (not base or hashlib.sha256(actual).hexdigest() != base[0]):
+            raise ValueError("Profile file changed while cloud file reconciliation was pending")
+        if actual != expected:
+            _atomic_write(profile_path, active["content"])
+        db.execute("DELETE FROM meta WHERE key IN ('cloud_profile_file_pending','cloud_profile_file_base')")
+    return True
+
+
 def reconcile_profile_file(db_path: Path, profile_path: Path) -> bool:
     """Repair only a pending cloud edit, without overwriting unrelated user files."""
     db = connect(db_path)
     try:
-        with db:
-            db.execute("BEGIN IMMEDIATE")
-            pending = db.execute("SELECT value FROM meta WHERE key='cloud_profile_file_pending'").fetchone()
-            if not pending:
-                return False
-            active = db.execute("SELECT content,profile_hash FROM profile_versions WHERE status='active'").fetchone()
-            if not active:
-                raise ValueError("Pending cloud profile has no active profile")
-            expected = active["content"].encode()
-            actual = profile_path.read_bytes() if profile_path.exists() else None
-            if active["profile_hash"] != pending[0] and actual != expected:
-                raise ValueError("Profile changed while cloud file reconciliation was pending")
-            base = db.execute("SELECT value FROM meta WHERE key='cloud_profile_file_base'").fetchone()
-            if actual is not None and actual != expected and (not base or hashlib.sha256(actual).hexdigest() != base[0]):
-                raise ValueError("Profile file changed while cloud file reconciliation was pending")
-            if actual != expected:
-                _atomic_write(profile_path, active["content"])
-            db.execute("DELETE FROM meta WHERE key IN ('cloud_profile_file_pending','cloud_profile_file_base')")
-        return True
+        return _reconcile_profile_file(db, profile_path)
     finally:
         db.close()

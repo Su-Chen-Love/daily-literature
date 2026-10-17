@@ -129,6 +129,14 @@ class IsolatedBackupTests(unittest.TestCase):
                                  sqlite_delta.inspect_snapshot(self.fixture.db))
                 self.assertEqual((restored/'state'/'history'/'new.txt').read_bytes(),
                                  (self.fixture.state/'history'/'new.txt').read_bytes())
+                pending = self.root/('restore-pending-'+suffix)
+                replay = self.isolated(['backup-restore','--backup',output,
+                    '--backup-sha256',result['backup_sha256'],'--output',pending,*trust], allow_reads=False)
+                self.assertEqual(replay['applied'], {'feedback':1,'profiles':1})
+                sqlite_delta.inspect_snapshot(pending/'state'/'papers.sqlite3')
+                self.assertEqual((pending/'state'/'research-profile.md').read_text(),
+                                 self.fixture.profiles[0]['content'])
+                self.assertEqual(self.calls, calls)
                 self.assertEqual(list(self.real_temp.iterdir()), [])
                 self.assertFalse(list(self.root.glob('academic-d1-*-schema-*')))
                 self.assertFalse(list(self.root.glob('.d1-backup-*')))

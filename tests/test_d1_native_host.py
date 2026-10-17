@@ -276,13 +276,33 @@ class D1TrustedSchemaWorkspaceTests(unittest.TestCase):
                             if expected is not None:
                                 self.assertEqual(fingerprint, expected)
                             for table in tables:
-                                # Bundled migrations seed their own metadata,
-                                # never any historical user/source rows.
-                                if name != 'bundled' or table['name'] not in {'meta', 'schema_migrations', 'sqlite_sequence'}:
-                                    self.assertEqual(db.execute('SELECT count(*) FROM "'+table['name']+'"').fetchone()[0], 0)
+                                # Every branch yields empty independently rebuilt DDL.
+                                self.assertEqual(db.execute('SELECT count(*) FROM "'+table['name']+'"').fetchone()[0], 0)
                     self.assertFalse(path.parent.exists())
                     self.assertEqual(list(self.safe.iterdir()), [])
         self.assert_source_unchanged()
+
+    def test_current_schema_rebuilt_separately_from_retained_builder_shm(self):
+        from academic_radar import storage,sqlite_delta
+        original=storage.upgrade_database;builders=[];raw=b'synthetic retained shm'.ljust(32768,b'\0')
+        def build(path):
+            result=original(path)
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+                self.assertEqual(db.execute('PRAGMA journal_mode=DELETE').fetchall(),[('delete',)])
+            Path(str(path)+'-shm').write_bytes(raw)
+            builders.append(path)
+            return result
+        with patch.object(storage,'upgrade_database',build):
+            with native.trusted_schema(self.bundled,temp_parent=self.safe) as snapshot:
+                self.assertEqual(len(builders),1)
+                self.assertNotEqual(snapshot,builders[0])
+                self.assertEqual(Path(str(builders[0])+'-shm').read_bytes(),raw)
+                with self.assertRaisesRegex(sqlite_delta.DeltaError,'SQLite sidecars present'):
+                    sqlite_delta.inspect_snapshot(builders[0])
+                inventory=sqlite_delta.inspect_snapshot(snapshot)
+                self.assertTrue(all(table['rows']==0 for table in inventory['tables']))
+        self.assertEqual(list(self.safe.iterdir()),[])
 
     def test_invalid_parent_fails_closed_before_creating_any_temporary_directory(self):
         ordinary_file = self.root/'file'; ordinary_file.write_text('not a directory')

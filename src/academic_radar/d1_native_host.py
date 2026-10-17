@@ -174,6 +174,8 @@ def materialize_schema(schema, destination):
     if destination.exists():
         raise ValueError('Schema destination must be absent')
     with contextlib.closing(sqlite3.connect(destination)) as target:
+        if target.execute('PRAGMA journal_mode=DELETE').fetchall() != [('delete',)]:
+            raise ValueError('Trusted schema requires DELETE journal mode')
         target.execute("PRAGMA encoding='" + schema['encoding'] + "'")
         for kind in ('table', 'index'):
             for object_kind, name, _table, sql in schema['objects']:
@@ -225,12 +227,14 @@ def trusted_schema(args, schema_sha256=None, *, temp_parent=None):
     if args.trusted_schema_sha256 is not None:
         raise RunnerError('trusted_schema_path_required')
     with tempfile.TemporaryDirectory(prefix='academic-d1-trusted-schema-', dir=temp_parent) as temporary:
-        path = Path(temporary) / 'schema.sqlite3'
+        # The migration builder can retain platform-owned WAL sidecars after
+        # close. It is never the strict snapshot exported to a consumer.
+        path = Path(temporary) / 'schema-builder.sqlite3'
         from .storage import upgrade_database
         upgrade_database(path)
         with contextlib.closing(sqlite3.connect(path)) as db:
-            db.execute('PRAGMA wal_checkpoint(TRUNCATE)'); db.execute('PRAGMA journal_mode=DELETE')
             current, _, _ = package._schema(db)
+        schema = current
         if schema_sha256 is not None and schema_sha256 != package.digest(current):
             # The remote/package hash selects an installed source definition;
             # it never supplies executable SQL. This reviewed historic DDL is
@@ -245,9 +249,11 @@ def trusted_schema(args, schema_sha256=None, *, temp_parent=None):
                     {key: value for key, value in current.items() if key != 'objects'}
                     or list(map(normalize, schema['objects'])) != list(map(normalize, current['objects']))):
                 raise RunnerError('bundled_schema_requires_source_review')
-            path = Path(temporary)/'historical.sqlite3'
-            materialize_schema(schema, path)
-        yield path
+        # Execute only independently trusted, fingerprint-checked DDL in a
+        # fresh DELETE-mode file. Do not copy seed rows or remove sidecars.
+        empty = Path(temporary)/'schema.sqlite3'
+        materialize_schema(schema, empty)
+        yield empty
 
 
 class D1NativeRunner:

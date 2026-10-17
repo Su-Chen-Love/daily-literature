@@ -22,21 +22,39 @@ from academic_radar.storage import upgrade_database
 def sha(raw):return hashlib.sha256(raw).hexdigest()
 
 
+def fixture_snapshot(source, destination):
+    """Copy only an owned synthetic writer into an absent, no-WAL snapshot."""
+    if destination.exists():
+        raise AssertionError('Synthetic snapshot destination must be absent')
+    with contextlib.closing(sqlite3.connect(source.as_uri()+'?mode=ro', uri=True)) as reader, contextlib.closing(sqlite3.connect(destination)) as target:
+        if reader.execute('PRAGMA journal_mode').fetchall() != [('delete',)]:
+            raise AssertionError('Synthetic writer must be in DELETE mode before copying')
+        if target.execute('PRAGMA journal_mode=DELETE').fetchall() != [('delete',)]:
+            raise AssertionError('Synthetic snapshot requires DELETE journal mode')
+        reader.backup(target)
+        if target.execute('PRAGMA journal_mode').fetchall() != [('delete',)]:
+            raise AssertionError('Synthetic snapshot unexpectedly enabled WAL')
+        sqlite_delta._validate_database(target)
+    sqlite_delta._sidecars(destination)
+
+
 class NativeFixture:
     def __init__(self,root):
         self.root=root;self.state=root/'source';self.state.mkdir()
         self.db=self.state/'papers.sqlite3'
-        upgrade_database(self.db)
+        writer=root/'writer.sqlite3'
+        upgrade_database(writer)
         self.profile='Original synthetic research profile.'
         self.profile_hash=sha(self.profile.encode())
-        # A transaction context does not close SQLite connections. Both fixture
-        # snapshots must be closed and checkpointed before strict export.
-        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+        # A transaction context does not close SQLite connections. Keep the
+        # writer separate from both independently created export snapshots.
+        with contextlib.closing(sqlite3.connect(writer)) as db, db:
             with contextlib.closing(db.execute('PRAGMA journal_mode=DELETE')) as cursor:
                 if cursor.fetchall() != [('delete',)]:
                     raise AssertionError('Synthetic fixture requires DELETE journal mode')
             db.execute("INSERT INTO papers(identity,title,first_seen,updated_at) VALUES('doi:synthetic','original','2026-01-01','2026-01-01')")
             db.execute("INSERT INTO profile_versions(profile_hash,content,status,source,created_at) VALUES(?,?,'active','test','2026-01-01')",(self.profile_hash,self.profile))
+        fixture_snapshot(writer,self.db)
         (self.state/'research-profile.md').write_text(self.profile)
         (self.state/'config.toml').write_text('profile_file = "research-profile.md"\nrelevance_threshold = 0.7\n')
         (self.state/'history').mkdir()
@@ -45,9 +63,13 @@ class NativeFixture:
         self.source_manifest_sha=original['manifest_sha256']
         self.core={k:v for k,v in original['manifest'].items() if k not in ('objects','files','statistics')}
         # A newer revision deliberately differs from the original inventory.
-        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+        with contextlib.closing(sqlite3.connect(writer)) as db, db:
             db.execute("UPDATE papers SET title='new current title' WHERE identity='doi:synthetic'")
             db.execute("INSERT INTO papers(identity,title,first_seen,updated_at) VALUES('doi:new','new paper','2026-01-02','2026-01-02')")
+        current_state=root/'current-source'
+        shutil.copytree(self.state,current_state,ignore=shutil.ignore_patterns('papers.sqlite3'))
+        self.state=current_state;self.db=self.state/'papers.sqlite3'
+        fixture_snapshot(writer,self.db)
         (self.state/'history'/'new.txt').write_bytes(b'new artifact'*20000)
         current=package.export_package(self.db,root/'current',files_root=self.state)
         self.current_manifest=current['manifest']
@@ -134,16 +156,20 @@ class NativeFixtureLifecycleTests(unittest.TestCase):
 
     def test_writer_connections_are_closed_before_each_export_without_gc(self):
         real_connect, real_export = sqlite3.connect, package.export_package
-        database = self.root/'source'/'papers.sqlite3'
+        writer = self.root/'writer.sqlite3'
+        tracked = {str(writer), writer.as_uri()+'?mode=ro',
+                   str(self.root/'source'/'papers.sqlite3'),
+                   str(self.root/'current-source'/'papers.sqlite3')}
         retained, boundaries = [], []
 
         def connect(path, *args, **kwargs):
             connection = real_connect(path, *args, **kwargs)
-            if str(path) == str(database):
+            if str(path) in tracked:
                 retained.append(connection)  # Strong references prevent GC cleanup.
             return connection
 
         def export(*args, **kwargs):
+            database = args[0]
             boundaries.append(len(retained))
             for connection in retained:
                 with self.assertRaisesRegex(sqlite3.ProgrammingError, 'closed'):
@@ -155,11 +181,30 @@ class NativeFixtureLifecycleTests(unittest.TestCase):
         try:
             with patch.object(sqlite3, 'connect', connect), patch.object(package, 'export_package', export):
                 fixture = NativeFixture(self.root)
-            self.assertEqual(boundaries, [2, 3])  # Migration + first writer, then second writer.
+            self.assertEqual(boundaries, [4, 7])  # Builder, writers and both independent snapshot handles.
             self.assertNotEqual(fixture.core['inventory'], fixture.current_manifest['inventory'])
         finally:
             for connection in retained:
                 connection.close()
+
+    def test_fresh_snapshot_preserves_retained_synthetic_source_sidecar(self):
+        writer=self.root/'writer.sqlite3'
+        with contextlib.closing(sqlite3.connect(writer)) as db:
+            db.execute('CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT)')
+            db.execute("INSERT INTO sample VALUES(1,'synthetic')")
+            db.commit()
+        retained=Path(str(writer)+'-shm');raw=b'synthetic retained shm'.ljust(32768,b'\0')
+        retained.write_bytes(raw)
+        snapshot=self.root/'snapshot.sqlite3'
+        fixture_snapshot(writer,snapshot)
+        self.assertEqual(retained.read_bytes(),raw)
+        with self.assertRaisesRegex(sqlite_delta.DeltaError,'SQLite sidecars present'):
+            sqlite_delta.inspect_snapshot(writer)
+        self.assertEqual(sqlite_delta.inspect_snapshot(snapshot)['tables'][0]['rows'],1)
+        before=snapshot.read_bytes()
+        with self.assertRaisesRegex(AssertionError,'must be absent'):
+            fixture_snapshot(writer,snapshot)
+        self.assertEqual(snapshot.read_bytes(),before)
 
     def test_fixture_writer_exception_rolls_back_and_closes(self):
         real_connect = sqlite3.connect
@@ -167,7 +212,7 @@ class NativeFixtureLifecycleTests(unittest.TestCase):
             with self.subTest(phase=phase):
                 root = self.root/phase
                 root.mkdir()
-                database = root/'source'/'papers.sqlite3'
+                database = root/'writer.sqlite3'
                 retained = []
                 marker = 'INSERT INTO profile_versions' if phase == 'initial' else 'INSERT INTO papers(identity,title,first_seen,updated_at) VALUES(\'doi:new\''
 
@@ -200,7 +245,7 @@ class NativeFixtureLifecycleTests(unittest.TestCase):
                     for connection in retained:
                         connection.close()
 
-    def test_live_wal_sidecars_still_reject_export_until_last_connection_closes(self):
+    def test_live_wal_source_rejected_and_only_fresh_delete_snapshot_exported(self):
         database = self.root/'live.sqlite3'
         upgrade_database(database)
         with contextlib.closing(sqlite3.connect(database)) as connection:
@@ -211,15 +256,20 @@ class NativeFixtureLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(package.PackageError, 'SQLite sidecars present'):
                 package.export_package(database, self.root/'rejected')
             self.assertFalse((self.root/'rejected').exists())
-        self.assertFalse(any(Path(str(database)+suffix).exists()
-                             for suffix in ('-wal', '-shm', '-journal')))
-        package.export_package(database, self.root/'closed')
+        # Closing is not a portable promise that platform-owned -shm vanished.
+        # Change only this synthetic writer using SQLite, never unlink sidecars.
+        with contextlib.closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()[0][0],0)
+            self.assertEqual(connection.execute('PRAGMA journal_mode=DELETE').fetchall(),[('delete',)])
+        snapshot=self.root/'closed.sqlite3'
+        fixture_snapshot(database,snapshot)
+        package.export_package(snapshot,self.root/'closed')
 
 
 class D1BackupTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
-        self.root=Path(self.temp.name);self.fixture=NativeFixture(self.root)
+        self.root=Path(self.temp.name).resolve();self.fixture=NativeFixture(self.root)
         self.output=self.root/'backup';self.restored=self.root/'restored'
 
     def export(self):
@@ -241,6 +291,22 @@ class D1BackupTests(unittest.TestCase):
         self.assertGreater(result['transport_call_count'],0)
         self.assertIn('read_objects',result['transport_calls']['main'])
         self.assertTrue(all(data.get('revision',2)==2 for _,data in self.fixture.calls))
+
+    def test_pending_profile_restore_never_reopens_through_wal_connector(self):
+        from academic_radar import profile_sync
+        self.export()
+        statements=[];real_connect=sqlite3.connect
+        def connect(*args,**kwargs):
+            db=real_connect(*args,**kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        with patch.object(profile_sync,'connect',side_effect=AssertionError('WAL connector forbidden during restore')), patch.object(sqlite3,'connect',connect):
+            report=backup.restore_backup(self.output,self.restored,trusted_schema_database=self.fixture.db)
+        self.assertEqual(report['applied'],{'feedback':1,'profiles':1})
+        self.assertFalse(any('JOURNAL_MODE=WAL' in ''.join(sql.upper().split()) for sql in statements))
+        sqlite_delta.inspect_snapshot(self.restored/'state'/'papers.sqlite3')
+        self.assertEqual((self.restored/'state'/'research-profile.md').read_text(),self.fixture.profiles[0]['content'])
+        self.assertEqual((self.fixture.state/'research-profile.md').read_text(),self.fixture.profile)
 
     def test_sqlite_build_without_extension_loading_api_full_roundtrip(self):
         original_connect=sqlite3.connect
@@ -552,7 +618,7 @@ class D1BackupWorkerBridgeTests(unittest.TestCase):
         from academic_radar import d1_runtime as runtime
         project=Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(prefix='d1-independent-backup-') as temporary:
-         root=Path(temporary); fixture=NativeFixture(root); script=root/'bridge.mjs'
+         root=Path(temporary).resolve(); fixture=NativeFixture(root); script=root/'bridge.mjs'
          script.write_text("""
         import {createInterface} from 'node:readline';
         import {database} from 'DATABASE';

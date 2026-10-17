@@ -609,7 +609,7 @@ def _profile_target(state,database,config,override,source_root=None):
 
 def _apply_pending(state,site,main_manifest,manifest,profile_relative_path,source_root=None):
     from .cloud_sync import apply_remote_feedback
-    from .profile_sync import apply_remote_profiles, reconcile_profile_file
+    from .profile_sync import apply_remote_profiles, _reconcile_profile_file
     from .product import load_config
     database=state/main_manifest['database_path']
     config_path=state/'config.toml'
@@ -634,13 +634,11 @@ def _apply_pending(state,site,main_manifest,manifest,profile_relative_path,sourc
         for key,meta_key in (('feedback_cursor','cloud_feedback_cursor'),('profile_cursor','cloud_profile_cursor')):
             row=db.execute('SELECT value FROM meta WHERE key=?',(meta_key,)).fetchone()
             if (int(row[0]) if row else 0)!=manifest['site_watermarks'][key]:_fail('Pending replay did not reach captured cursor')
+        if applied['profiles']:
+            # The restore owns this fresh DELETE-mode connection. Reuse it so
+            # profile reconciliation cannot turn the derived copy back to WAL.
+            _reconcile_profile_file(db,profile)
         db.row_factory=None
-        delta._validate_database(db)
-    if applied['profiles']:
-        reconcile_profile_file(database,profile)
-    with contextlib.closing(sqlite3.connect(database)) as db:
-        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        db.execute('PRAGMA journal_mode=DELETE')
         delta._validate_database(db)
     return applied
 
