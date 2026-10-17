@@ -1,7 +1,9 @@
 """Native JSON-line + real Worker acceptance. All data and identity are synthetic."""
+import contextlib
 import copy
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -224,6 +226,168 @@ class D1NativeWireTests(unittest.TestCase):
             runner.publish(SimpleNamespace(head=baseline), args, records, cert)
         self.assertNotIn('site.publish_main_snapshot', [r['operation'] for r in pipe.requests])
         self.assertNotIn('site.acknowledge_snapshot', [r['operation'] for r in pipe.requests])
+
+
+class D1TrustedSchemaWorkspaceTests(unittest.TestCase):
+    """Private output-adjacent schema workspaces never depend on TMPDIR aliases."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='d1-schema-test-', dir=Path.cwd())
+        self.addCleanup(self.temporary.cleanup)
+        # Canonicalize only newly created test-owned scratch space; production
+        # caller paths remain subject to the unchanged strict symlink checks.
+        self.root = Path(self.temporary.name).resolve()
+        self.safe = self.root/'safe'; self.safe.mkdir()
+        self.source = self.root/'trusted.sqlite3'
+        with contextlib.closing(sqlite3.connect(self.source)) as db:
+            db.executescript("PRAGMA user_version=42; PRAGMA application_id=73; "
+                "CREATE TABLE sample(id INTEGER PRIMARY KEY, value TEXT); "
+                "INSERT INTO sample VALUES(1,'synthetic source row');")
+            self.source_schema = package._schema(db)[0]
+        self.source_bytes = self.source.read_bytes()
+        self.source_stamp = package._stamp(self.source)
+        self.pinned = SimpleNamespace(trusted_schema=self.source,
+            trusted_schema_sha256=hashlib.sha256(self.source_bytes).hexdigest())
+        self.bundled = SimpleNamespace(trusted_schema=None, trusted_schema_sha256=None)
+        self.cases = [('pinned', self.pinned, package.digest(self.source_schema)),
+                      ('bundled', self.bundled, None),
+                      ('historical', self.bundled, native.HISTORICAL_SCHEMA_SHA256)]
+
+    def assert_source_unchanged(self):
+        self.assertEqual(self.source.read_bytes(), self.source_bytes)
+        self.assertEqual(package._stamp(self.source), self.source_stamp)
+        for suffix in ('-wal', '-shm', '-journal'):
+            self.assertFalse(Path(str(self.source)+suffix).exists())
+
+    def test_validated_parent_is_private_fresh_and_cleaned_with_fingerprint_preserved(self):
+        directories = set()
+        fingerprints = {}
+        for name, args, expected in self.cases:
+            for repeat in range(2):
+                with self.subTest(branch=name, repeat=repeat):
+                    with native.trusted_schema(args, expected, temp_parent=self.safe) as path:
+                        self.assertEqual(path.parent.parent, self.safe)
+                        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+                        self.assertNotIn(path.parent, directories); directories.add(path.parent)
+                        self.assertEqual(package._path(path), path)
+                        with contextlib.closing(sqlite3.connect(path)) as db:
+                            schema, tables, _ = package._schema(db)
+                            fingerprint = package.digest(schema)
+                            self.assertEqual(fingerprint, fingerprints.setdefault(name, fingerprint))
+                            if expected is not None:
+                                self.assertEqual(fingerprint, expected)
+                            for table in tables:
+                                # Bundled migrations seed their own metadata,
+                                # never any historical user/source rows.
+                                if name != 'bundled' or table['name'] not in {'meta', 'schema_migrations', 'sqlite_sequence'}:
+                                    self.assertEqual(db.execute('SELECT count(*) FROM "'+table['name']+'"').fetchone()[0], 0)
+                    self.assertFalse(path.parent.exists())
+                    self.assertEqual(list(self.safe.iterdir()), [])
+        self.assert_source_unchanged()
+
+    def test_invalid_parent_fails_closed_before_creating_any_temporary_directory(self):
+        ordinary_file = self.root/'file'; ordinary_file.write_text('not a directory')
+        alias = self.root/'alias'; alias.symlink_to(self.safe, target_is_directory=True)
+        (self.safe/'child').mkdir()
+        dangling = self.root/'dangling'; dangling.symlink_to(self.root/'missing', target_is_directory=True)
+        invalid = [self.root/'missing', ordinary_file, alias, alias/'child', dangling,
+                   self.safe/'..'/'safe']
+        for name, args, expected in self.cases:
+            for parent in invalid:
+                with self.subTest(branch=name, parent=parent), \
+                        patch.object(native.tempfile, 'TemporaryDirectory') as temporary:
+                    with self.assertRaises((RunnerError, package.PackageError)):
+                        with native.trusted_schema(args, expected, temp_parent=parent):
+                            self.fail('Unsafe temporary parent was accepted')
+                    temporary.assert_not_called()
+        self.assert_source_unchanged()
+
+    def test_private_directory_is_removed_when_consumer_or_schema_creation_fails(self):
+        from academic_radar import storage
+        for name, args, expected in self.cases:
+            with self.subTest(branch=name, failure='consumer'):
+                with self.assertRaisesRegex(RuntimeError, 'consumer failure'):
+                    with native.trusted_schema(args, expected, temp_parent=self.safe) as path:
+                        self.assertTrue(path.exists())
+                        raise RuntimeError('consumer failure')
+                self.assertFalse(path.parent.exists())
+                self.assertEqual(list(self.safe.iterdir()), [])
+            target = storage if name == 'bundled' else native
+            attribute = 'upgrade_database' if name == 'bundled' else 'materialize_schema'
+            original = getattr(target, attribute)
+            def fail_after_creation(*values):
+                original(*values)
+                raise RuntimeError('schema creation failure')
+            with self.subTest(branch=name, failure='creation'), \
+                    patch.object(target, attribute, side_effect=fail_after_creation):
+                with self.assertRaisesRegex(RuntimeError, 'schema creation failure'):
+                    with native.trusted_schema(args, expected, temp_parent=self.safe):
+                        self.fail('Failed schema was yielded')
+                self.assertEqual(list(self.safe.iterdir()), [])
+        self.assert_source_unchanged()
+
+    def test_safe_temporary_parent_does_not_relax_trusted_source_symlink_rejection(self):
+        linked_source = self.root/'linked.sqlite3'; linked_source.symlink_to(self.source)
+        linked_parent = self.root/'linked-root'; linked_parent.symlink_to(self.root, target_is_directory=True)
+        for source in (linked_source, linked_parent/self.source.name):
+            args = SimpleNamespace(trusted_schema=source, trusted_schema_sha256=self.pinned.trusted_schema_sha256)
+            with self.subTest(source=source), patch.object(native.tempfile, 'TemporaryDirectory') as temporary:
+                with self.assertRaisesRegex(package.PackageError, 'Symlinks'):
+                    with native.trusted_schema(args, temp_parent=self.safe):
+                        self.fail('Linked source was accepted')
+                temporary.assert_not_called()
+        self.assert_source_unchanged()
+
+    def test_schema_export_uses_output_parent_with_process_local_symlink_tmpdir(self):
+        default_target = self.root/'default-temp'; default_target.mkdir()
+        default_alias = self.root/'temp-alias'; default_alias.symlink_to(default_target, target_is_directory=True)
+        pipe = Pipe(lambda *_: self.fail('Schema export must remain offline'))
+        runner = native.D1NativeRunner(JsonLineHost(pipe, pipe))
+        for name, source_args, expected in self.cases:
+            output = self.safe/name
+            argv = ['schema-export', '--output', str(output)]
+            if source_args.trusted_schema is not None:
+                argv += ['--trusted-schema', str(source_args.trusted_schema),
+                         '--trusted-schema-sha256', source_args.trusted_schema_sha256]
+            if expected is not None:
+                argv += ['--schema-fingerprint', expected]
+            with self.subTest(branch=name), patch.dict(os.environ, {'TMPDIR': str(default_alias)}), \
+                    patch.object(tempfile, 'tempdir', None), \
+                    patch.object(native, 'trusted_schema', wraps=native.trusted_schema) as schema:
+                self.assertEqual(tempfile.gettempdir(), str(default_alias))
+                args = native.parser().parse_args(argv)
+                result = runner.execute(args)
+                schema.assert_called_once_with(args, expected, temp_parent=self.safe)
+                self.assertEqual(tempfile.gettempdir(), str(default_alias))
+                path = Path(result['trusted_schema'])
+                self.assertEqual(path, output/'schema.sqlite3')
+                self.assertFalse(result['contains_source_rows'])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), result['trusted_schema_sha256'])
+                if expected is not None:
+                    with contextlib.closing(sqlite3.connect(path)) as db:
+                        self.assertEqual(package.digest(package._schema(db)[0]), expected)
+                self.assertEqual(list(default_target.iterdir()), [])
+        self.assertEqual({path.name for path in self.safe.iterdir()}, {case[0] for case in self.cases})
+        self.assertEqual(pipe.requests, [])
+        self.assert_source_unchanged()
+
+    def test_output_based_commands_reject_unsafe_output_before_native_or_schema_work(self):
+        alias = self.root/'output-alias'; alias.symlink_to(self.safe, target_is_directory=True)
+        occupied = self.safe/'occupied'; occupied.mkdir()
+        outputs = (alias/'new', occupied, self.root/'missing'/'new', self.safe/'..'/'new')
+        pipe = Pipe(lambda *_: self.fail('Invalid output must fail before native requests'))
+        runner = native.D1NativeRunner(JsonLineHost(pipe, pipe))
+        for command in ('schema-export', 'backup-export', 'backup-restore'):
+            for output in outputs:
+                argv = [command, '--output', str(output)]
+                if command == 'backup-restore':
+                    argv += ['--backup', str(self.root/'backup'), '--backup-sha256', 'a'*64]
+                with self.subTest(command=command, output=output), patch.object(native, 'trusted_schema') as schema:
+                    with self.assertRaises(package.PackageError):
+                        runner.execute(native.parser().parse_args(argv))
+                    schema.assert_not_called()
+        self.assertEqual(pipe.requests, [])
 
 
 class D1NativeWorkerTests(unittest.TestCase):

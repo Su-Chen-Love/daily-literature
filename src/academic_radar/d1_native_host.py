@@ -188,8 +188,14 @@ def materialize_schema(schema, destination):
 
 
 @contextlib.contextmanager
-def trusted_schema(args, schema_sha256=None):
+def trusted_schema(args, schema_sha256=None, *, temp_parent=None):
     """Never execute the remote manifest's SQL or implicitly trust its DB."""
+    if temp_parent is not None:
+        # Output-based commands already have a safe existing parent. Keep the
+        # generated schema there rather than trusting a platform TMPDIR alias.
+        temp_parent = package._path(temp_parent)
+        if not temp_parent.is_dir():
+            raise RunnerError('trusted_schema_temp_parent_must_be_existing_directory')
     if args.trusted_schema is not None:
         if args.trusted_schema_sha256 is None:
             raise RunnerError('trusted_schema_requires_explicit_sha256')
@@ -211,14 +217,14 @@ def trusted_schema(args, schema_sha256=None):
         # its schema in a private empty file; never copy historical source rows.
         if package._stamp(path) != before or d1_backup._file_sha(path)[0] != args.trusted_schema_sha256:
             raise RunnerError('trusted_schema_changed')
-        with tempfile.TemporaryDirectory(prefix='academic-d1-pinned-schema-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='academic-d1-pinned-schema-', dir=temp_parent) as temporary:
             empty = Path(temporary) / 'schema.sqlite3'
             materialize_schema(schema, empty)
             yield empty
         return
     if args.trusted_schema_sha256 is not None:
         raise RunnerError('trusted_schema_path_required')
-    with tempfile.TemporaryDirectory(prefix='academic-d1-trusted-schema-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='academic-d1-trusted-schema-', dir=temp_parent) as temporary:
         path = Path(temporary) / 'schema.sqlite3'
         from .storage import upgrade_database
         upgrade_database(path)
@@ -344,7 +350,7 @@ class D1NativeRunner:
                     'unattended_host_verified': False}
         if command == 'schema-export':
             output = package._new_directory(args.output)
-            with trusted_schema(args, args.schema_fingerprint) as trusted, tempfile.TemporaryDirectory(prefix='.d1-schema-', dir=output.parent) as temporary:
+            with trusted_schema(args, args.schema_fingerprint, temp_parent=output.parent) as trusted, tempfile.TemporaryDirectory(prefix='.d1-schema-', dir=output.parent) as temporary:
                 stage = Path(temporary)/'schema'; stage.mkdir(mode=0o700)
                 destination = stage/'schema.sqlite3'; shutil.copyfile(trusted, destination); destination.chmod(0o600)
                 sha, size = d1_backup._file_sha(destination)
@@ -378,13 +384,13 @@ class D1NativeRunner:
             verified = d1_backup.verify_backup(args.backup, expected_backup_sha256=args.backup_sha256)
             return {'status': 'verified', 'backup_sha256': verified['backup_sha256'], 'revision': verified['manifest']['revision']}
         if command in {'backup-export', 'backup-restore'}:
-            package._new_directory(args.output)
+            output = package._new_directory(args.output)
             if command == 'backup-export':
                 head = self.client.head()
                 selected = self.main_call('read_manifest', {'revision': head['revision']})['manifest']['schema_sha256']
             else:
                 selected = d1_backup.verify_backup(args.backup, expected_backup_sha256=args.backup_sha256)['main_manifest']['schema_sha256']
-            with trusted_schema(args, selected) as trusted:
+            with trusted_schema(args, selected, temp_parent=output.parent) as trusted:
                 if command == 'backup-export':
                     return {'status': 'exported', **d1_backup.export_backup(self.main_call, self.backup_call, args.output,
                         trusted_schema_database=trusted), 'output': str(args.output.absolute())}

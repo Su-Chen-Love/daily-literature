@@ -14,6 +14,20 @@ exists it must successfully accept `False`; an error is fatal and the connection
 is closed. `trusted_schema=OFF` and the independent schema/table checks still
 apply before any downloaded rows are inserted.
 
+For `backup-export`, `backup-restore`, and `schema-export`, internally generated
+trusted schema databases live in a fresh private directory beneath the validated
+output parent. Both bundled-schema and explicitly pinned-schema modes follow this
+rule. This avoids system temporary-directory aliases such as macOS `/var` without
+changing `TMPDIR`, resolving user-supplied paths, or relaxing symlink rejection.
+Missing, non-directory, traversal-containing, or symlinked temporary parents are
+refused. Temporary schema directories are removed on success and failure.
+
+The isolated acceptance test invokes the actual pinned `-I -B` source loader under
+a child-process-only symlinked temporary-directory fixture, then completes a
+synthetic export, offline verification, and exact restore. It covers both schema
+modes and checks the transition from the five metadata requests to the first row
+request. It does not call a real service or change the host's environment.
+
 An interrupted or failed backup is not a completed recovery point. Preserve its
 closed spool and source pin. Diagnose already captured response envelopes and
 the local runtime without replaying a native request. A code fix requires a new
