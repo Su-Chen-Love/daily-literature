@@ -29,16 +29,16 @@
       <details class="paper-details">
       <summary><span>详情</span><svg class="icon detail-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg></summary>
       <div class="paper-detail-content">
-      {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。你可以在下方粘贴从论文页核验的完整摘要。</p>
-      <form class="manual-abstract-form" data-manual-abstract-form>
+      {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。{% if site_mode == 'cloud' %}可在本地补充核验后的完整摘要。{% else %}你可以在下方粘贴从论文页核验的完整摘要。{% endif %}</p>
+      {% if site_mode != 'cloud' %}<form class="manual-abstract-form" data-manual-abstract-form>
         <input type="hidden" name="identity" value="{{ paper.identity }}">
         <label>完整摘要<textarea name="abstract" rows="6" maxlength="50000" required placeholder="粘贴论文页面明确标注的完整 Abstract"></textarea></label>
         <label>来源链接（建议填写）<input name="source_url" type="url" value="{{ paper.url or '' }}" placeholder="https://..."></label>
         <button type="submit">保存摘要</button>
-      </form>{% endif %}
+      </form>{% endif %}{% endif %}
       <div class="abstract-wrap"><p class="abstract">{{ paper.abstract or '公开渠道未找到原始摘要。' }}</p></div>
       <dl class="paper-meta"><div><dt>作者</dt><dd>{{ paper.authors_json|authors }}</dd></div><div><dt>摘要来源</dt><dd>{{ paper.abstract_source or '未找到' }}</dd></div><div><dt>DOI</dt><dd>{{ paper.doi or '无' }}</dd></div></dl>
-      {% if show_pdf %}<div class="paper-actions"><form method="post" action="/fulltext" enctype="multipart/form-data" class="pdf-inline-form" data-inline-pdf-form data-has-fulltext="{{ 'true' if paper.fulltext_id else 'false' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}#{{ paper_anchor }}"><input type="hidden" name="identity" value="{{ paper.identity }}"><input type="file" name="pdf" accept="application/pdf,.pdf" required hidden data-inline-pdf-file><button type="button" class="button secondary" data-inline-pdf-trigger>导入全文 PDF</button><span class="pdf-file-name" data-inline-pdf-name hidden></span><button type="submit" class="button" data-inline-pdf-submit hidden>确认上传</button></form>{% if paper.fulltext_id %}<a class="button secondary" href="/fulltext/file?identity={{ paper.identity|urlencode }}" target="_blank" rel="noopener">查看 PDF</a>{% endif %}</div>{% endif %}
+      {% if show_pdf %}<div class="paper-actions">{% if site_mode != 'cloud' %}<form method="post" action="/fulltext" enctype="multipart/form-data" class="pdf-inline-form" data-inline-pdf-form data-has-fulltext="{{ 'true' if paper.fulltext_id else 'false' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}#{{ paper_anchor }}"><input type="hidden" name="identity" value="{{ paper.identity }}"><input type="file" name="pdf" accept="application/pdf,.pdf" required hidden data-inline-pdf-file><button type="button" class="button secondary" data-inline-pdf-trigger>导入全文 PDF</button><span class="pdf-file-name" data-inline-pdf-name hidden></span><button type="submit" class="button" data-inline-pdf-submit hidden>确认上传</button></form>{% endif %}{% if paper.fulltext_id %}<a class="button secondary" href="/fulltext/file?identity={{ paper.identity|urlencode }}" target="_blank" rel="noopener">查看 PDF</a>{% endif %}</div>{% endif %}
       <section class="feedback-panel" aria-label="标记与反馈">
       <div class="feedback-heading"><strong>标记与反馈</strong></div>
       <form method="post" action="/feedback" class="feedback-form" data-feedback-form>

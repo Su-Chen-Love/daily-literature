@@ -80,3 +80,11 @@ try{const response=await worker.fetch(new Request(origin+'/'),env),html=await re
 console.log('Offline cross-midnight Today freshness and yesterday date passed.');
 
 await import('./test-profile-ui.mjs');
+
+const browserError=await worker.fetch(new Request(origin+'/missing-page',{headers:{Accept:'text/html'}}),env);
+assert.equal(browserError.status,404);assert.ok(browserError.headers.get('Content-Type').includes('text/html'));
+assert.equal(browserError.headers.get('Referrer-Policy'),'same-origin');
+assert.ok((await browserError.text()).includes('返回首页'));
+const apiError=await worker.fetch(new Request(origin+'/api/missing',{headers:{Accept:'text/html'}}),env);
+assert.ok(apiError.headers.get('Content-Type').includes('application/json'));
+console.log('Recoverable browser errors retain navigation; API errors retain JSON and native forms retain same-origin metadata.');

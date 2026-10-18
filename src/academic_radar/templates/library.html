@@ -2,7 +2,7 @@
 {% from "_paper_card.html" import paper_card with context %}
 {% block title %}我的文献 · 每日文献{% endblock %}
 {% block content %}
-<header class="page-head"><div><p class="kicker">LIBRARY · {{ total }} RECOMMENDED</p><h1>你的文献库</h1><p>默认显示全部兴趣与阅读状态的论文；可通过筛选缩小范围。未达到 70 分的论文仍保留在数据库中，只是不默认展示。需要全文时，可在本地对应论文卡片中导入 PDF。</p></div></header>
+<header class="page-head"><div><p class="kicker">LIBRARY · {{ total }} RECOMMENDED</p><h1>你的文献库</h1><p>默认显示全部兴趣与阅读状态的论文；可通过筛选缩小范围。未达到推荐标准的论文保留在数据库中。需要全文时，可在本地对应论文卡片中导入 PDF。</p></div></header>
 <form class="filter-bar" method="get">
   <label class="search"><span aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m21 21-4.35-4.35m1.35-5.15A6.5 6.5 0 1 1 5 11.5a6.5 6.5 0 0 1 13 0Z"/></svg></span><input name="q" value="{{ q }}" placeholder="搜索标题、摘要或期刊" aria-label="搜索文献"></label>
   <label><span class="sr-only">兴趣判断</span><select name="interest"><option value="" {{ 'selected' if not interest }}>全部兴趣</option><option value="interested" {{ 'selected' if interest == 'interested' }}>感兴趣</option><option value="not_interested" {{ 'selected' if interest == 'not_interested' }}>不感兴趣</option></select></label>
@@ -10,7 +10,7 @@
   <label><span class="sr-only">收藏筛选</span><select name="favorite"><option value="">全部论文</option><option value="yes" {{ 'selected' if favorite == 'yes' }}>只看收藏</option></select></label>
   <label><span class="sr-only">排序方式</span><select name="sort"><option value="score_desc" {{ 'selected' if sort == 'score_desc' }}>匹配度：高到低</option><option value="score_asc" {{ 'selected' if sort == 'score_asc' }}>匹配度：低到高</option><option value="date_desc" {{ 'selected' if sort == 'date_desc' }}>发布日期：最新</option><option value="date_asc" {{ 'selected' if sort == 'date_asc' }}>发布日期：最早</option><option value="title_asc" {{ 'selected' if sort == 'title_asc' }}>标题：A–Z</option></select></label>
   <button>应用</button>
-  <button type="button" class="secondary" data-open-manual-paper>添加文献</button>
+  {% if site_mode != 'cloud' %}<button type="button" class="secondary" data-open-manual-paper>添加文献</button>{% endif %}
 </form>
 <div class="paper-list compact">
   {% for paper in papers %}{{ paper_card(paper, request.url.path ~ ('?' ~ request.url.query if request.url.query else ''), true) }}

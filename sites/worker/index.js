@@ -1,5 +1,5 @@
 import {render,staticAsset} from './render.js';
-const h={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer','X-Frame-Options':'DENY'};
+const h={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin','X-Frame-Options':'DENY'};
 const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{...h,'Content-Type':'application/json; charset=utf-8'}});
 const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
 const hash=async text=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)))).map(n=>n.toString(16).padStart(2,'0')).join('');
@@ -148,4 +148,12 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
  if(!['/','/library','/sources','/profile','/feedback','/status'].includes(u.pathname))fail('页面不存在',404);
  const name=u.pathname==='/'?'today':u.pathname.slice(1);
  return new Response(render(name,await pageContext(r,e,u,name)),{headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
- }catch(error){if(!error.status)console.error('radar storage error',error.name);return json({error:error.status?error.message:'数据暂时无法读取或保存，请稍后重试'},error.status||503);}}};
+ }catch(error){
+  if(!error.status)console.error('radar storage error',error.name);
+  const status=error.status||503,message=error.status?error.message:'数据暂时无法读取或保存，请稍后重试';
+  const url=new URL(r.url);
+  if(r.method==='GET'&&(r.headers.get('Accept')||'').includes('text/html')&&!url.pathname.startsWith('/api/')&&!url.pathname.startsWith('/static/')&&url.pathname!=='/fulltext/file'&&status!==403){
+    return new Response(render('error',{page:'error',site_mode:'cloud',cloud_sync_status:{},title:status===404?'页面未找到':'这次操作没有完成',message,action:'检查输入后重试，或从导航继续。'}),{status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+  }
+  return json({error:message},status);
+ }}};
