@@ -116,18 +116,21 @@ def apply_remote_profiles(db, events: list[dict], cursor: int, config: dict) -> 
                 raise ValueError("Cloud profile conflicts with a newer local profile; no changes applied")
             if screening_preferences(db, config) != event["base_preferences"]:
                 raise ValueError("Cloud preferences conflict with newer local preferences; no changes applied")
-            if not db.execute("SELECT 1 FROM meta WHERE key='cloud_profile_file_pending'").fetchone():
-                db.execute("INSERT INTO meta(key,value) VALUES('cloud_profile_file_base',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                           (hashlib.sha256(content.encode()).hexdigest(),))
-            db.execute("UPDATE profile_versions SET status='superseded' WHERE status='active'")
-            db.execute("""INSERT INTO profile_versions(profile_hash,content,status,source,change_summary,created_at,confirmed_at)
-                VALUES(?,?,'active','cloud-owner',?,?,?) ON CONFLICT(profile_hash) DO UPDATE SET
-                status='active',confirmed_at=excluded.confirmed_at""",
-                (event["profile_hash"], event["content"], event["summary"], event["updated_at"], event["updated_at"]))
+            content_changed = event["profile_hash"] != event["base_profile_hash"]
+            if content_changed:
+                if not db.execute("SELECT 1 FROM meta WHERE key='cloud_profile_file_pending'").fetchone():
+                    db.execute("INSERT INTO meta(key,value) VALUES('cloud_profile_file_base',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                               (hashlib.sha256(content.encode()).hexdigest(),))
+                db.execute("UPDATE profile_versions SET status='superseded' WHERE status='active'")
+                db.execute("""INSERT INTO profile_versions(profile_hash,content,status,source,change_summary,created_at,confirmed_at)
+                    VALUES(?,?,'active','cloud-owner',?,?,?) ON CONFLICT(profile_hash) DO UPDATE SET
+                    status='active',confirmed_at=excluded.confirmed_at""",
+                    (event["profile_hash"], event["content"], event["summary"], event["updated_at"], event["updated_at"]))
             db.execute("INSERT INTO applied_cloud_profile_events(seq,event_json,applied_at) VALUES(?,?,?)", (sequence, serialized, utc_now()))
             values = {"cloud_profile_cursor": str(sequence),
-                      "cloud_screening_preferences": _canonical(event["screening_preferences"]),
-                      "cloud_profile_file_pending": event["profile_hash"]}
+                      "cloud_screening_preferences": _canonical(event["screening_preferences"])}
+            if content_changed:
+                values["cloud_profile_file_pending"] = event["profile_hash"]
             db.executemany("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items())
             previous = sequence
             changed += 1

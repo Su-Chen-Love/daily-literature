@@ -46,6 +46,21 @@ class ProfileSyncTests(unittest.TestCase):
     def active(self):
         return dict(self.db.execute("SELECT * FROM profile_versions WHERE status='active'").fetchone())
 
+    def test_same_content_event_keeps_confirmation_boundary_and_file_untouched(self):
+        original = self.active()
+        original_bytes = self.profile.read_bytes()
+        original_mtime = self.profile.stat().st_mtime_ns
+        event = self.event(content=original['content'], profile_hash=original['profile_hash'],
+                           screening_preferences={'relevance_threshold': .7, 'instructions': ''})
+        self.assertEqual(apply_remote_profiles(self.db, [event], 1, self.config), 1)
+        self.assertEqual(self.active()['confirmed_at'], original['confirmed_at'])
+        self.assertEqual(self.active()['id'], original['id'])
+        self.assertFalse(reconcile_profile_file(self.path, self.profile))
+        self.assertEqual(self.profile.read_bytes(), original_bytes)
+        self.assertEqual(self.profile.stat().st_mtime_ns, original_mtime)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM profile_versions').fetchone()[0], 1)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM applied_cloud_profile_events').fetchone()[0], 1)
+
     def test_atomic_import_and_idempotent_file_reconciliation(self):
         event = self.event(content='New interests\r\nExact bytes preserved')
         self.assertEqual(apply_remote_profiles(self.db, [event], 1, self.config), 1)
