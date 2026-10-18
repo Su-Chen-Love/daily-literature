@@ -83,7 +83,7 @@ class WebTests(unittest.TestCase):
                     self.assertIn('rel="icon" type="image/svg+xml"', response.text)
                     self.assertIn('/images/daily-literature-logo.svg?v=brand01', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=center-20261018", response.text)
+                        self.assertIn("app.js?v=avatars-20261018", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 5)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
@@ -169,7 +169,7 @@ class WebTests(unittest.TestCase):
                     self.assertIn("Direct match", page.text)
                 status = client.get("/api/center/status").json()["html"]
             self.assertNotIn("待按新量表重新判断", status)
-            self.assertIn("仅导出从未由 Codex 判断过的新文献", status)
+            self.assertIn("数据库状态", status)
 
     def test_sources_show_completed_official_issue_count(self):
         with tempfile.TemporaryDirectory() as td:
@@ -416,7 +416,7 @@ class WebTests(unittest.TestCase):
                 after = client.get("/library")
                 all_reading = client.get("/library?reading=")
             self.assertIn('value="" selected>全部兴趣', before.text)
-            self.assertIn('value="" selected>全部阅读状态', before.text)
+            self.assertNotIn('name="reading"', before.text)
             self.assertIn("A useful paper", before.text)
             self.assertIn("A useful paper", after.text)
             self.assertIn("A useful paper", all_reading.text)
@@ -756,15 +756,15 @@ class WebTests(unittest.TestCase):
             self.assertEqual(response.status_code,500)
             self.assertEqual(config.read_text(),original)
 
-    def test_status_page_has_actionable_buttons_and_no_provider_api(self):
+    def test_center_shows_database_state_without_removed_action_modules(self):
         with tempfile.TemporaryDirectory() as td:
             app, _, _=self.make_app(Path(td))
             with TestClient(app) as client: response=client.get("/api/center/status")
             response_text=response.json()["html"]
-            for label in ("更新数据库", "当前：", "由 Codex 完整执行", "需要处理", "推荐精确率"):
+            for label in ("数据库状态", "本机完整性", "本机结构版本", "推荐文献", "摘要覆盖"):
                 self.assertIn(label,response_text)
-            for label in ("agent-export", "agent-import"):
-                self.assertIn(label,response_text)
+            for label in ("更新数据库", "下一步操作", "需要处理", "data-copy-update"):
+                self.assertNotIn(label,response_text)
             self.assertNotIn("recent-tasks-panel", response_text)
             self.assertNotIn("网页运行方式", response_text)
             self.assertNotIn("交给 Codex 判断相关性", response_text)

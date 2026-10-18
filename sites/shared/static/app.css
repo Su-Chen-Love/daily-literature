@@ -361,10 +361,6 @@ main { min-width: 0; max-width: 1600px; margin-left: var(--sidebar-width); paddi
 .simple-list div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: var(--space-3); }
 .simple-list dt { color: var(--muted); font-size: var(--text-sm); }
 .simple-list dd { margin: 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
-.action-center { margin-bottom: var(--space-5); }
-.action-guide { margin: 0 0 var(--space-4); color: var(--ink); font-size: var(--text-body); }
-.action-grid { display: flex; flex-wrap: wrap; gap: var(--space-2); }
-.action-hint { max-width: 780px; margin: var(--space-3) 0 0; color: var(--muted); font-size: var(--text-sm); }
 .task-progress { margin-top: var(--space-4); padding: var(--space-4); border-radius: var(--radius-sm); background: var(--panel-soft); }
 .task-progress progress, .recent-tasks progress { width: 100%; accent-color: var(--teal); }
 .check-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
@@ -489,10 +485,6 @@ td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: t
 .personal-trigger small { color:var(--muted);font-size:11px;margin-top:2px; }
 .personal-avatar { width:32px;height:32px;border-radius:50%;background:var(--teal-soft);color:var(--teal);display:inline-grid;place-items:center;flex:0 0 auto;overflow:hidden; }
 .personal-avatar img { width:100%;height:100%;object-fit:cover; }
-.cloud-state { background:transparent;color:var(--muted);padding:6px;min-width:28px; }
-.cloud-state[data-sync-state="succeeded"] { color:var(--teal); }
-.cloud-state[data-sync-state="failed"] { color:var(--red); }
-.cloud-state[data-sync-state="pending"],.cloud-state[data-sync-state="running"] { color:var(--amber); }
 .personal-center { width:min(980px,calc(100vw - 64px));max-width:980px;max-height:calc(100vh - 64px);padding:0;overflow:hidden; }
 .center-header { display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--line); }
 .center-header h2 { margin:0;font-size:20px; }
@@ -523,8 +515,31 @@ td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: t
 
 .nav-icon { fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round; }
 
-[data-copy-target]:not([hidden]) { display:block;width:100%;min-height:160px;margin-top:16px; }
 
 #center-appearance { display:grid;gap:20px; }
 .personal-center .preference-option { padding:12px; }
 .personal-center .theme-preview { height:26px; }
+
+.avatar-picker { margin:0;padding:18px;border:1px solid var(--line);border-radius:14px;background:var(--panel-soft); }
+.avatar-picker[hidden] { display:none; }
+.avatar-picker legend { font-weight:600;padding:0 6px; }
+.avatar-grid { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:16px 0; }
+.personal-form .avatar-option { position:relative;display:grid;justify-items:center;gap:8px;border:1px solid var(--line);border-radius:12px;padding:12px 6px;cursor:pointer;background:var(--panel);font-size:12px; }
+.avatar-option img { width:64px;height:64px;border-radius:50%;object-fit:cover; }
+.avatar-option input { position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer;margin:0; }
+.avatar-option:has(input:checked) { border-color:var(--teal);box-shadow:0 0 0 2px var(--teal-soft);background:var(--teal-soft); }
+.avatar-option:has(input:focus-visible) { outline:2px solid var(--focus);outline-offset:3px; }
+.avatar-picker-actions { display:flex;gap:10px;align-items:center;flex-wrap:wrap; }
+.personal-form .avatar-picker-actions label { display:inline-flex; }
+
+.database-heading { margin-top:24px !important; }
+
+@font-face { font-family:"Daily Ma Shan Zheng";src:url("/static/fonts/MaShanZheng-Regular.woff2") format("woff2");font-style:normal;font-weight:400;font-display:swap; }
+@font-face { font-family:"Daily ZCOOL KuaiLe";src:url("/static/fonts/ZCOOLKuaiLe-Regular.woff2") format("woff2");font-style:normal;font-weight:400;font-display:swap; }
+:root { --font-humanist:"Daily Ma Shan Zheng",serif;--font-playful:"Daily ZCOOL KuaiLe",sans-serif; }
+:root[data-font="mono"] { --font-ui:var(--font-playful); }
+[data-font-preview="mono"] { font-family:var(--font-playful); }
+:root[data-font="humanist"] body,:root[data-font="mono"] body { line-height:1.75; }
+
+.personal-avatar img.avatar-preset-image { padding:8%;object-fit:contain;background:var(--panel-soft); }
+.avatar-option img { padding:4px;object-fit:contain;background:var(--panel-soft); }

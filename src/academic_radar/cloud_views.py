@@ -262,24 +262,9 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     check("abstract_coverage", quality["abstract_percent"] >= 70 or quality["visible"] == 0,
           f"{quality['abstract_percent']}%（{quality['abstracts']}/{quality['visible']}）", action="补全可追溯的原始摘要")
     needed = sorted((item for item in checks if not item["ok"]), key=lambda item: ({"error": 0, "warning": 1}.get(item["level"], 2), item["name"]))
-    situations = []
-    if quality["missing_abstracts"]:
-        situations.append(f"正式文献库仍缺 {quality['missing_abstracts']} 篇摘要")
-    situations.append("部分监测来源尚未成功更新" if any(not item["ok"] and item["name"].startswith(("source_", "official_issue_")) for item in checks) else "所有已配置来源都有运行记录")
-    situations.append(f"有 {pending} 篇新文献待首次判断" if pending else "现有可筛选论文均已完成相关性判断")
-    summary = "当前：" + "；".join(situations) + "。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
-    # A portable task is actionable from either page without publishing machine paths.
-    prompt = "\n\n".join([
-        "请更新每日文献。使用本项目已配置的本地数据库和已确认研究兴趣，不使用独立模型 API。",
-        "当前诊断：" + "；".join(situations) + "。",
-        "先同步并合并云端反馈；采集所有已配置来源最近14天数据，核验已出版的最新两期，补全可追溯的原始摘要。官网或接口失败时保留已有数据并说明真实限制。",
-        "结合完整研究兴趣与累计反馈检查画像是否需要建议；只有本人确认才能启用新画像。仅导出从未由 Codex 判断过的新文献，逐篇按当前标准判断并原子导入，每篇恰好一条结果。已有判断不因画像、反馈、摘要或量表更新自动重评；没有新文献时导入完整的空队列。",
-        "推荐理由先讲清研究问题和动机，再说明作者做了什么，最后说明有证据支持的核心成果或价值。区分论文结果与拟议迁移，证据缺失必须明确，不推测未提供的结果。",
-        "完成后运行安装与数据检查；有内容变化时同步云端，报告新增论文、补全摘要、推荐结果、来源失败及剩余待处理项。",
-    ])
     return {"db_state": db_state, "quality": quality, "recommendation_quality": metrics,
             "checks": needed, "all_checks": checks, "healthy_count": len(checks) - len(needed),
-            "pending_screening": pending, "update_summary": summary, "update_prompt": prompt,
+            "pending_screening": pending,
             "local_checked_at": (_row(db, "SELECT value FROM meta WHERE key='last_local_check'") or {}).get("value"),
             **_run_records(db)}
 

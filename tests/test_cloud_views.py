@@ -150,8 +150,8 @@ class SharedCloudViewTests(unittest.TestCase):
         coverage = next(item for item in status["all_checks"] if item["name"] == "semantic_coverage")
         self.assertTrue(coverage["ok"])
         self.assertEqual(status["pending_screening"], 0)
-        self.assertNotIn("待按新量表重新判断", status["update_summary"])
-        self.assertIn("仅导出从未由 Codex 判断过的新文献", status["update_prompt"])
+        self.assertNotIn("update_prompt", status)
+        self.assertNotIn("update_summary", status)
 
 
 if __name__ == "__main__":

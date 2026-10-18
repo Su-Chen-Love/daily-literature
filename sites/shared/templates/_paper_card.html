@@ -1,6 +1,6 @@
 {% macro paper_card(paper, return_to, show_pdf=false, anchor_prefix='') %}
 {% set paper_anchor = anchor_prefix ~ 'paper-' ~ paper.identity|replace(':','-')|replace('/','-')|replace('.','-') %}
-<article class="paper-card" id="{{ paper_anchor }}" data-interest="{{ paper.interest or '' }}" data-paper-identity="{{ paper.identity }}" data-reading-status="{{ paper.reading_status or 'unread' }}" data-feedback-reason="{{ paper.feedback_reason or '' }}">
+<article class="paper-card" id="{{ paper_anchor }}" data-interest="{{ paper.interest or '' }}" data-paper-identity="{{ paper.identity }}" data-feedback-reason="{{ paper.feedback_reason or '' }}">
   <div class="paper-score">
     {% if paper.score is not none %}<strong>{{ (paper.score * 100 + 0.5)|int }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
   </div>
@@ -12,7 +12,6 @@
       {% if paper.eligibility_status != 'eligible' %}<span class="tag">当前收录：{{ paper.eligibility_status|status_label }}</span>{% endif %}
       {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
       {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
-      {% if paper.confidence is not none %}<span class="tag">判断置信度 {{ (paper.confidence * 100 + 0.5)|int }}%</span>{% endif %}
       {% if paper.themes_json and paper.themes_json != '[]' %}<span class="tag">{{ paper.themes_json|list_label }}</span>{% endif %}
       <span class="completion-status {{ paper.interest or 'neutral' }}" data-feedback-status {{ 'hidden' if not paper.interest }}>
         {% if paper.interest == 'interested' %}已完成 · 感兴趣{% elif paper.interest == 'not_interested' %}已完成 · 不感兴趣{% endif %}
@@ -55,13 +54,6 @@
         </label>
         <label class="grow">理由（选填）
           <input name="reason" value="{{ paper.feedback_reason or '' }}" placeholder="它为什么适合，或为什么偏离我的研究？">
-        </label>
-        <label>阅读状态
-          <select name="reading_status">
-            <option value="unread" {{ 'selected' if paper.reading_status == 'unread' }}>未读</option>
-            <option value="read_later" {{ 'selected' if paper.reading_status == 'read_later' }}>稍后阅读</option>
-            <option value="read" {{ 'selected' if paper.reading_status == 'read' }}>已读</option>
-          </select>
         </label>
         <label class="check"><input type="checkbox" name="favorite" {{ 'checked' if paper.favorite }}> 收藏</label>
         <button type="submit">保存反馈</button>

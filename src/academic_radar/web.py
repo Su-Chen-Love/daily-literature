@@ -10,7 +10,6 @@ import os
 import re
 import secrets
 import sqlite3
-import sys
 import urllib.parse
 import urllib.request
 import tempfile
@@ -61,16 +60,7 @@ from .storage import connect, database_status, upgrade_database, utc_now
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 
-def monitor_runner_path(state: Path) -> Path:
-    candidates = [
-        PACKAGE_DIR.parents[1] / "scripts" / "paper_monitor.py",
-        Path(sys.prefix) / "share" / "personal-academic-radar" / "paper_monitor.py",
-        state / "run" / "paper_monitor.py",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError("采集运行器未安装；请重新运行 academic-radar setup")
+
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -734,7 +724,7 @@ def create_app(config_path: Path) -> FastAPI:
         data=await form_data(request); validate_csrf(data)
         interest=data.get("interest") or None
         set_feedback(db_path,data["identity"],interest,data.get("reason",""),data.get("favorite")=="on",
-                     data.get("reading_status","unread"))
+                     data.get("reading_status"))
         queue_cloud_sync()
         return RedirectResponse(safe_return(data.get("return_to"),"/library"),303)
 
@@ -748,7 +738,7 @@ def create_app(config_path: Path) -> FastAPI:
             interest,
             str(data.get("reason", "")),
             bool(data.get("favorite")),
-            str(data.get("reading_status", "unread")),
+            data.get("reading_status"),
         )
         labels={"interested":"已完成 · 感兴趣", "not_interested":"已完成 · 不感兴趣"}
         queue_cloud_sync()
@@ -859,62 +849,7 @@ def create_app(config_path: Path) -> FastAPI:
         try:
             db_state=database_status(db_path)
             verification=verify_installation(config_path)
-            check_order={"error":0,"warning":1}
-            all_checks=sorted(
-                (check for check in verification["checks"] if check["name"] != "schema_version"),
-                key=lambda check: (check["ok"], check_order.get(check["level"], 2), check["name"]),
-            )
-            source_checks=[check for check in all_checks if check["name"] in {
-                "source_coverage","source_runs","source_degradation",
-                "official_issue_coverage","official_issue_failures",
-            }]
-            checks=[check for check in all_checks if not check["ok"]]
-            missing_abstracts=int(verification["governance"]["missing_abstracts"])
-            pending_count=screening_coverage(db)["pending"]
-            situations=[]
-            if missing_abstracts:
-                situations.append(f"正式文献库仍缺 {missing_abstracts} 篇摘要")
-            if any(not check["ok"] for check in source_checks):
-                situations.append("部分监测来源尚未成功更新")
-            else:
-                situations.append("所有已配置来源都有运行记录")
-            if pending_count:
-                situations.append(f"有 {pending_count} 篇新文献待首次判断")
-            else:
-                situations.append("现有可筛选论文均已完成相关性判断")
-            update_summary="当前："+"；".join(situations)+"。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
-            prompt_steps=[
-                "请更新“每日文献”的本地数据库，并在完成后报告结果。不要使用独立模型 API。",
-                "1. 阅读此项目的 SKILL.md 与 references/profile-guidance.md，遵守完整队列、原子导入和私有数据边界。",
-                f"2. 阅读研究兴趣：{state / str(config.get('profile_file', 'research-profile.md'))}。",
-                "3. 当前诊断："+"；".join(situations)+"。",
-            ]
-            if missing_abstracts:
-                prompt_steps.append(
-                    f"4. 先运行：academic-radar abstracts enrich --config {config_path} --retry。只保存可追溯的原始摘要，不生成或改写摘要。"
-                )
-            else:
-                prompt_steps.append("4. 当前没有已识别的缺失摘要；跳过摘要补全，继续更新来源。")
-            prompt_steps.extend([
-                f"5. 运行：python3 {monitor_runner_path(state)} collect-only --config {config_path}。记录返回的 run_id；这一步只执行所有来源的 14 天 API 采集。",
-                f"6. 运行：academic-radar official plan --config {config_path} --output {state / 'official' / 'plan-latest.json'}。按计划逐个打开出版商官网，只核验截至计划日期已经出版的最近两期；未来卷期不能占用两期名额。逐篇复制官网明确标注的完整原始摘要，按 DOI 去重，再用 official import 先预览、后 --apply 原子导入。已成功核验的相同卷期可以跳过；官网无法访问或尚无适配时保留 14 天 API 结果并报告来源。",
-                f"7. 再运行摘要补全，并执行 academic-radar profile review --db {db_path}。只有发现未审阅的新反馈时才提出完整画像建议并保存；没有必要修改时用 profile no-change 记录结论，不能静默改动已激活画像。",
-                f"8. 运行：python3 {monitor_runner_path(state)} agent-export --config {config_path} --no-collect --batch-run <第 5 步 run_id>。仅导出从未由 Codex 判断过的新文献；已有判断不因画像、反馈、摘要或量表更新自动重评，不使用 --rescreen。",
-                f"9. 阅读 {state / 'agent_queue'} 中最新的 JSON 队列。逐篇按已激活研究兴趣和反馈判断；每篇必须恰好有一条结果。",
-                "10. 将严格 results JSON 保存到 agent-results 目录，保留队列的 run_id、profile_hash、source_failures。"
-                "按 evaluation_policy 为每篇提供 identity、reasoning（论文证据、画像关联、可迁移价值、局限）、"
-                "score_dimensions、matched_themes、confidence 和自然中文 recommendation_reason；后者必须综合独特证据、"
-                "精确画像机制、具体可迁移内容与决定性局限，不能机械拼接字段标签或复述题名。最终分数由导入程序计算。"
-                "即使队列为空，也写入覆盖完整队列的空 results 数组。",
-                f"11. 运行：python3 {monitor_runner_path(state)} agent-import --config {config_path} --results <结果 JSON 路径>。",
-                f"12. 最后运行：academic-radar verify --config {config_path}，报告 API 采集数、官网卷期与论文数、补全摘要数、判断数、达到 70 分的入选论文、来源失败和仍需处理的项目。",
-            ])
-            values = context(request,"status",
-                db_state=db_state,quality=verification["governance"],
-                recommendation_quality=recommendation_feedback_metrics(
-                    db_path,float(config.get("relevance_threshold",0.70))
-                ),checks=checks,healthy_count=len(all_checks)-len(checks),
-                update_summary=update_summary,update_prompt="\n\n".join(prompt_steps))
+            values = context(request,"status",db_state=db_state,quality=verification["governance"])
             latest_import = db.execute("SELECT MAX(imported_at) FROM agent_jobs WHERE status='imported'").fetchone()[0]
             checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
             with db:

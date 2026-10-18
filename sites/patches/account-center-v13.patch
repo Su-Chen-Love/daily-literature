@@ -1,0 +1,105 @@
+diff --git a/scripts/test-account-settings.mjs b/scripts/test-account-settings.mjs
+new file mode 100644
+index 0000000..0b707fb
+--- /dev/null
++++ b/scripts/test-account-settings.mjs
+@@ -0,0 +1,37 @@
++import assert from 'node:assert/strict';
++import {database} from './d1-local.mjs';
++import {readAccountSettings,saveAccountSettings} from '../worker/account-settings.js';
++const DB=database(),env={DB,OWNER_EMAIL:'owner@example.test'},url=new URL('https://settings.example.test');
++const request=(email=env.OWNER_EMAIL,origin=url.origin)=>new Request(url,{headers:{'oai-authenticated-user-email':email,Origin:origin}});
++const read=()=>readAccountSettings(request(),env);
++const save=(version,patch)=>saveAccountSettings(request(),env,url,{base_version:version,patch});
++assert.equal((await read()).version,0);
++await assert.rejects(()=>readAccountSettings(request('other@example.test'),env),e=>e.status===403);
++await assert.rejects(()=>saveAccountSettings(request(env.OWNER_EMAIL,'https://evil.test'),env,url,{base_version:0,patch:{personal:{name:'Bad'}}}),e=>e.status===403);
++let state=await save(0,{personal:{name:'研究者',avatar:'preset:03'},appearance:{font:'humanist',theme:'mist'}});
++assert.equal(state.version,1);assert.equal(state.personal.avatar,'preset:03');assert.equal((await read()).appearance.theme,'mist');
++await assert.rejects(()=>save(0,{personal:{name:'stale'}}),e=>e.status===409);
++state=await save(1,{personal:{tagline:'跨设备资料'}});assert.equal(state.personal.name,'研究者');assert.equal(state.appearance.theme,'mist');
++const race=await Promise.allSettled([save(2,{personal:{name:'设备A'}}),save(2,{appearance:{font:'mono'}})]);assert.equal(race.filter(x=>x.status==='fulfilled').length,1);assert.equal((await read()).version,3);
++await assert.rejects(()=>save(3,{personal:{avatar:'https://evil.test/a.png'}}),e=>e.status===400);
++await assert.rejects(()=>save(3,{personal:{avatar:'data:image/png;base64,SGVsbG8='}}),e=>e.status===400);
++await assert.rejects(()=>save(3,{appearance:{font:'arbitrary'}}),e=>e.status===400);
++await assert.rejects(()=>save(3,{personal:{avatar:'preset:09'}}),e=>e.status===400);
++assert.equal((await read()).version,3);
++console.log('Account settings: owner isolation, CSRF, persistence, sparse field patches, CAS races, invalid avatars and stale-write refusal passed.');
++const {default:worker}=await import('../worker/index.js');
++const http=await worker.fetch(new Request(new URL('/api/account/settings',url),{headers:{'oai-authenticated-user-email':env.OWNER_EMAIL}}),env);
++assert.equal(http.status,200);assert.equal((await http.json()).version,3);
++const denied=await worker.fetch(new Request(new URL('/api/account/settings',url),{headers:{'oai-authenticated-user-email':'stranger@example.test'}}),env);assert.equal(denied.status,403);
++const csrf=await worker.fetch(new Request(new URL('/api/account/settings',url),{method:'POST',headers:{'oai-authenticated-user-email':env.OWNER_EMAIL,Origin:'https://other.test','Content-Type':'application/json'},body:JSON.stringify({base_version:3,patch:{personal:{name:'CSRF'}}})}),env);assert.equal(csrf.status,403);
++console.log('Account settings HTTP transport enforces owner identity and same-origin POST.');
++const {readFile}=await import('node:fs/promises');
++for(let n=1;n<=8;n++){
++ const path=`images/avatars/avatar-${String(n).padStart(2,'0')}.webp`;
++ const image=await worker.fetch(new Request(new URL('/static/'+path,url)),env);
++ assert.equal(image.status,200);assert.equal(image.headers.get('Content-Type'),'image/webp');assert.deepEqual(Buffer.from(await image.arrayBuffer()),await readFile('shared/static/'+path));
++}
++for(const name of ['MaShanZheng','ZCOOLKuaiLe']){
++ const response=await worker.fetch(new Request(new URL('/static/fonts/'+name+'-OFL.txt',url)),env);assert.equal(response.status,200);assert.ok((await response.text()).includes('SIL Open Font License'));
++}
++console.log('All eight WebP assets serve exact verified bytes; both font licenses accompany the served fonts.');
+diff --git a/worker/account-settings.js b/worker/account-settings.js
+new file mode 100644
+index 0000000..f78ab0e
+--- /dev/null
++++ b/worker/account-settings.js
+@@ -0,0 +1,30 @@
++import {isOwner} from './profile.js';
++const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
++
++async function accountKey(request,env){
++ if(!isOwner(request,env))fail('请使用站点所有者账号登录',403);
++ const identity=env.OWNER_USER_ID?.trim()||env.OWNER_EMAIL?.trim().toLowerCase();
++ const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(identity));
++ return 'account_settings:'+Array.from(new Uint8Array(hash)).map(x=>x.toString(16).padStart(2,'0')).join('');
++}
++export async function readAccountSettings(request,env){const key=await accountKey(request,env);const row=await env.DB.prepare('SELECT value FROM pointers WHERE key=?').bind(key).first();return row?JSON.parse(row.value):{version:0,personal:null,appearance:null,updated_at:null};}
++function validatePatch(patch){
++ if(!patch||typeof patch!=='object'||Array.isArray(patch)||!Object.keys(patch).length||Object.keys(patch).some(k=>!['personal','appearance'].includes(k)))fail('设置格式无效');
++ const out={};
++ if('personal'in patch){const p=patch.personal;if(!p||typeof p!=='object'||Object.keys(p).some(k=>!['name','tagline','avatar'].includes(k))||('name'in p&&(typeof p.name!=='string'||p.name.length>40))||('tagline'in p&&(typeof p.tagline!=='string'||p.tagline.length>80))||('avatar'in p&&(typeof p.avatar!=='string'||p.avatar.length>160000))||/[\u0000-\u001f]/.test(p.name+p.tagline))fail('个人资料格式无效');
++  if(p.avatar&&!/^preset:0[1-8]$/.test(p.avatar)&&!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(p.avatar))fail('头像格式无效');
++  if(p.avatar?.startsWith('data:')){const encoded=p.avatar.split(',')[1];let bytes;try{bytes=Uint8Array.from(atob(encoded),c=>c.charCodeAt(0));}catch{fail('头像格式无效');}const png=bytes[0]===137&&bytes[1]===80&&bytes[2]===78&&bytes[3]===71,jpeg=bytes[0]===255&&bytes[1]===216,webp=String.fromCharCode(...bytes.slice(0,4))==='RIFF'&&String.fromCharCode(...bytes.slice(8,12))==='WEBP';if(!(p.avatar.startsWith('data:image/png;')&&png||p.avatar.startsWith('data:image/jpeg;')&&jpeg||p.avatar.startsWith('data:image/webp;')&&webp))fail('头像内容与格式不符');}
++  out.personal={};if('name'in p)out.personal.name=p.name.trim();if('tagline'in p)out.personal.tagline=p.tagline.trim();if('avatar'in p)out.personal.avatar=p.avatar;}
++ if('appearance'in patch){const p=patch.appearance;if(!p||Object.keys(p).some(k=>!['font','theme'].includes(k))||('font'in p&&!['system','serif','humanist','mono'].includes(p.font))||('theme'in p&&!['sage','paper','sand','mist'].includes(p.theme)))fail('显示设置格式无效');out.appearance={};if('font'in p)out.appearance.font=p.font;if('theme'in p)out.appearance.theme=p.theme;}
++ return out;
++}
++export async function saveAccountSettings(request,env,url,data){
++ const key=await accountKey(request,env);if(request.headers.get('Origin')!==url.origin)fail('请求来源无效',403);
++ if(!data||!Number.isSafeInteger(data.base_version)||data.base_version<0||data.base_version>=Number.MAX_SAFE_INTEGER)fail('设置版本无效');
++ const patch=validatePatch(data.patch),current=await readAccountSettings(request,env);
++ if(current.version!==data.base_version)fail('其他设备已更新设置，请重新打开个人中心核对后再保存。',409);
++ const next={...current,...('personal'in patch?{personal:{name:'',tagline:'',avatar:'',...current.personal,...patch.personal}}:{}),...('appearance'in patch?{appearance:{font:'system',theme:'sage',...current.appearance,...patch.appearance}}:{}),version:current.version+1,updated_at:new Date().toISOString()};
++ const result=await env.DB.prepare(`INSERT INTO pointers(key,value) SELECT ?,? WHERE ?=0 OR EXISTS(SELECT 1 FROM pointers WHERE key=? AND json_extract(value,'$.version')=?) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE json_extract(pointers.value,'$.version')=?`).bind(key,JSON.stringify(next),data.base_version,key,data.base_version,data.base_version).run();
++ if(!result.meta?.changes)fail('其他设备已更新设置，请重新打开个人中心核对后再保存。',409);
++ return next;
++}
+diff --git a/worker/index.js b/worker/index.js
+index be11e3e..138730d 100644
+--- a/worker/index.js
++++ b/worker/index.js
+@@ -1,3 +1,4 @@
++import {readAccountSettings,saveAccountSettings} from './account-settings.js';
+ import {render,staticAsset} from './render.js';
+ import {handleCloudState,streamCheckpointFile,readLibraryHead,commitLibraryHead} from './cloud-state.js';
+ import {handleMcp} from './mcp.js';
+@@ -210,6 +211,7 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
+  if(!e.DB&&u.pathname.startsWith('/api/'))fail('云端数据库暂时不可用',503);
+  if(u.pathname.startsWith('/api/state/')){await requireSyncAuth(r,e);return await handleCloudState(r,e,u.pathname);}
+  if(e.SITE_ACCESS!=='public-legacy'&&(!u.pathname.startsWith('/api/sync/')||u.pathname==='/api/sync/status')&&!isOwner(r,e))fail('请使用站点所有者的 ChatGPT 账号登录',403);
++ if(u.pathname==='/api/account/settings'){if(r.method==='GET')return json(await readAccountSettings(r,e));if(r.method==='POST')return json(await saveAccountSettings(r,e,u,await body(r)));fail('不支持此方法',405);}
+  if(u.pathname==='/api/profile'&&r.method==='POST'){if(!isOwner(r,e))fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好',403);return json(await saveProfile(r,e,u,await body(r)));}
+  if(u.pathname==='/profile/save'&&r.method==='POST'){
+   if(!isOwner(r,e))fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好',403);
+@@ -223,7 +225,7 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
+  if(u.pathname==='/api/center/status'&&r.method==='GET'){
+   const context=await pageContext(r,e,u,'status'),state=await syncState(e.DB);
+   const generation=await active(e.DB),overview=await record(e.DB,generation,'meta','overview');
+-  return json({html:render('_center_checks',context),local_checked_at:context.local_checked_at||null,last_import:overview?.last_import||null,sync:{...state,status:state.pending?'pending':'succeeded',message:state.pending?'已保存更新，等待本地接收。':'最近同步已完成。'}});
++  return json({html:render('_center_checks',context),local_checked_at:context.local_checked_at||null,last_import:overview?.last_import||null,sync:{...state,status:state.pending?'pending':state.synced_at?'succeeded':'unknown',message:state.pending?'已保存更新，等待本地接收。':state.synced_at?'最近同步已完成。':'尚无已完成同步记录。'}});
+  }
+  if(u.pathname==='/api/sync'&&r.method==='POST')return await requestSync(r,e,u);
+  if(u.pathname==='/api/sync/status'&&r.method==='GET'){const state=await syncState(e.DB);return json({...state,message:state.pending?'已保存更新，等待本地接收。':'云端数据已更新；暂无待处理更新。'});}

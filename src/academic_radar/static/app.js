@@ -34,7 +34,7 @@
       headers: {"Content-Type": "application/json", "X-CSRF-Token": csrf, ...(options.headers || {})},
     });
     const data = await response.json().catch(() => ({error: "服务器返回了无法识别的响应"}));
-    if (!response.ok) throw new Error(data.error || `请求失败（${response.status}）`);
+    if (!response.ok) throw Object.assign(new Error(data.error || `请求失败（${response.status}）`),{status:response.status});
     return data;
   };
 
@@ -47,14 +47,15 @@
     });
     return preferences;
   };
-  const saveAppearance = (value) => {
+  const saveAppearance = async (value) => {
     const preferences = showAppearance(value);
     const status = appearanceDialog?.querySelector("[data-appearance-status]");
     try {
+      if(accountMode){await persistAccount({appearance:preferences});}
       localStorage.setItem(appearanceKey, JSON.stringify(preferences));
-      if (status) status.textContent = "已保存到此浏览器";
+      if (status) status.textContent = "";
     } catch (_) {
-      if (status) status.textContent = "已应用；浏览器暂时无法保存偏好";
+      if (status) status.textContent = accountMode?"设置未同步，请重新打开个人中心核对后重试":"已应用；浏览器暂时无法保存偏好";
     }
   };
   showAppearance(readAppearance());
@@ -64,16 +65,18 @@
     saveAppearance({font: appearanceDialog.querySelector('input[name="appearance-font"]:checked')?.value,
                     theme: appearanceDialog.querySelector('input[name="appearance-theme"]:checked')?.value});
   });
-  document.querySelector("[data-reset-appearance]")?.addEventListener("click", () => saveAppearance(null));
   window.addEventListener("storage", (event) => { if (event.key === appearanceKey) showAppearance(readAppearance()); });
 
   const center = document.getElementById('personal-center');
+  const accountMode=document.body.dataset.siteMode==='cloud';
+  let accountState=null,accountWrite=Promise.resolve(),accountReady=false,accountReadSerial=0;
+  const accountPendingFields=new Map();
   const personalKey = 'daily-literature.personal.v1';
-  const normalizePersonal = value => ({name:typeof value?.name==='string'?value.name.slice(0,40):'',tagline:typeof value?.tagline==='string'?value.tagline.slice(0,80):'',avatar:typeof value?.avatar==='string'&&value.avatar.length<=400000&&/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value.avatar)?value.avatar:''});
+  const normalizePersonal = value => ({name:typeof value?.name==='string'?value.name.slice(0,40):'',tagline:typeof value?.tagline==='string'?value.tagline.slice(0,80):'',avatar:typeof value?.avatar==='string'&&value.avatar.length<=400000&&(/^preset:0[1-8]$/.test(value.avatar)||/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value.avatar))?value.avatar:''});
   const readPersonal = () => {try{return normalizePersonal(JSON.parse(localStorage.getItem(personalKey)))}catch(_){return normalizePersonal(null)}};
   const paintAvatar = (element, value) => {
     if(!element)return; element.replaceChildren();
-    if(value.avatar){const image=document.createElement('img');image.src=value.avatar;image.alt='';element.append(image)}
+    if(value.avatar){const image=document.createElement('img');image.src=value.avatar.startsWith('preset:')?'/static/images/avatars/avatar-'+value.avatar.slice(7)+'.webp':value.avatar;image.alt='';if(value.avatar.startsWith('preset:'))image.className='avatar-preset-image';element.append(image)}
     else element.textContent=Array.from(value.name)[0]||'文';
   };
   const renderPersonal = value => {
@@ -83,36 +86,120 @@
   let avatarRead=0;
   let draftPersonal=readPersonal();renderPersonal(draftPersonal);
   const personalForm=center?.querySelector('[data-personal-form]');
-  const resetPersonalForm=()=>{avatarRead++;draftPersonal=readPersonal();if(!personalForm)return;personalForm.elements.display_name.value=draftPersonal.name;personalForm.elements.tagline.value=draftPersonal.tagline;personalForm.querySelector('[type="submit"]').disabled=false;paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);center.querySelector('[data-personal-status]').textContent='';};
+  const avatarPicker=center?.querySelector('[data-avatar-picker]');
+  const avatarOpen=center?.querySelector('[data-avatar-open]');
+  let avatarBefore='';
+  const closeAvatarPicker=(cancel=false,focus=true)=>{
+    if(!avatarPicker||avatarPicker.hidden)return;
+    if(cancel){avatarRead++;draftPersonal={...draftPersonal,avatar:avatarBefore};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);}
+    avatarPicker.hidden=true;avatarOpen.setAttribute('aria-expanded','false');if(focus)avatarOpen.focus();
+  };
+  avatarOpen?.addEventListener('click',()=>{
+    if(!avatarPicker.hidden){closeAvatarPicker(true);return;}
+    avatarBefore=draftPersonal.avatar;avatarPicker.hidden=false;avatarOpen.setAttribute('aria-expanded','true');
+    avatarPicker.querySelectorAll('[name="avatar-preset"]').forEach(input=>input.checked=input.value===draftPersonal.avatar);
+    (avatarPicker.querySelector(':checked')||avatarPicker.querySelector('input')).focus();
+  });
+  avatarPicker?.addEventListener('click',event=>{if(event.target.name==='avatar-preset'&&event.target.value===draftPersonal.avatar)closeAvatarPicker();});
+  avatarPicker?.addEventListener('change',event=>{if(event.target.name!=='avatar-preset')return;avatarRead++;draftPersonal={...draftPersonal,avatar:event.target.value};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);closeAvatarPicker();queuePersonalSave();});
+  center?.querySelector('[data-avatar-cancel]')?.addEventListener('click',()=>closeAvatarPicker(true));
+
+  center?.addEventListener('cancel',event=>{if(avatarPicker&&!avatarPicker.hidden){event.preventDefault();closeAvatarPicker(true);}});
+  const resetPersonalForm=()=>{closeAvatarPicker(false,false);avatarRead++;if(personalForm)personalForm.dataset.dirty='false';draftPersonal=readPersonal();if(!personalForm)return;personalForm.elements.display_name.value=draftPersonal.name;personalForm.elements.tagline.value=draftPersonal.tagline;paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);center.querySelector('[data-personal-status]').textContent='';};
   resetPersonalForm();
   personalForm?.elements.display_name.addEventListener('input',()=>paintAvatar(center.querySelector('[data-avatar-preview]'),{...draftPersonal,name:personalForm.elements.display_name.value}));
-  personalForm?.addEventListener('submit',event=>{
-    event.preventDefault(); const status=center.querySelector('[data-personal-status]');
+  let personalTimer,personalRevision=0,personalComposing=false;
+  const pendingPersonalKey='daily-literature.personal.pending.v1';
+  const retryPersonal=center?.querySelector('[data-personal-retry]');
+  async function savePersonal(force=false){
+    clearTimeout(personalTimer);if(personalComposing||!personalForm||(!force&&!retryPersonal.hidden))return;
+    const revision=personalRevision;
     const value=normalizePersonal({...draftPersonal,name:personalForm.elements.display_name.value.trim(),tagline:personalForm.elements.tagline.value.trim()});
-    try{localStorage.setItem(personalKey,JSON.stringify(value));draftPersonal=value;renderPersonal(value);status.textContent='已保存到此浏览器'}catch(_){status.textContent='无法保存，请检查浏览器存储后重试';}
+    try{
+      if(accountMode)await persistAccount({personal:value});
+      else{localStorage.setItem(personalKey,JSON.stringify(value));renderPersonal(value);}
+      if(revision===personalRevision){try{localStorage.removeItem(pendingPersonalKey);}catch(_){}draftPersonal=value;personalForm.dataset.dirty='false';center.querySelector('[data-personal-status]').textContent='';retryPersonal.hidden=true;}
+    }catch(error){center.querySelector('[data-personal-status]').textContent=error.message||'同步失败，请重试';retryPersonal.hidden=false;}
+  }
+  function queuePersonalSave(){personalRevision++;try{const value=normalizePersonal({...draftPersonal,name:personalForm.elements.display_name.value.trim(),tagline:personalForm.elements.tagline.value.trim()});localStorage.setItem(pendingPersonalKey,JSON.stringify({base:accountState?.personal||null,value}));}catch(_){}personalForm.dataset.dirty='true';clearTimeout(personalTimer);if(!personalComposing)personalTimer=setTimeout(savePersonal,650);}
+  personalForm?.addEventListener('submit',event=>{event.preventDefault();savePersonal();});
+  for(const input of personalForm?.querySelectorAll('input[name="display_name"],input[name="tagline"]')||[]){
+    input.addEventListener('compositionstart',()=>{personalComposing=true;clearTimeout(personalTimer);});
+    input.addEventListener('compositionend',()=>{personalComposing=false;queuePersonalSave();});
+    input.addEventListener('input',queuePersonalSave);input.addEventListener('blur',()=>{if(personalForm.dataset.dirty==='true')savePersonal();});
+  }
+  retryPersonal?.addEventListener('click',async()=>{if(accountMode&&!accountReady)await loadAccount();await savePersonal(true);});
+  window.addEventListener('pagehide',()=>{
+    if(!accountMode||!accountReady||personalForm?.dataset.dirty!=='true'||personalComposing||!retryPersonal.hidden)return;
+    const value=normalizePersonal({...draftPersonal,name:personalForm.elements.display_name.value.trim(),tagline:personalForm.elements.tagline.value.trim()});
+    const fields={};for(const key of Object.keys(value))if(value[key]!==accountState.personal?.[key])fields[key]=value[key];
+    if(Object.keys(fields).length)fetch('/api/account/settings',{method:'POST',keepalive:true,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({base_version:accountState.version,patch:{personal:fields}})}).catch(()=>{});
   });
+  center?.addEventListener('close',()=>{if(personalForm.dataset.dirty==='true')savePersonal();});
   center?.querySelector('[data-avatar-file]')?.addEventListener('change',async event=>{
     const file=event.target.files?.[0],status=center.querySelector('[data-personal-status]'),token=++avatarRead;if(!file)return;
-    const saveButton=personalForm.querySelector('[type="submit"]');saveButton.disabled=true;
+
     try{
       if(!['image/png','image/jpeg','image/webp'].includes(file.type)||file.size>3*1024*1024)throw Error('请选择不超过 3MB 的 PNG、JPEG 或 WebP 图片');
       const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('图片读取失败'));reader.readAsDataURL(file)});
       const image=new Image();image.src=data;await image.decode();if(token!==avatarRead)return;
       const canvas=document.createElement('canvas');canvas.width=canvas.height=160;
       const scale=Math.max(160/image.width,160/image.height);canvas.getContext('2d').drawImage(image,(160-image.width*scale)/2,(160-image.height*scale)/2,image.width*scale,image.height*scale);
-      draftPersonal={...draftPersonal,avatar:canvas.toDataURL('image/png')};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);status.textContent='头像已预览，保存后生效';
-    }catch(error){if(token===avatarRead)status.textContent=error.message}finally{event.target.value='';if(token===avatarRead)saveButton.disabled=false}
+      draftPersonal={...draftPersonal,avatar:canvas.toDataURL('image/png')};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);status.textContent='';closeAvatarPicker();queuePersonalSave();
+    }catch(error){if(token===avatarRead)status.textContent=error.message}finally{event.target.value='';}
   });
-  center?.querySelector('[data-avatar-clear]')?.addEventListener('click',()=>{avatarRead++;personalForm.querySelector('[type="submit"]').disabled=false;draftPersonal={...draftPersonal,avatar:''};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);center.querySelector('[data-personal-status]').textContent='保存后移除头像'});
-  const formatTime=value=>{if(!value)return '尚无记录';const date=new Date(value);return Number.isFinite(date.getTime())?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(date):'尚无记录'};
+  center?.querySelector('[data-avatar-clear]')?.addEventListener('click',()=>{avatarRead++;closeAvatarPicker(false,false);draftPersonal={...draftPersonal,avatar:''};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);queuePersonalSave()});
+  function cacheAccount(state){
+    accountState=state;accountReady=true;
+    if(state.personal){try{localStorage.setItem(personalKey,JSON.stringify(state.personal));}catch(_){}if(![...accountPendingFields].some(([key,count])=>key.startsWith('personal.')&&count>1))renderPersonal(normalizePersonal(state.personal));}
+    if(state.appearance){try{localStorage.setItem(appearanceKey,JSON.stringify(state.appearance));}catch(_){}if(![...accountPendingFields].some(([key,count])=>key.startsWith('appearance.')&&count>0))showAppearance(state.appearance);}
+  }
+  async function persistAccount(patch){
+    if(!accountReady||!accountState)throw Error('账号设置尚未加载，请稍后重新打开个人中心');
+    const base=structuredClone(accountState),changes={};
+    for(const [group,values] of Object.entries(patch)){const changed={};for(const [field,value] of Object.entries(values))if(value!==base[group]?.[field]||accountPendingFields.get(group+'.'+field))changed[field]=value;if(Object.keys(changed).length)changes[group]=changed;}
+    if(!Object.keys(changes).length)return accountState;
+    const pendingKeys=Object.entries(changes).flatMap(([group,fields])=>Object.keys(fields).map(field=>group+'.'+field));
+    pendingKeys.forEach(key=>accountPendingFields.set(key,(accountPendingFields.get(key)||0)+1));
+    const operation=accountWrite.catch(()=>{}).then(async()=>{
+      try{const result=await api('/api/account/settings',{method:'POST',body:JSON.stringify({base_version:accountState.version,patch:changes})});cacheAccount(result);return result;}
+      catch(error){
+        if(error.status!==409)throw error;
+        const latest=await api('/api/account/settings');
+        const conflict=Object.entries(changes).some(([group,fields])=>Object.keys(fields).some(field=>latest[group]?.[field]!==base[group]?.[field]&&latest[group]?.[field]!==fields[field]));
+        if(conflict){accountState=latest;throw Error('另一台设备已修改相同设置，当前输入已保留。请核对后点击重试同步。');}
+        accountState=latest;const result=await api('/api/account/settings',{method:'POST',body:JSON.stringify({base_version:latest.version,patch:changes})});cacheAccount(result);return result;
+      }
+    }).finally(()=>pendingKeys.forEach(key=>{const count=accountPendingFields.get(key)-1;if(count)accountPendingFields.set(key,count);else accountPendingFields.delete(key);}));accountWrite=operation;return operation;
+  }
+  async function loadAccount(migrate=false){
+    if(!accountMode)return;
+    const status=center.querySelector('[data-personal-status]'),serial=++accountReadSerial;
+    try{
+      await accountWrite.catch(()=>{});const state=await api('/api/account/settings');if(serial!==accountReadSerial||state.version<(accountState?.version||0))return;cacheAccount(state);
+      let pending;try{pending=JSON.parse(localStorage.getItem(pendingPersonalKey));}catch(_){}
+      if(pending?.value){
+        const fields={};for(const [key,value] of Object.entries(normalizePersonal(pending.value)))if(value!==pending.base?.[key])fields[key]=value;
+        const conflict=Object.keys(fields).some(key=>state.personal?.[key]!==pending.base?.[key]&&state.personal?.[key]!==fields[key]);
+        if(conflict){draftPersonal=normalizePersonal(pending.value);personalForm.elements.display_name.value=draftPersonal.name;personalForm.elements.tagline.value=draftPersonal.tagline;paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);personalForm.dataset.dirty='true';retryPersonal.hidden=false;throw Error('另一台设备更新了相同资料，未同步输入已保留，请核对后重试');}
+        if(Object.keys(fields).length)await persistAccount({personal:fields});localStorage.removeItem(pendingPersonalKey);
+      }
+      if(migrate){const patch={};
+        if(!state.personal){try{if(localStorage.getItem(personalKey))patch.personal=readPersonal();}catch(_){}}
+        if(!state.appearance){try{if(localStorage.getItem(appearanceKey))patch.appearance=readAppearance();}catch(_){}}
+        if(Object.keys(patch).length)await persistAccount(patch);
+      }
+      if(center.open&&personalForm.dataset.dirty!=='true'&&avatarPicker.hidden)resetPersonalForm();
+    }catch(error){if(!accountState)accountReady=false;status.textContent='账号设置读取或同步失败：'+error.message;}
+  }
+
+  const formatTime=value=>{if(!value)return '尚无记录';const date=new Date(value);return Number.isFinite(date.getTime())?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(date)+'（北京时间）':'尚无记录'};
   const setTime=(selector,value)=>{const el=document.querySelector(selector);if(el){el.textContent=formatTime(value);el.title=value||''}};
   const showSync = status => {
     let state=status.status==='failed'?'failed':status.running?'running':status.pending?'pending':status.status==='disabled'?'disabled':status.synced_at?'succeeded':'unknown';
     const label=state==='failed'?'同步失败':state==='running'?'正在同步':state==='pending'?'等待本地接收':state==='succeeded'?'最近同步成功':state==='disabled'?'未配置同步':'同步状态尚未确认';
-    document.querySelectorAll('[data-sync-indicator]').forEach(el=>{el.dataset.syncState=state;el.setAttribute('aria-label',label+'，打开同步与检查');el.title=label+(status.synced_at?' · '+formatTime(status.synced_at):'');});
-    const mark=document.querySelector('[data-cloud-state-mark]');if(mark)mark.setAttribute('d',state==='succeeded'?'m9 14 2 2 4-4':state==='failed'?'m10 12 4 4m0-4-4 4':'M9 14h6');
     document.querySelectorAll('[data-sync-message]').forEach(el=>el.textContent=status.message||label);
-    setTime('[data-center-sync-time]',status.synced_at||status.remote_synced_at);
+    if('synced_at'in status||'remote_synced_at'in status)setTime('[data-center-sync-time]',status.synced_at||status.remote_synced_at);
   };
   let checkRequest=0;
   const refreshChecks=async()=>{
@@ -129,7 +216,7 @@
     center?.querySelectorAll('[data-center-panel]').forEach(el=>el.hidden=el.dataset.centerPanel!==name);
     if(name==='checks')refreshChecks();
   };
-  const openCenter=name=>{if(!center)return;resetPersonalForm();selectCenterTab(name);if(!center.open)center.showModal();};
+  const openCenter=name=>{if(!center)return;if(personalForm.dataset.dirty!=='true')resetPersonalForm();selectCenterTab(name);if(!center.open)center.showModal();loadAccount();};
   document.querySelectorAll('[data-open-center]').forEach(el=>el.addEventListener('click',()=>openCenter(el.dataset.openCenter)));
   center?.querySelectorAll('[data-center-tab]').forEach(el=>el.addEventListener('click',()=>selectCenterTab(el.dataset.centerTab)));
   center?.querySelector('.center-tabs')?.addEventListener('keydown',event=>{
@@ -139,6 +226,8 @@
   center?.querySelector('[data-refresh-checks]')?.addEventListener('click',refreshChecks);
   const requestedCenter=new URL(location.href).searchParams.get('center');
   if(['profile','appearance','checks'].includes(requestedCenter))openCenter(requestedCenter);
+  loadAccount(true);
+  window.addEventListener('focus',()=>{if(!center?.open)loadAccount();});
   api('/api/sync/status').then(showSync).catch(()=>showSync({status:'unknown',message:'暂时无法读取同步状态'}));
   window.addEventListener('storage',event=>{if(event.key===personalKey){renderPersonal(readPersonal());if(!center?.open)resetPersonalForm();}});
 
@@ -226,22 +315,8 @@
     const star = card.querySelector(".feedback-heading .star");
     if (star) star.hidden = !favorite;
   };
-  const syncReading = (card, readingStatus) => {
-    card.dataset.readingStatus = readingStatus;
-    const button = card.querySelector("[data-read-later]");
-    const later = readingStatus === "read_later";
-    if (button) {
-      button.setAttribute("aria-pressed", String(later));
-      button.setAttribute("aria-label", later ? "移出稍后读" : "加入稍后读");
-      button.classList.toggle("is-read-later", later);
-      const label = button.querySelector("[data-reading-label]");
-      if (label) label.textContent = later ? "已加入稍后读" : "稍后读";
-    }
-    const select = card.querySelector('select[name="reading_status"]');
-    if (select) select.value = readingStatus;
-  };
   const setCardBusy = (identity, busy) => matchingCards(identity).forEach((card) => {
-    card.querySelectorAll('[data-favorite], [data-read-later], [data-feedback-form] button[type="submit"]').forEach((button) => { button.disabled = busy; });
+    card.querySelectorAll('[data-favorite], [data-feedback-form] button[type="submit"]').forEach((button) => { button.disabled = busy; });
   });
 
   const orderRecommendationCards = (list) => {
@@ -261,7 +336,7 @@
       identity: values.get("identity"),
       interest: values.get("interest"),
       reason: values.get("reason"),
-      reading_status: values.get("reading_status"),
+
       favorite: values.get("favorite") === "on",
     };
     setCardBusy(payload.identity, true);
@@ -280,10 +355,8 @@
         if (otherForm) {
           otherForm.elements.interest.value = result.interest || "";
           otherForm.elements.reason.value = payload.reason;
-          otherForm.elements.reading_status.value = payload.reading_status;
         }
         syncFavorite(card, payload.favorite);
-        syncReading(card, result.reading_status);
         const list = card.closest("[data-today-list], [data-history-list]");
         if (list) {
           card.classList.add("is-completing");
@@ -303,24 +376,6 @@
       const details = card?.querySelector(".paper-details");
       if (details) details.open = true;
       requestAnimationFrame(() => card?.querySelector('[data-feedback-form] select[name="interest"]')?.focus());
-      return;
-    }
-    const reading = event.target.closest("[data-read-later]");
-    if (reading) {
-      const card = reading.closest("[data-paper-identity]");
-      const identity = reading.dataset.identity;
-      const next = card.dataset.readingStatus === "read_later" ? "unread" : "read_later";
-      setCardBusy(identity, true);
-      try {
-        const result = await api("/api/feedback", {method: "POST", body: JSON.stringify({
-          identity, interest: card.dataset.interest || null, reason: card.dataset.feedbackReason || "",
-          favorite: card.querySelector("[data-favorite]")?.getAttribute("aria-pressed") === "true",
-          reading_status: next,
-        })});
-        matchingCards(identity).forEach((other) => syncReading(other, result.reading_status));
-        announce(next === "read_later" ? "已加入稍后读" : "已移出稍后读");
-      } catch (error) { announce(error.message, true); }
-      finally { setCardBusy(identity, false); }
       return;
     }
     const favorite = event.target.closest("[data-favorite]");
@@ -456,12 +511,7 @@
     }));
   }
 
-  document.addEventListener("click", async event => {
-    if(!event.target.closest("[data-copy-update]"))return;
-    const text = document.querySelector("[data-copy-target]")?.value || "";
-    try { await navigator.clipboard.writeText(text); announce("更新任务已复制，发送给 Codex 即可执行"); }
-    catch (_) { const target=document.querySelector("[data-copy-target]");if(target){target.hidden=false;target.setAttribute("aria-label","更新任务");target.focus();target.select();}announce("已显示更新任务，请手动复制", true); }
-  });
+
   };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", onReady, {once: true});
   else onReady();

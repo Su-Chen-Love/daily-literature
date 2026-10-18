@@ -21,7 +21,7 @@ for(const query of ['favorite=yes','reading=read_later']){
 const savedView=await (await request('/api/view?view=library&favorite=yes')).json();assert.equal(savedView.papers.length,1);assert.equal(savedView.papers[0].identity,'doi:low');
 const response=await request('/api/feedback',{identity:'doi:low',interest:'interested',reason:'',favorite:true,reading_status:'read_later'});assert.equal(response.status,200);
 const saved=DB.sql.prepare('SELECT * FROM cloud_feedback ORDER BY seq DESC LIMIT 1').get();assert.equal(saved.interest,'interested');assert.equal(saved.reason,null);assert.equal(saved.favorite,1);assert.equal(saved.reading_status,'read_later');
-const checks=await (await request('/api/center/status')).json();assert.equal(checks.local_checked_at,base.local_checked_at);assert.equal(checks.last_import,'2026-01-01T00:00:00Z');assert.ok(checks.html.includes('Synthetic local update task'));assert.ok(checks.sync.pending);
+const checks=await (await request('/api/center/status')).json();assert.equal(checks.local_checked_at,base.local_checked_at);assert.equal(checks.last_import,'2026-01-01T00:00:00Z');assert.ok(checks.html.includes('数据库状态'));assert.ok(!checks.html.includes('更新数据库'));assert.ok(checks.sync.pending);
 const redirect=await request('/status');assert.equal(redirect.status,303);assert.equal(redirect.headers.get('Location'),'/?center=checks');
 const unauth=await worker.fetch(new Request(origin+'/api/center/status'),env);assert.ok([200,403].includes(unauth.status)); // legacy repository keeps its existing access behavior; production worker denial is tested separately.
 console.log('Personal center checks/redirect/auth, fixed .7 views, optional feedback and all saved low-score/excluded entries passed.');

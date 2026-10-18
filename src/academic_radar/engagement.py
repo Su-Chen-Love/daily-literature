@@ -290,11 +290,11 @@ def set_feedback(
     interest: str | None,
     reason: str,
     favorite: bool,
-    reading_status: str,
+    reading_status: str | None,
 ) -> dict[str, Any]:
     if interest not in INTEREST_VALUES:
         raise ValueError(f"Invalid interest value: {interest}")
-    if reading_status not in READING_VALUES:
+    if reading_status is not None and reading_status not in READING_VALUES:
         raise ValueError(f"Invalid reading status: {reading_status}")
     upgrade_database(db_path)
     db = connect(db_path)
@@ -302,6 +302,8 @@ def set_feedback(
         if not db.execute("SELECT 1 FROM papers WHERE identity=?", (identity,)).fetchone():
             raise ValueError(f"Unknown paper identity: {identity}")
         prior = db.execute("SELECT * FROM paper_feedback WHERE identity=?", (identity,)).fetchone()
+        if reading_status is None:
+            reading_status = prior["reading_status"] if prior else "unread"
         normalized_reason = reason.strip() or None
         semantic_changed = (
             (prior["interest"] if prior else None) != interest

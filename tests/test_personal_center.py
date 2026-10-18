@@ -49,7 +49,8 @@ class PersonalCenterTests(unittest.TestCase):
                 self.assertEqual(old.status_code,303)
                 self.assertEqual(old.headers['location'],'/?center=checks')
                 result=client.get('/api/center/status').json()
-                self.assertIn('更新数据库',result['html'])
+                self.assertIn('数据库状态',result['html'])
+                self.assertNotIn('更新数据库',result['html'])
                 self.assertTrue(result['local_checked_at'])
                 page=client.get('/').text
                 self.assertNotIn('href="/status"',page)
@@ -77,3 +78,14 @@ class PersonalCenterTests(unittest.TestCase):
             self.assertIn('Keep these specific methodological boundaries.',profile_file.read_text())
             with connect(path) as db:
                 self.assertEqual(json.loads(db.execute("SELECT value FROM meta WHERE key='cloud_screening_preferences'").fetchone()[0]),{'relevance_threshold':.7,'instructions':''})
+
+    def test_feedback_without_removed_reading_field_keeps_legacy_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            app,_,_=self.make_app(Path(td))
+            with TestClient(app) as client:
+                headers={"X-CSRF-Token":app.state.csrf_token}
+                first=client.post('/api/feedback',json={"identity":"doi:10.1/test","interest":"interested","reason":"","favorite":True,"reading_status":"read_later"},headers=headers)
+                self.assertEqual(first.status_code,200)
+                second=client.post('/api/feedback',json={"identity":"doi:10.1/test","interest":"not_interested","reason":"","favorite":True},headers=headers)
+                self.assertEqual(second.status_code,200)
+                self.assertEqual(second.json()['reading_status'],'read_later')

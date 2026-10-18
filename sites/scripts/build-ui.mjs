@@ -11,6 +11,10 @@ for(const [path,type] of [['app.css','text/css; charset=utf-8'],['app.js','text/
  const data=await readFile('shared/static/'+path);
  assets['/static/'+path]={type,data:data.toString('base64')};
 }
+for(const [folder,type] of [['fonts','font/woff2'],['images/avatars','image/webp']]) {
+ let names;try{names=await readdir('shared/static/'+folder);}catch{continue;}
+ for(const name of names){if(!(folder==='fonts'?name.endsWith('.woff2')||name.endsWith('-OFL.txt'):name.endsWith('.webp')))continue;const data=await readFile('shared/static/'+folder+'/'+name);assets['/static/'+folder+'/'+name]={type:name.endsWith('.txt')?'text/plain; charset=utf-8':type,data:data.toString('base64')};}
+}
 await writeFile('worker/generated-ui.js','export const templates={'+templates.join(',')+'};\nexport const assets='+JSON.stringify(assets)+';\n');
 await mkdir('dist/server',{recursive:true});
 await build({entryPoints:['worker/index.js'],outfile:'dist/server/index.js',bundle:true,format:'esm',platform:'browser',target:'es2022',legalComments:'none',plugins:[{name:'precompiled-templates-only',setup(b){b.onLoad({filter:/nunjucks-slim\.js$/},async({path})=>{const code=await readFile(path,'utf8'),needle='var func = new Function(source);';if(!code.includes(needle))throw new Error('Nunjucks runtime changed; review compile guard.');return {contents:code.replace(needle,"throw new Error('Only precompiled templates are supported.'); var func;"),loader:'js'};});}}]});

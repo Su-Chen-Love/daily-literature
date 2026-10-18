@@ -1,0 +1,62 @@
+{
+  "source_commit": "c6b83f38218832c7044cf63339ccac3957c84773",
+  "bundle_sha256": "696106393fba9d1c13d112edbad25d73c921c93743520ad5d5cf224d513ff824",
+  "assets": [
+    {
+      "name": "owl.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-01.webp",
+      "sha256": "40958c9ca6dba943a4833e12080db9b315daaa82c737f773f36a4f4d4e7627bc",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "cat.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-02.webp",
+      "sha256": "5a2ed6a2f868d0bb9d2e7134903d0d28e9dcfb09e8fd03041d1baffb178cd416",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "fox.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-03.webp",
+      "sha256": "223182eaf7dab6c7c2071c135a5a872c9d7e0849f991a07ac6749e8adba61219",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "rabbit.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-04.webp",
+      "sha256": "82dcc046a27506c255f7a7baa4209bd62b1c0f9d494abf7b0b6eed97cd9ed44d",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "bear.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-05.webp",
+      "sha256": "ef4ace84e87bb82edb0dd47845ebb0c5e5862c2caaea3e8c1420d3631f7209c0",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "penguin.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-06.webp",
+      "sha256": "8a52dde59fe98ac443b011a43444eca5e55236c5aaba1f584cbd2f43c035342d",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "robot.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-07.webp",
+      "sha256": "05a5b1e82df38b87e07b9da3522449b688bd213660f52ba7eb7d7fab2c95738c",
+      "width": 384,
+      "height": 384
+    },
+    {
+      "name": "bird.webp",
+      "runtime_path": "src/academic_radar/static/images/avatars/avatar-08.webp",
+      "sha256": "19b16ef9e4c3ba6580b2e814c248341c359accce10750a244288b61c76ea26f4",
+      "width": 384,
+      "height": 384
+    }
+  ]
+}

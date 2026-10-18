@@ -57,7 +57,7 @@ console.log('Monotonic manual requests, generation-bound ACK, and later-request 
 
 for(const path of ['/','/library','/sources','/profile','/feedback']) {
  const response=await worker.fetch(new Request(origin+path),env);assert.equal(response.status,200,path);
- const html=await response.text();assert.ok(html.includes('class="sidebar"'));assert.ok(html.includes('/static/app.css?v=center-20261018'));assert.ok(html.includes('data-sync-now'));assert.ok(html.includes('personal-center'));assert.ok(!html.includes('href="/status"'));assert.ok(!html.includes('signin-with-chatgpt'));
+ const html=await response.text();assert.ok(html.includes('class="sidebar"'));assert.ok(html.includes('/static/app.css?v=avatars-20261018'));assert.ok(html.includes('data-sync-now'));assert.ok(html.includes('personal-center'));assert.ok(!html.includes('href="/status"'));assert.ok(!html.includes('signin-with-chatgpt'));
 }
 const style=await worker.fetch(new Request(origin+'/static/app.css'),env);assert.equal(await style.text(),readFileSync(new URL('../shared/static/app.css',import.meta.url),'utf8'));
 console.log('All six anonymous shared-template pages and exact shared stylesheet passed.');

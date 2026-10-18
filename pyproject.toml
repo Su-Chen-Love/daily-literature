@@ -31,7 +31,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-academic_radar = ["migrations/*.sql", "templates/*.html", "static/*.css", "static/*.js", "static/images/*.png", "static/images/*.svg", "assets/*.toml", "assets/*.md"]
+academic_radar = ["migrations/*.sql", "templates/*.html", "static/*.css", "static/*.js", "static/images/*.png", "static/images/*.svg", "static/images/avatars/*.webp", "static/fonts/*.woff2", "static/fonts/*-OFL.txt", "assets/*.toml", "assets/*.md"]
 
 [tool.setuptools.data-files]
 "share/personal-academic-radar" = ["scripts/paper_monitor.py"]
