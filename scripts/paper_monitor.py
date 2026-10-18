@@ -16,6 +16,8 @@ from academic_radar.governance import (
 )
 from academic_radar.product import abstract_source_for, classify_low_priority, manual_identity_for_title, publication_date_label
 from academic_radar.storage import latest_schema_version, upgrade_database
+from academic_radar.cloud_sync import pull_configured
+from academic_radar.profile_sync import screening_preferences
 from academic_radar.recommendations import (
     snapshot_run, SCREENING_SCHEMA_VERSION, SCREENING_RUBRIC_VERSION,
     SCREENING_DIMENSIONS, REASONING_MIN_LENGTHS,
@@ -686,10 +688,28 @@ def collect_into_db(cfg: dict[str,Any], db: sqlite3.Connection, now: str, run_id
     unique_new=list({paper.identity:paper for paper in new}.values())
     return unique_collected,unique_new,failures
 
+def pull_before_run(config_path: Path) -> None:
+    """Do not collect or freeze a judgment queue with an unconsumed Site edit."""
+    result=pull_configured(config_path)
+    if result.get("status") not in {"disabled","pulled"}:
+        raise RuntimeError("Cloud edits could not be pulled before this run; retry after synchronization completes")
+
+
+def screening_config(db: sqlite3.Connection, cfg: dict[str,Any]) -> dict[str,Any]:
+    """Read preferences under the same write lock as the frozen profile."""
+    effective=dict(cfg); preferences=screening_preferences(db,cfg)
+    cursor=db.execute("SELECT value FROM meta WHERE key='cloud_profile_cursor'").fetchone()
+    effective.update(relevance_threshold=preferences["relevance_threshold"],
+                     screening_instructions=preferences["instructions"],
+                     screening_preferences_version=int(cursor[0]) if cursor else 0)
+    return effective
+
+
 def collect_only(config_path: Path) -> int:
     """Collect the 14-day API window before official issue checks and queue freezing."""
 
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
+    pull_before_run(config_path)
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id="collect-"+now.replace(":","-")
     db=db_open(state/"papers.sqlite3")
     collected,new,failures=collect_into_db(cfg,db,now,run_id)
@@ -724,9 +744,10 @@ def collect_only(config_path: Path) -> int:
 def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False,
                  batch_run: str | None=None, limit: int | None=None) -> int:
     cfg=config_load(config_path); state=resolve_state(cfg,config_path); state.mkdir(parents=True,exist_ok=True)
+    pull_before_run(config_path)
     profile_path=state/cfg["profile_file"]
     now=dt.datetime.now(dt.timezone.utc).isoformat(); run_id=now.replace(":","-"); db=db_open(state/"papers.sqlite3")
-    active=confirmed_profile(db,profile_path); phash=active["profile_hash"]
+    confirmed_profile(db,profile_path)
     with db:
         stale=[row[0] for row in db.execute("SELECT run_id FROM agent_jobs WHERE status='exported'")]
         db.execute("UPDATE agent_jobs SET status='abandoned' WHERE status='exported'")
@@ -763,10 +784,15 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
         # Complete traceable metadata before freezing the one authoritative
         # queue so this run retains its `new` identities for Today's Radar.
         enrichment=run_enrichment(state/"papers.sqlite3",cfg,limit=500)
+        # Collection can be lengthy. Include edits made while it was running
+        # before the one authoritative judgment queue is frozen.
+        pull_before_run(config_path)
     # Freeze evidence, calibration examples and the event watermark together.
     # A later cloud pull may carry an old UTC timestamp but still be new to
     # this host, so timestamps alone cannot detect feedback missing at export.
     db.execute("BEGIN IMMEDIATE")
+    active=confirmed_profile(db,profile_path); phash=active["profile_hash"]
+    cfg=screening_config(db,cfg)
     if rescreen:
         rows=db.execute("SELECT * FROM papers WHERE eligibility_status='eligible' ORDER BY first_seen").fetchall()
     else:
@@ -787,8 +813,11 @@ def agent_export(config_path: Path, rescreen: bool=False, no_collect: bool=False
     examples=feedback_snapshot(db,int(cfg.get("feedback_examples_per_class",20)))
     payload={"schema_version":SCREENING_SCHEMA_VERSION,"run_id":run_id,"profile_hash":phash,"profile_version_id":active["id"],
              "profile_confirmed_at":active["confirmed_at"],"profile_path":str(profile_path),
+             "profile_content":active["content"],
              "feedback_examples":examples,"feedback_event_cursor":db.execute("SELECT COALESCE(MAX(id),0) FROM feedback_events").fetchone()[0],
              "threshold":float(cfg.get("relevance_threshold",0.70)),
+             "screening_instructions":str(cfg.get("screening_instructions","")),
+             "screening_preferences_version":cfg.get("screening_preferences_version",0),
              "papers":papers,"source_failures":failures,"collection_run_id":batch_run,
              "total_candidates":total_candidates,"deferred_candidates":total_candidates-len(papers),
              "evaluation_policy":evaluation_policy()}
@@ -852,7 +881,9 @@ def agent_import(config_path: Path, results_path: Path) -> int:
     if received != expected:
         missing=sorted(expected-received); extra=sorted(received-expected)
         raise ValueError(f"Results must cover the complete queue (missing={len(missing)}, extra={len(extra)})")
-    threshold=float(cfg.get("relevance_threshold",0.70))
+    # Later preferences apply to the next queue, not this frozen judgment.
+    threshold=float(queue.get("threshold",cfg.get("relevance_threshold",0.70)))
+    if not 0 <= threshold <= 1: raise ValueError("Invalid frozen queue threshold")
     validated=[]; validation_errors=[]
     queue_schema_version=int(queue.get("schema_version", 1))
     for item in results:

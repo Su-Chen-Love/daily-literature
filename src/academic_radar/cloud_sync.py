@@ -18,9 +18,10 @@ from zoneinfo import ZoneInfo
 
 from .recommendations import local_today, recommendation_days, recommendations_on
 from .cloud_views import export_view_contexts
-from .storage import connect, utc_now
+from .storage import connect, utc_now, upgrade_database
 from .product import load_config, resolve_state
 from .governance import latest_scores_sql
+from .profile_sync import apply_remote_profiles, reconcile_profile_file, screening_preferences
 
 
 def canonical(value: Any) -> str:
@@ -106,6 +107,9 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
         records.append({"kind": kind, "key": key, "data": data, "checksum": hashlib.sha256(data.encode()).hexdigest()})
     try:
         db.execute("BEGIN")
+        preferences = screening_preferences(db, config)
+        config = {**config, "relevance_threshold": preferences["relevance_threshold"],
+                  "screening_instructions": preferences["instructions"]}
         profile = db.execute("SELECT content,profile_hash,confirmed_at FROM profile_versions WHERE status='active'").fetchone()
         scores = latest_scores_sql()
         query = f"""SELECT p.identity,p.doi,p.title,p.abstract,p.venue,p.published,p.published_precision,p.url,p.authors_json,
@@ -137,9 +141,9 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
               s.themes_json,s.reasoning_json,s.score_dimensions_json,s.rubric_version FROM run_papers rp
               JOIN papers p ON p.identity=rp.identity JOIN screenings s ON s.identity=p.identity AND s.run_id=rp.run_id
               WHERE rp.run_id=? AND s.provider='codex-agent' AND p.eligibility_status='eligible'
-              AND s.score>=? AND (rp.role='selected' OR (rp.role='selected_new' AND NOT EXISTS(
+              AND (rp.role='selected' OR (rp.role='selected_new' AND NOT EXISTS(
                 SELECT 1 FROM run_papers chosen WHERE chosen.run_id=rp.run_id AND chosen.identity=rp.identity AND chosen.role='selected')))
-              ORDER BY p.identity""", (latest["run_id"], config.get("relevance_threshold", .70)))]
+              ORDER BY p.identity""", (latest["run_id"],))]
         append("history", "current", {"day": day.isoformat(), "papers": current, "batches": int(is_today), "incomplete": False})
         for feedback in db.execute("SELECT * FROM paper_feedback ORDER BY identity"):
             append("feedback", feedback["identity"], dict(feedback))
@@ -165,7 +169,11 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
                 except (ValueError, KeyError, TypeError, AttributeError):
                     pass
             sources.append(item)
-        append("private", "profile", dict(profile) if profile else {})
+        profile_state = dict(profile) if profile else {}
+        profile_cursor = db.execute("SELECT value FROM meta WHERE key='cloud_profile_cursor'").fetchone()
+        profile_state.update(profile_cursor=int(profile_cursor[0]) if profile_cursor else 0,
+                             screening_preferences=preferences)
+        append("private", "profile", profile_state)
         totals = dict(db.execute("SELECT COUNT(*) total,SUM(eligibility_status='eligible') eligible,SUM(COALESCE(abstract,'')='') missing_abstracts FROM papers").fetchone())
         latest_import = db.execute("SELECT MAX(imported_at) t FROM agent_jobs WHERE status='imported'").fetchone()[0]
         append("meta", "overview", {"sources": sources, "counts": totals, "days": days, "timezone": timezone,
@@ -234,6 +242,15 @@ def request_json(endpoint: str, path: str, credentials: dict, data: dict | None 
 
 
 def sync_configured(config_path: Path) -> dict:
+    return _run_configured(config_path, pull_only=False)
+
+
+def pull_configured(config_path: Path) -> dict:
+    """Drain owner edits without uploading a snapshot or acknowledging events."""
+    return _run_configured(config_path, pull_only=True)
+
+
+def _run_configured(config_path: Path, *, pull_only: bool) -> dict:
     config = load_config(config_path)
     settings = config.get("cloud_sync", {})
     if not settings.get("enabled"):
@@ -253,6 +270,11 @@ def sync_configured(config_path: Path) -> dict:
         except BlockingIOError:
             return {"status": "busy"}
         try:
+            if pull_only:
+                pulled = _pull_remote(state / "papers.sqlite3", config, endpoint, credentials)
+                return {"status": "pulled", "feedback_imported": pulled["pulled"],
+                        "profiles_imported": pulled["profiles_imported"], "cursor": pulled["cursor"],
+                        "profile_cursor": pulled["profile_cursor"], "request_id": pulled["request_id"]}
             result = _synchronize(state / "papers.sqlite3", config, endpoint, credentials)
             result["synced_at"] = utc_now()
             _save_status(state, result)
@@ -355,7 +377,8 @@ def _save_sync_meta(db_path: Path, values: dict[str, str | int]) -> None:
         db.close()
 
 
-def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) -> dict:
+def _pull_remote(db_path: Path, config: dict, endpoint: str, credentials: dict) -> dict:
+    upgrade_database(db_path)
     db = connect(db_path)
     pulled = 0
     remote_generation = None
@@ -363,11 +386,16 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
     request_id = None
     remote_acknowledged_request = None
     remote_acknowledged_cursor = None
+    remote_acknowledged_profile_cursor = None
+    profiles_imported = 0
+    profile_events_version = None
+    profile_cursor = 0
     try:
         saved = dict(db.execute("""SELECT key,value FROM meta WHERE key IN
           ('cloud_feedback_cursor','cloud_last_synced_generation',
-           'cloud_acknowledged_request_id','cloud_acknowledged_cursor')"""))
+           'cloud_acknowledged_request_id','cloud_acknowledged_cursor','cloud_profile_cursor')"""))
         cursor = int(saved.get("cloud_feedback_cursor", "0"))
+        profile_cursor = int(saved.get("cloud_profile_cursor", "0"))
         while True:
             response = request_json(endpoint, f"/api/sync/feedback?after={cursor}", credentials)
             if response.get("more") and (type(response.get("cursor")) is not int or response["cursor"] <= cursor):
@@ -383,18 +411,65 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
                     raise ValueError("Invalid cloud synchronization acknowledgement state")
             remote_acknowledged_request = response.get("acknowledged_request_id")
             remote_acknowledged_cursor = response.get("acknowledged_cursor")
+            profile_events_version = response.get("profile_events_version")
+            remote_acknowledged_profile_cursor = response.get("acknowledged_profile_cursor")
+            if remote_acknowledged_profile_cursor is not None and (type(remote_acknowledged_profile_cursor) is not int or remote_acknowledged_profile_cursor < 0):
+                raise ValueError("Invalid cloud profile acknowledgement")
             if "request_id" in response:
                 if type(response["request_id"]) is not int or response["request_id"] < 0:
                     raise ValueError("Invalid cloud synchronization request ID")
                 request_id = max(request_id or 0, response["request_id"])
             if not response.get("more"):
                 break
+        if type(profile_events_version) is int and profile_events_version == 1:
+            while True:
+                page = request_json(endpoint, f"/api/sync/profile?after={profile_cursor}", credentials)
+                if not isinstance(page, dict) or ("more" in page and type(page["more"]) is not bool):
+                    raise ValueError("Invalid cloud profile page")
+                if page.get("more") and (type(page.get("cursor")) is not int or page["cursor"] <= profile_cursor):
+                    raise ValueError("Cloud profile pagination did not advance its cursor")
+                profiles_imported += apply_remote_profiles(db, page["events"], page["cursor"], config)
+                profile_cursor = page["cursor"]
+                if not page.get("more"):
+                    break
+        elif profile_events_version is not None:
+            raise ValueError("Unsupported cloud profile event protocol")
     finally:
         db.close()
+    reconcile_profile_file(db_path, db_path.parent / config.get("profile_file", "research-profile.md"))
+    return {"saved": saved, "pulled": pulled, "profiles_imported": profiles_imported,
+            "cursor": cursor, "profile_cursor": profile_cursor, "request_id": request_id,
+            "remote_generation": remote_generation, "remote_synced_at": remote_synced_at,
+            "remote_acknowledged_request": remote_acknowledged_request,
+            "remote_acknowledged_cursor": remote_acknowledged_cursor,
+            "remote_acknowledged_profile_cursor": remote_acknowledged_profile_cursor,
+            "profile_events_version": profile_events_version}
+
+
+
+def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) -> dict:
+    pulled_state = _pull_remote(db_path, config, endpoint, credentials)
+    saved = pulled_state["saved"]
+    pulled, cursor = pulled_state["pulled"], pulled_state["cursor"]
+    request_id = pulled_state["request_id"]
+    remote_generation, remote_synced_at = pulled_state["remote_generation"], pulled_state["remote_synced_at"]
+    remote_acknowledged_request = pulled_state["remote_acknowledged_request"]
+    remote_acknowledged_cursor = pulled_state["remote_acknowledged_cursor"]
+    remote_acknowledged_profile_cursor = pulled_state["remote_acknowledged_profile_cursor"]
     records = snapshot_records(db_path, config)
+    # ACK the watermark in this exact snapshot, never a later database cursor.
+    profile_cursor = 0
+    if pulled_state["profile_events_version"] == 1:
+        profile_records = [row for row in records if row["kind"] == "private" and row["key"] == "profile"]
+        if len(profile_records) != 1:
+            raise ValueError("Cloud snapshot requires its consumed profile cursor")
+        profile_cursor = json.loads(profile_records[0]["data"]).get("profile_cursor")
+        if type(profile_cursor) is not int or profile_cursor < 0 or profile_cursor > pulled_state["profile_cursor"]:
+            raise ValueError("Cloud snapshot has an invalid consumed profile cursor")
     fingerprint = "\n".join(f"{r['kind']}:{r['key']}:{r['checksum']}" for r in records)
     generation = hashlib.sha256(fingerprint.encode()).hexdigest()
-    base = {"generation": generation, "records": len(records), "feedback_imported": pulled}
+    base = {"generation": generation, "records": len(records), "feedback_imported": pulled,
+            "profiles_imported": pulled_state["profiles_imported"], "profile_cursor": profile_cursor}
     if isinstance(remote_synced_at, str):
         base["remote_synced_at"] = remote_synced_at
 
@@ -410,12 +485,18 @@ def _synchronize(db_path: Path, config: dict, endpoint: str, credentials: dict) 
                                 else int(saved.get("cloud_acknowledged_request_id", "0")))
         acknowledged_cursor = (remote_acknowledged_cursor if remote_acknowledged_cursor is not None
                                else int(saved.get("cloud_acknowledged_cursor", "0")))
-        if request_id is not None and (request_id > acknowledged_request or cursor > acknowledged_cursor):
+        if request_id is not None and (request_id > acknowledged_request or cursor > acknowledged_cursor
+                                       or profile_cursor > (remote_acknowledged_profile_cursor or 0)):
             acknowledged = request_json(endpoint, "/api/sync/ack", credentials,
                                         {"request_id": request_id, "cursor": cursor,
-                                         "generation": generation})
+                                         "generation": generation, **({"profile_cursor": profile_cursor}
+                                         if pulled_state["profile_events_version"] == 1 else {})})
             if acknowledged.get("ok") is not True:
                 raise ValueError("Cloud synchronization acknowledgement could not be confirmed")
+            if pulled_state["profile_events_version"] == 1:
+                acknowledged_profile = acknowledged.get("acknowledged_profile_cursor")
+                if type(acknowledged_profile) is not int or acknowledged_profile < profile_cursor:
+                    raise ValueError("Cloud profile acknowledgement could not be confirmed")
             _save_sync_meta(db_path, {"cloud_acknowledged_request_id": request_id,
                                      "cloud_acknowledged_cursor": cursor})
             result["request_acknowledged"] = request_id

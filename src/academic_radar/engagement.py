@@ -93,8 +93,12 @@ def _atomic_write(path: Path, content: str) -> None:
 def confirm_profile(db_path: Path, version_id: int, profile_file: Path) -> dict[str, Any]:
     upgrade_database(db_path)
     db = connect(db_path)
-    previous_content = profile_file.read_text(encoding="utf-8") if profile_file.exists() else None
     try:
+        # Remote reconciliation uses this same SQLite write lock. Keep the
+        # file replacement, activation and any rollback inside its boundary.
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT 1 FROM meta WHERE key='cloud_profile_file_pending'").fetchone():
+            raise ValueError("Reconcile the pending cloud profile before confirming a local profile")
         candidate = db.execute("SELECT * FROM profile_versions WHERE id=?", (version_id,)).fetchone()
         if not candidate:
             raise ValueError(f"Unknown profile version: {version_id}")
@@ -102,16 +106,17 @@ def confirm_profile(db_path: Path, version_id: int, profile_file: Path) -> dict[
             return dict(candidate)
         if candidate["status"] not in {"draft", "superseded"}:
             raise ValueError("Only a draft or historical profile can be activated")
+        previous_content = profile_file.read_bytes().decode("utf-8") if profile_file.exists() else None
         _atomic_write(profile_file, candidate["content"])
         try:
-            with db:
-                db.execute("UPDATE profile_versions SET status='superseded' WHERE status='active'")
-                db.execute("UPDATE profile_versions SET status='active',confirmed_at=? WHERE id=?", (utc_now(), version_id))
-                db.execute(
-                    """UPDATE profile_review_runs SET status='accepted',updated_at=?
-                    WHERE profile_version_id=? AND status='suggested'""",
-                    (utc_now(), version_id),
-                )
+            db.execute("UPDATE profile_versions SET status='superseded' WHERE status='active'")
+            db.execute("UPDATE profile_versions SET status='active',confirmed_at=? WHERE id=?", (utc_now(), version_id))
+            db.execute(
+                """UPDATE profile_review_runs SET status='accepted',updated_at=?
+                WHERE profile_version_id=? AND status='suggested'""",
+                (utc_now(), version_id),
+            )
+            db.commit()
         except Exception:
             if previous_content is None:
                 profile_file.unlink(missing_ok=True)
@@ -120,6 +125,8 @@ def confirm_profile(db_path: Path, version_id: int, profile_file: Path) -> dict[
             raise
         return dict(db.execute("SELECT * FROM profile_versions WHERE id=?", (version_id,)).fetchone())
     finally:
+        if db.in_transaction:
+            db.rollback()
         db.close()
 
 
