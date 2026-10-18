@@ -4,7 +4,6 @@
 {% block content %}
 <header class="page-head hero-head">
   <div><p class="kicker">DAILY SIGNAL · 今日信号</p><h1>今日推荐</h1><p>最近推荐更新：{{ freshness.last_import }}（{{ display_timezone }}）</p></div>
-  <div class="run-badge {{ latest_run.status if freshness.is_today and latest_run else 'unknown' }}"><span></span>{% if freshness.is_today and latest_run %}{{ '推荐已更新 · 部分来源待重试' if latest_run.status == 'partial' else latest_run.status|status_label }}{% else %}今日待更新{% endif %}</div>
 </header>
 <section class="metric-grid" aria-label="概览">
   <div><strong>{{ papers|length }}</strong><span>今日入选</span></div>
@@ -16,7 +15,7 @@
 <section class="section-head"><div><p class="kicker">CURATED TODAY</p><h2>本次入选</h2></div><a href="/library">查看完整文献库 →</a></section>
 <div class="paper-list" data-today-list>
   {% for paper in papers %}{{ paper_card(paper, '/') }}
-  {% else %}<div class="empty"><strong>{{ '本轮暂无新的入选论文' if freshness.is_today else '今天尚未完成更新' }}</strong><p>{% if freshness.is_today %}本轮评分没有论文达到推荐阈值，可以继续浏览历史推荐。{% else %}下方显示历史推荐。{% if freshness.pending_collection %}已有采集结果尚未完成评分导入。{% else %}本地定时任务需要电脑开机且 Codex 保持运行。{% endif %}{% endif %}</p><a class="button" href="/status">查看更新与检查</a></div>{% endfor %}
+  {% else %}<div class="empty"><strong>{{ '本轮暂无新的入选论文' if freshness.is_today else '今天尚未完成更新' }}</strong><p>{% if freshness.is_today %}本轮评分没有论文达到推荐阈值，可以继续浏览历史推荐。{% else %}下方显示历史推荐。{% if freshness.pending_collection %}已有采集结果尚未完成评分导入。{% else %}本地定时任务需要电脑开机且 Codex 保持运行。{% endif %}{% endif %}</p><a class="button" href="/?center=checks">查看更新与检查</a></div>{% endfor %}
 </div>
 <section id="history" class="historical-recommendations" aria-labelledby="history-heading">
   <div class="section-head"><div><p class="kicker">PAST SIGNALS</p><h2 id="history-heading">{{ '昨日推荐' if history_date == yesterday else '历史推荐' }}</h2><p>{{ history_date }} · {{ history_papers|length }} 篇 · {{ display_timezone }}</p></div><a href="/library">查看完整文献库 →</a></div>

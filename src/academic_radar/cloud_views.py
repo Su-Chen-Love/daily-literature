@@ -270,7 +270,7 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     summary = "当前：" + "；".join(situations) + "。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
     # A portable task is actionable from either page without publishing machine paths.
     prompt = "\n\n".join([
-        "请更新个人学术助手。使用本项目已配置的本地数据库和已确认研究兴趣，不使用独立模型 API。",
+        "请更新每日文献。使用本项目已配置的本地数据库和已确认研究兴趣，不使用独立模型 API。",
         "当前诊断：" + "；".join(situations) + "。",
         "先同步并合并云端反馈；采集所有已配置来源最近14天数据，核验已出版的最新两期，补全可追溯的原始摘要。官网或接口失败时保留已有数据并说明真实限制。",
         "结合完整研究兴趣与累计反馈检查画像是否需要建议；只有本人确认才能启用新画像。仅导出从未由 Codex 判断过的新文献，逐篇按当前标准判断并原子导入，每篇恰好一条结果。已有判断不因画像、反馈、摘要或量表更新自动重评；没有新文献时导入完整的空队列。",
@@ -280,6 +280,7 @@ def _status(db: sqlite3.Connection, config: dict, quality: dict,
     return {"db_state": db_state, "quality": quality, "recommendation_quality": metrics,
             "checks": needed, "all_checks": checks, "healthy_count": len(checks) - len(needed),
             "pending_screening": pending, "update_summary": summary, "update_prompt": prompt,
+            "local_checked_at": (_row(db, "SELECT value FROM meta WHERE key='last_local_check'") or {}).get("value"),
             **_run_records(db)}
 
 

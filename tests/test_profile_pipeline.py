@@ -100,7 +100,7 @@ class ProfilePipelineTests(unittest.TestCase):
             queue = self.export()
         self.assertEqual(queue['profile_hash'], digest('New interests'))
         self.assertEqual(queue['profile_content'], 'New interests')
-        self.assertEqual(queue['threshold'], .85)
+        self.assertEqual(queue['threshold'], .7)
         self.assertEqual(queue['screening_instructions'], 'Require mechanism evidence.')
         self.assertEqual(queue['screening_preferences_version'], 1)
         self.assertEqual([row['identity'] for row in queue['papers']], [paper.identity])

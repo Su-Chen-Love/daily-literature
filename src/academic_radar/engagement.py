@@ -116,6 +116,9 @@ def confirm_profile(db_path: Path, version_id: int, profile_file: Path) -> dict[
                 WHERE profile_version_id=? AND status='suggested'""",
                 (utc_now(), version_id),
             )
+            if candidate["source"] == "web-single":
+                db.execute("INSERT INTO meta(key,value) VALUES('cloud_screening_preferences',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           (json.dumps({"relevance_threshold": 0.7, "instructions": ""}),))
             db.commit()
         except Exception:
             if previous_content is None:
@@ -293,8 +296,6 @@ def set_feedback(
         raise ValueError(f"Invalid interest value: {interest}")
     if reading_status not in READING_VALUES:
         raise ValueError(f"Invalid reading status: {reading_status}")
-    if interest is not None and not reason.strip():
-        raise ValueError("A reason is required for interested/not interested feedback")
     upgrade_database(db_path)
     db = connect(db_path)
     try:

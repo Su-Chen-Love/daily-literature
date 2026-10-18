@@ -77,8 +77,6 @@ def apply_remote_feedback(db: sqlite3.Connection, events: list[dict], cursor: in
             if type(event.get("favorite")) is not int or event["favorite"] not in (0, 1):
                 raise ValueError("Invalid cloud favorite")
             reason = str(event.get("reason") or "").strip() or None
-            if event.get("interest") and not reason:
-                raise ValueError("Cloud preference requires a reason")
             stamp = event["updated_at"]
             if not isinstance(stamp, str):
                 raise ValueError("Invalid cloud feedback timestamp")
@@ -108,7 +106,7 @@ def snapshot_records(db_path: Path, config: dict) -> list[dict]:
     try:
         db.execute("BEGIN")
         preferences = screening_preferences(db, config)
-        config = {**config, "relevance_threshold": preferences["relevance_threshold"],
+        config = {**config, "relevance_threshold": 0.7,
                   "screening_instructions": preferences["instructions"]}
         profile = db.execute("SELECT content,profile_hash,confirmed_at FROM profile_versions WHERE status='active'").fetchone()
         scores = latest_scores_sql()

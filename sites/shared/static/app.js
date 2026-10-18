@@ -2,8 +2,8 @@
   "use strict";
   const appearanceKey = "daily-literature.appearance.v1";
   const normalizeAppearance = (value) => ({
-    font: value?.font === "serif" ? "serif" : "system",
-    theme: value?.theme === "paper" ? "paper" : "sage",
+    font: ["system","serif","humanist","mono"].includes(value?.font) ? value.font : "system",
+    theme: ["sage","paper","sand","mist"].includes(value?.theme) ? value.theme : "sage",
   });
   const readAppearance = () => {
     try { return normalizeAppearance(JSON.parse(localStorage.getItem(appearanceKey))); }
@@ -38,7 +38,7 @@
     return data;
   };
 
-  const appearanceDialog = document.getElementById("appearance-dialog");
+  const appearanceDialog = document.getElementById("personal-center");
   const showAppearance = (value) => {
     const preferences = applyAppearance(value);
     appearanceDialog?.querySelectorAll('input[name="appearance-font"], input[name="appearance-theme"]').forEach((input) => {
@@ -58,7 +58,7 @@
     }
   };
   showAppearance(readAppearance());
-  document.querySelector("[data-open-appearance]")?.addEventListener("click", () => appearanceDialog?.showModal());
+
   appearanceDialog?.addEventListener("change", (event) => {
     if (!event.target.matches('input[name="appearance-font"], input[name="appearance-theme"]')) return;
     saveAppearance({font: appearanceDialog.querySelector('input[name="appearance-font"]:checked')?.value,
@@ -67,6 +67,81 @@
   document.querySelector("[data-reset-appearance]")?.addEventListener("click", () => saveAppearance(null));
   window.addEventListener("storage", (event) => { if (event.key === appearanceKey) showAppearance(readAppearance()); });
 
+  const center = document.getElementById('personal-center');
+  const personalKey = 'daily-literature.personal.v1';
+  const normalizePersonal = value => ({name:typeof value?.name==='string'?value.name.slice(0,40):'',tagline:typeof value?.tagline==='string'?value.tagline.slice(0,80):'',avatar:typeof value?.avatar==='string'&&value.avatar.length<=400000&&/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(value.avatar)?value.avatar:''});
+  const readPersonal = () => {try{return normalizePersonal(JSON.parse(localStorage.getItem(personalKey)))}catch(_){return normalizePersonal(null)}};
+  const paintAvatar = (element, value) => {
+    if(!element)return; element.replaceChildren();
+    if(value.avatar){const image=document.createElement('img');image.src=value.avatar;image.alt='';element.append(image)}
+    else element.textContent=Array.from(value.name)[0]||'文';
+  };
+  const renderPersonal = value => {
+    document.querySelectorAll('[data-personal-avatar]').forEach(el=>paintAvatar(el,value));
+    document.querySelectorAll('[data-personal-name]').forEach(el=>el.textContent=value.name||'个人中心');
+  };
+  let avatarRead=0;
+  let draftPersonal=readPersonal();renderPersonal(draftPersonal);
+  const personalForm=center?.querySelector('[data-personal-form]');
+  const resetPersonalForm=()=>{avatarRead++;draftPersonal=readPersonal();if(!personalForm)return;personalForm.elements.display_name.value=draftPersonal.name;personalForm.elements.tagline.value=draftPersonal.tagline;personalForm.querySelector('[type="submit"]').disabled=false;paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);center.querySelector('[data-personal-status]').textContent='';};
+  resetPersonalForm();
+  personalForm?.elements.display_name.addEventListener('input',()=>paintAvatar(center.querySelector('[data-avatar-preview]'),{...draftPersonal,name:personalForm.elements.display_name.value}));
+  personalForm?.addEventListener('submit',event=>{
+    event.preventDefault(); const status=center.querySelector('[data-personal-status]');
+    const value=normalizePersonal({...draftPersonal,name:personalForm.elements.display_name.value.trim(),tagline:personalForm.elements.tagline.value.trim()});
+    try{localStorage.setItem(personalKey,JSON.stringify(value));draftPersonal=value;renderPersonal(value);status.textContent='已保存到此浏览器'}catch(_){status.textContent='无法保存，请检查浏览器存储后重试';}
+  });
+  center?.querySelector('[data-avatar-file]')?.addEventListener('change',async event=>{
+    const file=event.target.files?.[0],status=center.querySelector('[data-personal-status]'),token=++avatarRead;if(!file)return;
+    const saveButton=personalForm.querySelector('[type="submit"]');saveButton.disabled=true;
+    try{
+      if(!['image/png','image/jpeg','image/webp'].includes(file.type)||file.size>3*1024*1024)throw Error('请选择不超过 3MB 的 PNG、JPEG 或 WebP 图片');
+      const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(Error('图片读取失败'));reader.readAsDataURL(file)});
+      const image=new Image();image.src=data;await image.decode();if(token!==avatarRead)return;
+      const canvas=document.createElement('canvas');canvas.width=canvas.height=160;
+      const scale=Math.max(160/image.width,160/image.height);canvas.getContext('2d').drawImage(image,(160-image.width*scale)/2,(160-image.height*scale)/2,image.width*scale,image.height*scale);
+      draftPersonal={...draftPersonal,avatar:canvas.toDataURL('image/png')};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);status.textContent='头像已预览，保存后生效';
+    }catch(error){if(token===avatarRead)status.textContent=error.message}finally{event.target.value='';if(token===avatarRead)saveButton.disabled=false}
+  });
+  center?.querySelector('[data-avatar-clear]')?.addEventListener('click',()=>{avatarRead++;personalForm.querySelector('[type="submit"]').disabled=false;draftPersonal={...draftPersonal,avatar:''};paintAvatar(center.querySelector('[data-avatar-preview]'),draftPersonal);center.querySelector('[data-personal-status]').textContent='保存后移除头像'});
+  const formatTime=value=>{if(!value)return '尚无记录';const date=new Date(value);return Number.isFinite(date.getTime())?new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(date):'尚无记录'};
+  const setTime=(selector,value)=>{const el=document.querySelector(selector);if(el){el.textContent=formatTime(value);el.title=value||''}};
+  const showSync = status => {
+    let state=status.status==='failed'?'failed':status.running?'running':status.pending?'pending':status.status==='disabled'?'disabled':status.synced_at?'succeeded':'unknown';
+    const label=state==='failed'?'同步失败':state==='running'?'正在同步':state==='pending'?'等待本地接收':state==='succeeded'?'最近同步成功':state==='disabled'?'未配置同步':'同步状态尚未确认';
+    document.querySelectorAll('[data-sync-indicator]').forEach(el=>{el.dataset.syncState=state;el.setAttribute('aria-label',label+'，打开同步与检查');el.title=label+(status.synced_at?' · '+formatTime(status.synced_at):'');});
+    const mark=document.querySelector('[data-cloud-state-mark]');if(mark)mark.setAttribute('d',state==='succeeded'?'m9 14 2 2 4-4':state==='failed'?'m10 12 4 4m0-4-4 4':'M9 14h6');
+    document.querySelectorAll('[data-sync-message]').forEach(el=>el.textContent=status.message||label);
+    setTime('[data-center-sync-time]',status.synced_at||status.remote_synced_at);
+  };
+  let checkRequest=0;
+  const refreshChecks=async()=>{
+    const token=++checkRequest,button=center?.querySelector('[data-refresh-checks]'),error=center?.querySelector('[data-center-error]');if(button)button.disabled=true;if(error)error.hidden=true;
+    try{const data=await api('/api/center/status');if(token!==checkRequest)return;
+      const content=center.querySelector('[data-center-checks-content]');content.innerHTML=data.html;
+      setTime('[data-center-local-time]',data.local_checked_at);setTime('[data-center-import-time]',data.last_import);showSync(data.sync);
+    }catch(e){if(error){error.textContent='检查暂时无法读取，可稍后重试。';error.hidden=false}}
+    finally{if(button)button.disabled=false}
+  };
+  const selectCenterTab=name=>{
+    if(!['profile','appearance','checks'].includes(name))name='profile';
+    center?.querySelectorAll('[data-center-tab]').forEach(el=>{const active=el.dataset.centerTab===name;el.setAttribute('aria-selected',String(active));el.tabIndex=active?0:-1});
+    center?.querySelectorAll('[data-center-panel]').forEach(el=>el.hidden=el.dataset.centerPanel!==name);
+    if(name==='checks')refreshChecks();
+  };
+  const openCenter=name=>{if(!center)return;resetPersonalForm();selectCenterTab(name);if(!center.open)center.showModal();};
+  document.querySelectorAll('[data-open-center]').forEach(el=>el.addEventListener('click',()=>openCenter(el.dataset.openCenter)));
+  center?.querySelectorAll('[data-center-tab]').forEach(el=>el.addEventListener('click',()=>selectCenterTab(el.dataset.centerTab)));
+  center?.querySelector('.center-tabs')?.addEventListener('keydown',event=>{
+    if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End'].includes(event.key)||!event.target.matches('[role="tab"]'))return;
+    event.preventDefault();const tabs=[...center.querySelectorAll('[role="tab"]')],index=tabs.indexOf(event.target),next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(['ArrowDown','ArrowRight'].includes(event.key)?1:-1)+tabs.length)%tabs.length;selectCenterTab(tabs[next].dataset.centerTab);tabs[next].focus();
+  });
+  center?.querySelector('[data-refresh-checks]')?.addEventListener('click',refreshChecks);
+  const requestedCenter=new URL(location.href).searchParams.get('center');
+  if(['profile','appearance','checks'].includes(requestedCenter))openCenter(requestedCenter);
+  api('/api/sync/status').then(showSync).catch(()=>showSync({status:'unknown',message:'暂时无法读取同步状态'}));
+  window.addEventListener('storage',event=>{if(event.key===personalKey){renderPersonal(readPersonal());if(!center?.open)resetPersonalForm();}});
+
   document.querySelectorAll("[data-sync-now]").forEach(button => button.addEventListener("click", async () => {
     button.disabled = true;
     const label = document.querySelector("[data-sync-message]");
@@ -74,16 +149,17 @@
       const result = await api("/api/sync", {method: "POST", body: "{}"});
       if (label) label.textContent = result.message;
       announce(result.message);
+      showSync({pending:result.status!=='disabled',status:result.status,message:result.message});
       let attempts = 0;
       const poll = async () => {
         try {
           const status = await api("/api/sync/status");
-          if (label) label.textContent = status.message;
+          showSync(status);
           if (status.pending && ++attempts < 100) setTimeout(poll, 3500);
         } catch (_) { /* Saved requests remain queued during a network interruption. */ }
       };
       setTimeout(poll, 2000);
-    } catch (error) { announce(error.message, true); }
+    } catch (error) { showSync({status:"failed",message:"同步请求未发出，请稍后重试。"}); announce(error.message, true); }
     finally { button.disabled = false; }
   }));
 
@@ -380,10 +456,11 @@
     }));
   }
 
-  document.querySelector("[data-copy-update]")?.addEventListener("click", async () => {
+  document.addEventListener("click", async event => {
+    if(!event.target.closest("[data-copy-update]"))return;
     const text = document.querySelector("[data-copy-target]")?.value || "";
     try { await navigator.clipboard.writeText(text); announce("更新任务已复制，发送给 Codex 即可执行"); }
-    catch (_) { announce("无法访问剪贴板，请手动复制", true); }
+    catch (_) { const target=document.querySelector("[data-copy-target]");if(target){target.hidden=false;target.setAttribute("aria-label","更新任务");target.focus();target.select();}announce("已显示更新任务，请手动复制", true); }
   });
   };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", onReady, {once: true});

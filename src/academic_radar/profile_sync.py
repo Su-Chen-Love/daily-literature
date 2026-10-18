@@ -42,14 +42,14 @@ def screening_preferences(db, config: dict) -> dict:
 
 def effective_config(config: dict, db_path: Path) -> dict:
     """Return a copy with only the explicitly allowed future-screening settings."""
-    result = dict(config)
+    result = {**config, "relevance_threshold": 0.7}
     if not db_path.exists():
         return result
     db = connect(db_path)
     try:
         prefs = screening_preferences(db, config)
         cursor = db.execute("SELECT value FROM meta WHERE key='cloud_profile_cursor'").fetchone()
-        result.update(relevance_threshold=prefs["relevance_threshold"],
+        result.update(relevance_threshold=0.7,
                       screening_instructions=prefs["instructions"],
                       screening_preferences_version=int(cursor[0]) if cursor else 0)
         return result
@@ -166,3 +166,11 @@ def reconcile_profile_file(db_path: Path, profile_path: Path) -> bool:
         return _reconcile_profile_file(db, profile_path)
     finally:
         db.close()
+
+
+def unified_profile_text(content: str, instructions: str) -> str:
+    """Surface legacy preference text in the one owner-editable profile."""
+    extra = instructions.strip()
+    if not extra or extra in content:
+        return content
+    return content.rstrip() + "\n\n## 补充筛选偏好\n\n" + extra

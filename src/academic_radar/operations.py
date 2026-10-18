@@ -182,7 +182,7 @@ def web_service_status(config_path: Path | None = None, port: int = 8765) -> dic
 
 def verify_installation(config_path: Path) -> dict[str, Any]:
     config_path = config_path.expanduser().resolve()
-    config = _load_config(config_path)
+    config = {**_load_config(config_path), "relevance_threshold": 0.7}
     state = _state_for_config(config_path)
     db_path = state / "papers.sqlite3"
     upgrade_database(db_path)

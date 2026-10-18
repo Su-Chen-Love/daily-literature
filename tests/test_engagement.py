@@ -35,25 +35,25 @@ class EngagementTests(unittest.TestCase):
             )
         db.close()
 
-    def test_feedback_requires_reason_and_keeps_audit_history(self):
+    def test_feedback_optional_reason_and_keeps_audit_history(self):
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "papers.sqlite3"
             self.add_paper(db_path)
-            with self.assertRaisesRegex(ValueError, "reason"):
-                set_feedback(db_path, "doi:10.1/example", "interested", "", False, "unread")
+            empty = set_feedback(db_path, "doi:10.1/example", "interested", "", False, "unread")
+            self.assertIsNone(empty["reason"])
             set_feedback(db_path, "doi:10.1/example", "interested", "Transfers directly", True, "read_later")
             set_feedback(db_path, "doi:10.1/example", "not_interested", "Wrong empirical setting", False, "read")
             examples = feedback_examples(db_path)
             self.assertEqual(examples[0]["interest"], "not_interested")
             db = connect(db_path)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 3)
             self.assertEqual(db.execute("SELECT needs_rescreen FROM papers").fetchone()[0], 1)
             db.execute("UPDATE papers SET needs_rescreen=0")
             db.commit()
             db.close()
             set_feedback(db_path, "doi:10.1/example", "not_interested", "Wrong empirical setting", True, "read")
             db = connect(db_path)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0], 3)
             self.assertEqual(db.execute("SELECT needs_rescreen FROM papers").fetchone()[0], 0)
             db.close()
 

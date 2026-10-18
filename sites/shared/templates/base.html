@@ -9,8 +9,8 @@
   <link rel="icon" type="image/svg+xml" sizes="any" href="{{ url_for('static', path='/images/daily-literature-logo.svg') }}?v=brand01">
   <link rel="icon" type="image/png" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
   <link rel="apple-touch-icon" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=daily-20261018">
-  <script src="{{ url_for('static', path='/app.js') }}?v=daily-20261018"></script>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=center-20261018">
+  <script src="{{ url_for('static', path='/app.js') }}?v=center-20261018"></script>
 </head>
 <body>
   <a href="#main-content" class="skip-link">跳到正文</a>
@@ -20,41 +20,61 @@
       <strong>每日文献</strong>
     </a>
     <nav aria-label="主导航">
-      <a class="{{ 'active' if page == 'today' }}" {% if page == 'today' %}aria-current="page"{% endif %} href="/"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2 1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7L12 2Z"/></svg><span class="nav-label">今日推荐</span></a>
-      <a class="{{ 'active' if page == 'library' }}" {% if page == 'library' %}aria-current="page"{% endif %} href="/library"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.8A2.8 2.8 0 0 1 6.8 2H20v17.5H6.8A2.8 2.8 0 0 0 4 22V4.8Zm2.8-.8a.8.8 0 0 0 0 1.6H18V4H6.8ZM6.8 18H18V7.6H6.8a2.8 2.8 0 0 0 0 5.6H18"/></svg><span class="nav-label">我的文献</span></a>
-      <a class="{{ 'active' if page == 'sources' }}" {% if page == 'sources' %}aria-current="page"{% endif %} href="/sources"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h10v2H4v-2Zm0 5h16v2H4v-2Zm12-6 4 2-4 2v-4Z"/></svg><span class="nav-label">监测来源</span></a>
-      <a class="{{ 'active' if page == 'profile' }}" {% if page == 'profile' %}aria-current="page"{% endif %} href="/profile"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9Zm-8 9c0-4.1 3.6-7 8-7s8 2.9 8 7H4Z"/></svg><span class="nav-label">研究兴趣</span></a>
-      <a class="{{ 'active' if page == 'feedback' }}" {% if page == 'feedback' %}aria-current="page"{% endif %} href="/feedback"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h16v13H8l-4 4V3Zm4 5h8v2H8V8Zm0 4h5v2H8v-2Z"/></svg><span class="nav-label">偏好反馈</span></a>
-      <a class="{{ 'active' if page == 'status' }}" {% if page == 'status' %}aria-current="page"{% endif %} href="/status"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18.5 8.5A7 7 0 1 0 19 15h-2.2A5 5 0 1 1 16.8 10H13V8h8v8h-2V8.5h-.5Z"/></svg><span class="nav-label">更新与检查</span></a>
+      <a class="{{ 'active' if page == 'today' }}" {% if page == 'today' %}aria-current="page"{% endif %} href="/"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2 6 6 3-6 2-2 7-2-7-6-2 6-3 2-6Z"/></svg><span class="nav-label">今日推荐</span></a>
+      <a class="{{ 'active' if page == 'library' }}" {% if page == 'library' %}aria-current="page"{% endif %} href="/library"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3h14v18H5V3Zm3 4h8M8 11h8M8 15h5"/></svg><span class="nav-label">我的文献</span></a>
+      <a class="{{ 'active' if page == 'sources' }}" {% if page == 'sources' %}aria-current="page"{% endif %} href="/sources"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h12M4 18h16"/></svg><span class="nav-label">监测来源</span></a>
+      <a class="{{ 'active' if page == 'profile' }}" {% if page == 'profile' %}aria-current="page"{% endif %} href="/profile"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 9a7 7 0 0 1 14 0"/></svg><span class="nav-label">研究兴趣</span></a>
+      <a class="{{ 'active' if page == 'feedback' }}" {% if page == 'feedback' %}aria-current="page"{% endif %} href="/feedback"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4V4Zm4 4h8m-8 4h5"/></svg><span class="nav-label">偏好反馈</span></a>
     </nav>
-    <button type="button" class="secondary appearance-trigger" data-open-appearance aria-haspopup="dialog" aria-controls="appearance-dialog">显示设置</button>
-    <div class="sidebar-foot">
-      <span class="pulse"></span> {{ '云端共享数据' if site_mode == 'cloud' else '本地数据' }}
-      {% if cloud_url %}
-      <small><a href="{{ cloud_url }}" target="_blank" rel="noopener noreferrer">打开云端站点</a></small>
-      <small>{% if cloud_sync_status.status in ['succeeded','unchanged'] %}云端同步：{{ cloud_sync_status.synced_at|human_time }}{% elif cloud_sync_status.status == 'failed' %}云端同步失败，等待重试{% else %}云端等待同步{% endif %}</small>
-      {% endif %}
-      <button type="button" class="secondary sync-now" data-sync-now>同步更新</button>
-      <small data-sync-message aria-live="polite">兴趣与反馈双向同步</small>
+    <div class="account-entry">
+      <button type="button" class="cloud-state" data-open-center="checks" data-sync-indicator data-sync-state="unknown" aria-label="同步状态尚未检查，打开个人中心"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18a4 4 0 0 1-1-7.9 6.5 6.5 0 0 1 12.5-1.6A4.8 4.8 0 0 1 18 18H6Z"/><path data-cloud-state-mark d="M9 14h6"/></svg></button>
+      <button type="button" class="personal-trigger" data-open-center="profile" aria-haspopup="dialog" aria-controls="personal-center">
+        <span class="personal-avatar" data-personal-avatar aria-hidden="true">文</span><span><strong data-personal-name>个人中心</strong><small>资料与设置</small></span><span aria-hidden="true">⌃</span>
+      </button>
     </div>
   </aside>
   <main id="main-content" tabindex="-1">
     {% block content %}{% endblock %}
   </main>
-  <dialog id="appearance-dialog" class="modal appearance-settings" aria-labelledby="appearance-title">
-    <div class="modal-form">
-      <header class="panel-head"><h2 id="appearance-title">显示设置</h2><button type="button" class="icon-button" data-close-dialog aria-label="关闭显示设置">×</button></header>
-      <fieldset class="preference-fieldset"><legend>字体</legend><div class="preference-grid">
-        <label class="preference-option"><input type="radio" name="appearance-font" value="system"><span><strong>系统无衬线</strong><span class="font-preview" data-font-preview="system">每日文献 Aa 012</span></span></label>
-        <label class="preference-option"><input type="radio" name="appearance-font" value="serif"><span><strong>阅读衬线</strong><span class="font-preview" data-font-preview="serif">每日文献 Aa 012</span></span></label>
-      </div></fieldset>
-      <fieldset class="preference-fieldset"><legend>界面</legend><div class="preference-grid">
-        <label class="preference-option"><input type="radio" name="appearance-theme" value="sage"><span><strong>浅鼠尾草</strong><span class="theme-preview" data-theme-preview="sage" aria-hidden="true"></span></span></label>
-        <label class="preference-option"><input type="radio" name="appearance-theme" value="paper"><span><strong>纸白</strong><span class="theme-preview" data-theme-preview="paper" aria-hidden="true"></span></span></label>
-      </div></fieldset>
-      <p class="muted" data-appearance-status role="status">保存在此浏览器</p>
-      <div class="dialog-actions"><button type="button" class="secondary" data-reset-appearance>恢复默认</button><button type="button" data-close-dialog>完成</button></div>
-    </div>
+  <dialog id="personal-center" class="modal personal-center" aria-labelledby="center-title">
+    <header class="center-header"><h2 id="center-title">个人中心</h2><button type="button" class="icon-button" data-close-dialog aria-label="关闭个人中心">×</button></header>
+    <div class="center-layout"><nav class="center-tabs" role="tablist" aria-label="个人中心栏目">
+      <button type="button" role="tab" aria-selected="true" aria-controls="center-profile" id="center-tab-profile" data-center-tab="profile">个人资料</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="center-appearance" id="center-tab-appearance" data-center-tab="appearance">显示设置</button>
+      <button type="button" role="tab" aria-selected="false" aria-controls="center-checks" id="center-tab-checks" data-center-tab="checks">同步与检查</button>
+      <a href="/profile">研究兴趣 ↗</a>
+    </nav><div class="center-content">
+      <section id="center-profile" role="tabpanel" aria-labelledby="center-tab-profile" data-center-panel="profile">
+        <form data-personal-form class="personal-form">
+          <div class="avatar-editor"><span class="personal-avatar avatar-preview" data-avatar-preview aria-hidden="true">文</span><label class="button secondary">选择头像<input type="file" accept="image/png,image/jpeg,image/webp" data-avatar-file class="sr-only"></label><button type="button" class="text-button" data-avatar-clear>移除头像</button></div>
+          <label>称呼<input name="display_name" maxlength="40" autocomplete="off" placeholder="你的称呼"></label>
+          <label>简介（选填）<input name="tagline" maxlength="80" autocomplete="off" placeholder="研究方向或所属机构"></label>
+          <p class="muted">仅用于此浏览器中的每日文献。</p><p data-personal-status role="status" class="muted"></p><button type="submit">保存个人资料</button>
+        </form>
+      </section>
+      <section id="center-appearance" role="tabpanel" aria-labelledby="center-tab-appearance" data-center-panel="appearance" hidden>
+        <fieldset class="preference-fieldset"><legend>字体</legend><div class="preference-grid">
+          <label class="preference-option"><input type="radio" name="appearance-font" value="system"><span><strong>系统无衬线</strong><span class="font-preview" data-font-preview="system">每日文献 Aa 012</span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-font" value="serif"><span><strong>阅读衬线</strong><span class="font-preview" data-font-preview="serif">每日文献 Aa 012</span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-font" value="humanist"><span><strong>人文无衬线</strong><span class="font-preview" data-font-preview="humanist">每日文献 Aa 012</span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-font" value="mono"><span><strong>等宽字体</strong><span class="font-preview" data-font-preview="mono">每日文献 Aa 012</span></span></label>
+        </div></fieldset>
+        <fieldset class="preference-fieldset"><legend>界面</legend><div class="preference-grid">
+          <label class="preference-option"><input type="radio" name="appearance-theme" value="sage"><span><strong>浅鼠尾草</strong><span class="theme-preview" data-theme-preview="sage" aria-hidden="true"></span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-theme" value="paper"><span><strong>纸白</strong><span class="theme-preview" data-theme-preview="paper" aria-hidden="true"></span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-theme" value="sand"><span><strong>暖沙</strong><span class="theme-preview" data-theme-preview="sand" aria-hidden="true"></span></span></label>
+          <label class="preference-option"><input type="radio" name="appearance-theme" value="mist"><span><strong>雾蓝</strong><span class="theme-preview" data-theme-preview="mist" aria-hidden="true"></span></span></label>
+        </div></fieldset>
+        <p class="muted" data-appearance-status role="status">保存在此浏览器</p><button type="button" class="secondary" data-reset-appearance>恢复默认</button>
+      </section>
+      <section id="center-checks" role="tabpanel" aria-labelledby="center-tab-checks" data-center-panel="checks" hidden>
+        <h3>同步与更新</h3><p data-sync-message role="status">尚未检查同步状态</p>
+        <dl class="center-times"><div><dt>云端同步</dt><dd data-center-sync-time>尚无记录</dd></div><div><dt>本机检查</dt><dd data-center-local-time>尚无记录</dd></div><div><dt>最近推荐更新</dt><dd data-center-import-time>尚无记录</dd></div></dl>
+        <div class="center-actions"><button type="button" data-sync-now>同步更新</button><button type="button" class="secondary" data-refresh-checks>{{ '刷新状态' if site_mode == 'cloud' else '刷新检查' }}</button></div>
+        <p class="muted">同步只传回已保存的兴趣和反馈；采集与评分由本地每日任务完成。</p>
+        <p data-center-error role="alert" hidden></p><div data-center-checks-content></div>
+      </section>
+    </div></div>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>

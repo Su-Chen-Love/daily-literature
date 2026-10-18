@@ -52,7 +52,7 @@ class ProfileSyncTests(unittest.TestCase):
         self.assertEqual(self.active()['content'], event['content'])
         self.assertEqual(self.profile.read_bytes(), b'Original interests')
         effective = effective_config(self.config, self.path)
-        self.assertEqual(effective['relevance_threshold'], .85)
+        self.assertEqual(effective['relevance_threshold'], .7)
         self.assertEqual(effective['screening_instructions'], 'Prefer mechanism evidence.')
         self.assertEqual(effective['screening_preferences_version'], 1)
         self.assertEqual(self.config['relevance_threshold'], .7)

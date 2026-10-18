@@ -472,3 +472,55 @@ td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: t
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Personal center: desktop only, one persistent entry for settings and checks. */
+:root { --font-humanist: "Avenir Next", "Trebuchet MS", Verdana, "DejaVu Sans", "PingFang SC", sans-serif; }
+:root[data-font="humanist"] { --font-ui: var(--font-humanist); }
+:root[data-theme="sand"] { --paper:#faf6ef;--panel:#fffdfa;--panel-soft:#f6f0e7;--nav:#f2ebdf;--nav-active:#e8dfce;--line:#e6ddcf;--ink:#3c382e;--muted:#756d5e;--teal:#695739;--teal-hover:#53432b;--teal-soft:#eee5d6;--focus:#856c41; }
+:root[data-theme="mist"] { --paper:#f3f7f9;--panel:#fff;--panel-soft:#eef4f7;--nav:#e9f0f4;--nav-active:#d8e6ed;--line:#d7e2e8;--ink:#293d49;--muted:#617582;--teal:#365f73;--teal-hover:#284a5c;--teal-soft:#e1ecf2;--focus:#4d7e95; }
+[data-font-preview="humanist"] { font-family:var(--font-humanist); }
+[data-font-preview="mono"] { font-family:var(--font-mono); }
+[data-theme-preview="sand"] { background:linear-gradient(90deg,#f2ebdf 25%,#fffdfa 25%); }
+[data-theme-preview="mist"] { background:linear-gradient(90deg,#e9f0f4 25%,#fff 25%); }
+.account-entry { display:flex;align-items:center;gap:8px;margin-top:auto;padding-top:18px;border-top:1px solid var(--line); }
+.personal-trigger { display:flex;align-items:center;gap:10px;background:transparent;color:var(--ink);padding:8px 4px;flex:1;min-width:0;text-align:left;justify-content:flex-start; }
+.personal-trigger>span:nth-child(2) { flex:1;min-width:0; }
+.personal-trigger strong,.personal-trigger small { display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+.personal-trigger small { color:var(--muted);font-size:11px;margin-top:2px; }
+.personal-avatar { width:32px;height:32px;border-radius:50%;background:var(--teal-soft);color:var(--teal);display:inline-grid;place-items:center;flex:0 0 auto;overflow:hidden; }
+.personal-avatar img { width:100%;height:100%;object-fit:cover; }
+.cloud-state { background:transparent;color:var(--muted);padding:6px;min-width:28px; }
+.cloud-state[data-sync-state="succeeded"] { color:var(--teal); }
+.cloud-state[data-sync-state="failed"] { color:var(--red); }
+.cloud-state[data-sync-state="pending"],.cloud-state[data-sync-state="running"] { color:var(--amber); }
+.personal-center { width:min(980px,calc(100vw - 64px));max-width:980px;max-height:calc(100vh - 64px);padding:0;overflow:hidden; }
+.center-header { display:flex;align-items:center;justify-content:space-between;padding:20px 24px;border-bottom:1px solid var(--line); }
+.center-header h2 { margin:0;font-size:20px; }
+.center-layout { display:grid;grid-template-columns:160px minmax(0,1fr);min-height:410px; }
+.center-tabs { padding:18px 12px;display:flex;flex-direction:column;gap:6px;border-right:1px solid var(--line);background:var(--panel-soft); }
+.center-tabs button,.center-tabs a { background:transparent;color:var(--muted);text-align:left;justify-content:flex-start;padding:10px 12px;text-decoration:none; }
+.center-tabs button[aria-selected="true"] { color:var(--teal);background:var(--teal-soft); }
+.center-content { padding:24px;max-height:calc(100vh - 145px);overflow:auto;min-width:0; }
+.center-content h3 { margin-top:0; }
+.personal-form { display:grid;gap:18px; }
+.personal-form label { display:grid;gap:6px; }
+.personal-form button[type="submit"] { justify-self:start; }
+.avatar-editor { display:flex;align-items:center;gap:16px; }
+.avatar-preview { width:64px;height:64px;font-size:24px; }
+.avatar-editor .button { display:inline-flex; }
+.center-times { display:grid;gap:10px;margin:18px 0; }
+.center-times>div { display:grid;grid-template-columns:120px 1fr;gap:12px; }
+.center-times dt { color:var(--muted); }.center-times dd { margin:0; }
+.center-actions { display:flex;gap:10px;flex-wrap:wrap; }
+.center-content .metric-grid { grid-template-columns:repeat(3,minmax(0,1fr));margin:24px 0; }
+.center-content .metric-grid>div { padding:12px; }
+.center-content .metric-grid strong { font-size:20px; }
+.center-content .panel { padding:18px;margin-top:16px; }
+.center-content .panel-head h2 { font-size:17px; }
+.center-content .check-grid { grid-template-columns:1fr; }
+.feedback-panel { max-width:none;width:100%; }
+.paper-card .feedback-panel { width:auto; }
+
+.nav-icon { fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round; }
+
+[data-copy-target]:not([hidden]) { display:block;width:100%;min-height:160px;margin-top:16px; }

@@ -699,7 +699,7 @@ def screening_config(db: sqlite3.Connection, cfg: dict[str,Any]) -> dict[str,Any
     """Read preferences under the same write lock as the frozen profile."""
     effective=dict(cfg); preferences=screening_preferences(db,cfg)
     cursor=db.execute("SELECT value FROM meta WHERE key='cloud_profile_cursor'").fetchone()
-    effective.update(relevance_threshold=preferences["relevance_threshold"],
+    effective.update(relevance_threshold=0.7,
                      screening_instructions=preferences["instructions"],
                      screening_preferences_version=int(cursor[0]) if cursor else 0)
     return effective

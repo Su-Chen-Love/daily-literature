@@ -55,9 +55,9 @@ assert.equal((await request('/api/sync/status')).data.pending,false);
 assert.equal((await request('/api/sync/ack',{generation:nextGeneration,request_id:3,cursor:2},false,true)).status,400);
 console.log('Monotonic manual requests, generation-bound ACK, and later-request preservation passed.');
 
-for(const path of ['/','/library','/sources','/profile','/feedback','/status']) {
+for(const path of ['/','/library','/sources','/profile','/feedback']) {
  const response=await worker.fetch(new Request(origin+path),env);assert.equal(response.status,200,path);
- const html=await response.text();assert.ok(html.includes('class="sidebar"'));assert.ok(html.includes('/static/app.css?v=daily-20261018'));assert.ok(html.includes('data-sync-now'));assert.ok(!html.includes('signin-with-chatgpt'));
+ const html=await response.text();assert.ok(html.includes('class="sidebar"'));assert.ok(html.includes('/static/app.css?v=center-20261018'));assert.ok(html.includes('data-sync-now'));assert.ok(html.includes('personal-center'));assert.ok(!html.includes('href="/status"'));assert.ok(!html.includes('signin-with-chatgpt'));
 }
 const style=await worker.fetch(new Request(origin+'/static/app.css'),env);assert.equal(await style.text(),readFileSync(new URL('../shared/static/app.css',import.meta.url),'utf8'));
 console.log('All six anonymous shared-template pages and exact shared stylesheet passed.');
@@ -76,7 +76,7 @@ try {
 console.log('Partial-feedback preservation and same-millisecond monotonic edits passed.');
 
 const oldDate=Date;globalThis.Date=class extends oldDate{constructor(...args){super(...(args.length?args:['2026-01-02T01:00:00Z']));}static now(){return oldDate.parse('2026-01-02T01:00:00Z');}};
-try{const response=await worker.fetch(new Request(origin+'/'),env),html=await response.text();assert.ok(html.includes('今日待更新'));assert.ok(html.includes('今天尚未完成更新'));assert.ok(html.includes('value="2026-01-01"'));assert.ok(!html.includes('推荐已更新'))}finally{globalThis.Date=oldDate;}
+try{const response=await worker.fetch(new Request(origin+'/'),env),html=await response.text();assert.ok(html.includes('今天尚未完成更新'));assert.ok(html.includes('value="2026-01-01"'));assert.ok(!html.includes('推荐已更新'))}finally{globalThis.Date=oldDate;}
 console.log('Offline cross-midnight Today freshness and yesterday date passed.');
 
 await import('./test-profile-ui.mjs');
@@ -93,3 +93,5 @@ const brandSvg=await worker.fetch(new Request(origin+'/static/images/daily-liter
 assert.equal(brandSvg.status,200);assert.ok(brandSvg.headers.get('Content-Type').includes('image/svg+xml'));
 assert.equal(await brandSvg.text(),readFileSync(new URL('../shared/static/images/daily-literature-logo.svg',import.meta.url),'utf8'));
 console.log('Approved brand SVG is embedded and served byte-for-byte.');
+
+await import('./test-personal-center.mjs');

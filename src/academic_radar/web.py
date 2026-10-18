@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .profile_sync import screening_preferences, unified_profile_text
 from .cloud_sync import background_sync, background_sync_state
 from .engagement import (
     clear_feedback,
@@ -74,7 +75,7 @@ def monitor_runner_path(state: Path) -> Path:
 
 def load_config(path: Path) -> dict[str, Any]:
     with path.expanduser().open("rb") as handle:
-        return tomllib.load(handle)
+        return {**tomllib.load(handle), "relevance_threshold": 0.7}
 
 
 def resolve_state(config_path: Path, config: dict[str, Any]) -> Path:
@@ -295,7 +296,7 @@ def create_app(config_path: Path) -> FastAPI:
         "abandoned": "已放弃", "rejected": "已拒绝", "healthy": "健康",
         "degraded": "降级", "unknown": "尚无记录", "ok": "成功",
         "eligible": "符合收录范围", "excluded": "已排除", "quarantine": "待核查",
-        "queued": "等待中",
+        "queued": "等待中", "no_change": "无需调整", "suggested": "已有建议", "accepted": "已采用",
     }.get(str(value), str(value) if value else "尚无记录")
     templates.env.filters["check_label"] = lambda value: {
         "database_integrity": "数据库完整性",
@@ -516,7 +517,9 @@ def create_app(config_path: Path) -> FastAPI:
     def library(request: Request, q: str = "", interest: str = "", reading: str = "", favorite: str = "",
                 sort: str = "score_desc", page_no: int = 1) -> HTMLResponse:
         page_no=max(1,page_no); limit=24; offset=(page_no-1)*limit
-        clauses=["p.eligibility_status='eligible'","s.score>=?"]; parameters: list[Any]=[float(config.get("relevance_threshold",0.70))]
+        personal_view = favorite == "yes" or reading in {"read_later", "read"}
+        clauses=["1=1"] if personal_view else ["p.eligibility_status='eligible'","s.score>=?"]
+        parameters: list[Any]=[] if personal_view else [0.7]
         if q:
             clauses.append("(p.title LIKE ? OR p.abstract LIKE ? OR p.venue LIKE ?)")
             value=f"%{q}%"; parameters.extend([value,value,value])
@@ -683,13 +686,13 @@ def create_app(config_path: Path) -> FastAPI:
               ORDER BY created_at DESC,id DESC""")
             active=next((item for item in versions if item["status"]=="active"),None)
             return templates.TemplateResponse(request,"profile.html",context(request,"profile",versions=versions,
-                active=active,profile_review=pending_profile_review(db_path)))
+                active=active, profile_edit_content=unified_profile_text(active["content"] if active else "", screening_preferences(db, config)["instructions"]),profile_review=pending_profile_review(db_path)))
         finally: db.close()
 
     @app.post("/profile/draft")
     async def profile_draft(request: Request) -> RedirectResponse:
         data=await form_data(request); validate_csrf(data)
-        create_profile_draft(db_path,data.get("content",""),data.get("summary",""),"web")
+        create_profile_draft(db_path,data.get("content",""),data.get("summary", "更新研究兴趣"),"web-single")
         return RedirectResponse("/profile",303)
 
     @app.post("/profile/confirm")
@@ -846,8 +849,12 @@ def create_app(config_path: Path) -> FastAPI:
             content_disposition_type="inline",
         )
 
-    @app.get("/status", response_class=HTMLResponse)
-    def status(request: Request) -> HTMLResponse:
+    @app.get("/status")
+    def status_legacy() -> RedirectResponse:
+        return RedirectResponse("/?center=checks", status_code=303)
+
+    @app.get("/api/center/status")
+    def center_status(request: Request) -> JSONResponse:
         db=connect(db_path)
         try:
             db_state=database_status(db_path)
@@ -902,12 +909,19 @@ def create_app(config_path: Path) -> FastAPI:
                 f"11. 运行：python3 {monitor_runner_path(state)} agent-import --config {config_path} --results <结果 JSON 路径>。",
                 f"12. 最后运行：academic-radar verify --config {config_path}，报告 API 采集数、官网卷期与论文数、补全摘要数、判断数、达到 70 分的入选论文、来源失败和仍需处理的项目。",
             ])
-            return templates.TemplateResponse(request,"status.html",context(request,"status",
+            values = context(request,"status",
                 db_state=db_state,quality=verification["governance"],
                 recommendation_quality=recommendation_feedback_metrics(
                     db_path,float(config.get("relevance_threshold",0.70))
                 ),checks=checks,healthy_count=len(all_checks)-len(checks),
-                update_summary=update_summary,update_prompt="\n\n".join(prompt_steps)))
+                update_summary=update_summary,update_prompt="\n\n".join(prompt_steps))
+            latest_import = db.execute("SELECT MAX(imported_at) FROM agent_jobs WHERE status='imported'").fetchone()[0]
+            checked_at = dt.datetime.now(dt.timezone.utc).isoformat()
+            with db:
+                db.execute("INSERT INTO meta(key,value) VALUES('last_local_check',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (checked_at,))
+            return JSONResponse({"html": templates.env.get_template("_center_checks.html").render(values),
+                "checked_at": checked_at, "local_checked_at": checked_at, "last_import": latest_import,
+                "sync": public_sync_status()})
         finally: db.close()
 
     return app

@@ -10,9 +10,9 @@ assert.ok(current.includes('action="/profile/save"'));
 assert.ok(current.includes('name="base_version" value="4"'));
 assert.ok(current.includes('name="generation" value="'+profile.generation+'"'));
 assert.ok(current.includes('Owner interests &lt;exact&gt;'));
-assert.ok(current.includes('Use concrete mechanism evidence.'));
-assert.ok(current.includes('name="relevance_threshold"'));
-assert.ok(current.includes('value="0.85"'));
+
+assert.ok(!current.includes('name="relevance_threshold"'));assert.ok(!current.includes('name="instructions"'));assert.ok(current.includes('name="profile_format" value="single"'));
+
 assert.ok(current.includes('等待本地同步'));
 assert.ok(!current.includes('action="/profile/draft"'));
 const retry=render('profile',{...common,cloud_profile:profile,profile_editable:true,

@@ -1,0 +1,142 @@
+diff --git a/worker/feedback.js b/worker/feedback.js
+index 2eaca46..b06638c 100644
+--- a/worker/feedback.js
++++ b/worker/feedback.js
+@@ -22,7 +22,7 @@ export async function appendFeedback(db,generation,identity,baseline,patch,stamp
+    value AS previous FROM current)
+  `;
+  const args=[JSON.stringify(base),identity,...fields.flatMap(key=>[Object.hasOwn(patch,key)?1:0,patch[key]??null]),stamp,stamp];
+- const valid="(interest IS NULL OR interest IN ('interested','not_interested')) AND favorite IN (0,1) AND reading_status IN ('unread','read','read_later') AND (interest IS NULL OR length(trim(COALESCE(reason,'')))>0)";
++ const valid="(interest IS NULL OR interest IN ('interested','not_interested')) AND favorite IN (0,1) AND reading_status IN ('unread','read','read_later')";
+  const changed=fields.map(key=>`${key} IS NOT json_extract(previous,'$.${key}')`).join(' OR ');
+  const saved=await db.prepare(cte+`INSERT INTO cloud_feedback(identity,interest,reason,favorite,reading_status,updated_at)
+   SELECT ?,interest,reason,favorite,reading_status,updated_at FROM merged
+diff --git a/worker/index.js b/worker/index.js
+index a775e4e..be11e3e 100644
+--- a/worker/index.js
++++ b/worker/index.js
+@@ -7,7 +7,7 @@ import {mainStoreOperation} from './main-store.js';
+ import {publishMainSnapshot} from './main-publication.js';
+ import {siteBackup} from './site-backup.js';
+ import {displayRecord,displayRecords} from './display-records.js';
+-import {isOwner,profileState,profileEvents,profileHistory,saveProfile} from './profile.js';
++import {isOwner,profileState,profileEvents,profileHistory,saveProfile,unifiedProfileText} from './profile.js';
+ const h={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin','X-Frame-Options':'DENY'};
+ const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{...h,'Content-Type':'application/json; charset=utf-8'}});
+ const fail=(message,status=400)=>{throw Object.assign(new Error(message),{status});};
+@@ -115,10 +115,14 @@ async function view(r,e,u){
+  if(v==='sources'||v==='status'){if(!own)result.overview.sources=meta.sources.map(s=>({...s,health:{status:s.health?.status,last_success_at:s.health?.last_success_at}}));return json(result);}
+  let papers=await all(db,g,'paper');
+  if(v==='today'){const today=new Date().toLocaleDateString('en-CA',{timeZone:meta.timezone||'Asia/Shanghai'}),day=u.searchParams.get('day')||today;let history=await record(db,g,'history',day===today?'current':day);if(day===today&&history?.day!==today)history=null;const index=new Map(papers.map(p=>[p.identity,p]));result.day=day;result.batches=history?.batches||0;result.incomplete=history?.incomplete||false;papers=(history?.papers||[]).filter(p=>index.has(p.identity)).map(p=>({...index.get(p.identity),...p}));}
+- else if(v==='library')papers=papers.filter(p=>p.eligibility_status==='eligible'&&p.score>=(meta.threshold??.70));else if(v!=='feedback')fail('页面不存在',404);
++ else if(v==='library'){const personalView=u.searchParams.get('favorite')==='yes'||['read_later','read'].includes(u.searchParams.get('reading'));papers=papers.filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));}else if(v!=='feedback')fail('页面不存在',404);
+  const f=own?await feedback(db,g):new Map();
+  const publicFields=['identity','doi','title','abstract','venue','published','published_precision','url','authors_json','abstract_source','abstract_source_url','abstract_retrieved_at','eligibility_status','publication_type','score','reasons','confidence','rubric_version','needs_rescreen'];
+  result.papers=papers.map(p=>own?{...p,...(f.has(p.identity)?{feedback:f.get(p.identity)}:{})}:Object.fromEntries(publicFields.filter(k=>k in p).map(k=>[k,p[k]])));
++ if(v==='library'){
++  if(u.searchParams.get('favorite')==='yes')result.papers=result.papers.filter(p=>p.feedback?.favorite);
++  const reading=u.searchParams.get('reading');if(['unread','read_later','read'].includes(reading))result.papers=result.papers.filter(p=>(p.feedback?.reading_status||'unread')===reading);
++ }
+  if(v==='feedback')result.papers=result.papers.filter(p=>p.feedback);return json(result);
+ }
+ async function saveFeedback(r,e,u){
+@@ -132,7 +136,7 @@ async function saveFeedback(r,e,u){
+  if(u.pathname==='/api/favorite')patch={...previous,favorite:Number(Boolean(d.favorite))};
+  if(u.pathname==='/feedback/clear')patch={interest:null,reason:null,favorite:0,reading_status:'unread'};
+  if(![null,'interested','not_interested'].includes(patch.interest)||![0,1].includes(patch.favorite)||!['unread','read','read_later'].includes(patch.reading_status))fail('反馈格式无效');
+- const reason=String(patch.reason||'').trim();if(reason.length>3000||patch.interest&&!reason)fail('请填写具体偏好理由');const stamp=new Date(Math.max(Date.now(),Date.parse(previous.updated_at||'')+1||0)).toISOString();
++ const reason=String(patch.reason||'').trim();if(reason.length>3000)fail('理由最多3000字');const stamp=new Date(Math.max(Date.now(),Date.parse(previous.updated_at||'')+1||0)).toISOString();
+  const changedFields=u.pathname==='/feedback/clear'?['interest','reason','favorite','reading_status']:
+   u.pathname==='/api/favorite'?['favorite']:['interest','reason','favorite','reading_status'].filter(key=>has(key)||(form&&key==='favorite'));
+  const edits=Object.fromEntries(changedFields.map(key=>[key,key==='reason'?reason||null:patch[key]]));
+@@ -152,7 +156,7 @@ async function pageContext(r,e,u,page){
+  const merge=p=>{const saved=f.get(p.identity)||{};return {...p,...saved,feedback_reason:saved.reason||'',reasons:p.reasons,reading_status:saved.reading_status||'unread',favorite:saved.favorite||0};};
+  const index=new Map(papers.map(p=>[p.identity,merge(p)]));
+  const context={...base,site_mode:'cloud',state_path:'云端主数据库',cloud_url:u.origin,cloud_sync_status:{status:'succeeded',synced_at:state.synced_at},csrf_token:'same-origin-public',request:{url:{path:u.pathname,query:u.search.slice(1)}}};
+- if(page==='profile'){context.cloud_profile=await profileState(db,g);context.profile_editable=isOwner(r,e);context.cloud_profile_history=await profileHistory(db);context.profile_saved=u.searchParams.get('saved')==='1';}
++ if(page==='profile'){context.cloud_profile=await profileState(db,g);context.profile_editable=isOwner(r,e);context.cloud_profile_history=await profileHistory(db);context.profile_edit_content=unifiedProfileText(context.cloud_profile.content,context.cloud_profile.screening_preferences.instructions);context.profile_saved=u.searchParams.get('saved')==='1';}
+  const sp=u.searchParams;
+  if(page==='today'){
+   const timezone=meta.timezone||'Asia/Shanghai',dateLabel=d=>d.toLocaleDateString('en-CA',{timeZone:timezone}),today=dateLabel(new Date()),current=await record(db,g,'history','current');
+@@ -170,7 +174,8 @@ async function pageContext(r,e,u,page){
+  }
+  if(page==='library'){
+   Object.assign(context,{q:sp.get('q')||'',interest:sp.get('interest')||'',reading:sp.get('reading')||'',favorite:sp.get('favorite')||'',sort:sp.get('sort')||'score_desc',page_no:Math.max(1,Math.min(100000,parseInt(sp.get('page_no')||'1')||1))});
+-  let selected=[...index.values()].filter(p=>p.eligibility_status==='eligible'&&p.score>=(meta.threshold??.7));
++  const personalView=context.favorite==='yes'||['read_later','read'].includes(context.reading);
++  let selected=[...index.values()].filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));
+   const q=context.q;selected=selected.filter(p=>(!q||[p.title,p.abstract,p.venue].some(v=>searchMatches(v,q)))&&(!['interested','not_interested'].includes(context.interest)||p.interest===context.interest)&&(!['unread','read_later','read'].includes(context.reading)||p.reading_status===context.reading)&&(context.favorite!=='yes'||p.favorite));
+   if(!['score_desc','score_asc','date_desc','date_asc','title_asc'].includes(context.sort))context.sort='score_desc';const sort=context.sort;
+   selected.sort((a,b)=>(sort==='score_asc'?(a.score-b.score||binary(b.published,a.published)):sort==='date_asc'?(binary(a.published,b.published)||b.score-a.score):sort==='date_desc'?(binary(b.published,a.published)||b.score-a.score):sort==='title_asc'?binary(fold(a.title),fold(b.title)):(b.score-a.score||binary(b.published,a.published)))||binary(a.identity,b.identity));
+@@ -210,9 +215,15 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
+   if(!isOwner(r,e))fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好',403);
+   if(r.headers.get('Origin')!==u.origin)fail('请求来源无效',403);
+   if((r.headers.get('content-type')||'').split(';')[0].trim()!=='application/x-www-form-urlencoded')fail('需要表单请求',415);
+-  const raw=Object.fromEntries(new URLSearchParams(await boundedText(r))),data={base_version:Number(raw.base_version),generation:raw.generation,content:raw.content,summary:raw.summary,screening_preferences:{relevance_threshold:Number(raw.relevance_threshold),instructions:raw.instructions||''}};
++  const raw=Object.fromEntries(new URLSearchParams(await boundedText(r))),data={base_version:Number(raw.base_version),generation:raw.generation,content:raw.content,summary:raw.summary||'更新研究兴趣',profile_format:raw.profile_format,screening_preferences:{relevance_threshold:raw.profile_format==='single'?.7:Number(raw.relevance_threshold),instructions:raw.profile_format==='single'?'':raw.instructions||''}};
+   try{await saveProfile(r,e,u,data);return new Response(null,{status:303,headers:{...h,Location:'/profile?saved=1'}});}
+-  catch(error){if(!error.status)throw error;const context=await pageContext(r,e,u,'profile');context.profile_error=error.message;context.profile_submission=data;return new Response(render('profile',context),{status:error.status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});}
++  catch(error){if(!error.status)throw error;const context=await pageContext(r,e,u,'profile');context.profile_error=error.message;data.content=unifiedProfileText(data.content,data.screening_preferences.instructions);context.profile_submission=data;return new Response(render('profile',context),{status:error.status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});}
++ }
++ if(u.pathname==='/status'&&r.method==='GET')return new Response(null,{status:303,headers:{...h,Location:'/?center=checks'}});
++ if(u.pathname==='/api/center/status'&&r.method==='GET'){
++  const context=await pageContext(r,e,u,'status'),state=await syncState(e.DB);
++  const generation=await active(e.DB),overview=await record(e.DB,generation,'meta','overview');
++  return json({html:render('_center_checks',context),local_checked_at:context.local_checked_at||null,last_import:overview?.last_import||null,sync:{...state,status:state.pending?'pending':'succeeded',message:state.pending?'已保存更新，等待本地接收。':'最近同步已完成。'}});
+  }
+  if(u.pathname==='/api/sync'&&r.method==='POST')return await requestSync(r,e,u);
+  if(u.pathname==='/api/sync/status'&&r.method==='GET'){const state=await syncState(e.DB);return json({...state,message:state.pending?'已保存更新，等待本地接收。':'云端数据已更新；暂无待处理更新。'});}
+@@ -240,13 +251,13 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
+  if(r.method==='POST')fail('这项操作需要在本地站点执行；保存的反馈和阅读标记可在两端直接修改。',409);
+  if(!['/','/library','/sources','/profile','/feedback','/status'].includes(u.pathname))fail('页面不存在',404);
+  const name=u.pathname==='/'?'today':u.pathname.slice(1);
+- return new Response(render(name,await pageContext(r,e,u,name)),{headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
++ return new Response(render(name,await pageContext(r,e,u,name)),{headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+  }catch(error){
+   if(!error.status)console.error('radar storage error',error.name);
+   const status=error.status||503,message=error.status?error.message:'数据暂时无法读取或保存，请稍后重试';
+   const url=new URL(r.url);
+   if(r.method==='GET'&&(r.headers.get('Accept')||'').includes('text/html')&&!url.pathname.startsWith('/api/')&&!url.pathname.startsWith('/static/')&&url.pathname!=='/fulltext/file'&&status!==403){
+-    return new Response(render('error',{page:'error',site_mode:'cloud',cloud_sync_status:{},title:status===404?'页面未找到':'这次操作没有完成',message,action:'检查输入后重试，或从导航继续。'}),{status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
++    return new Response(render('error',{page:'error',site_mode:'cloud',cloud_sync_status:{},title:status===404?'页面未找到':'这次操作没有完成',message,action:'检查输入后重试，或从导航继续。'}),{status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+   }
+   return json({error:message},status);
+  }}};
+diff --git a/worker/profile.js b/worker/profile.js
+index 1e13710..f8f4b25 100644
+--- a/worker/profile.js
++++ b/worker/profile.js
+@@ -41,6 +41,10 @@ export async function profileEvents(db, after) {
+ export async function profileHistory(db) {
+   return (await db.prepare('SELECT seq,summary,updated_at FROM cloud_profile_events ORDER BY seq DESC LIMIT 50').all()).results;
+ }
++export function unifiedProfileText(content, instructions) {
++  const extra=String(instructions||'').trim();
++  return !extra||content.includes(extra)?content:content.trimEnd()+'\n\n## 补充筛选偏好\n\n'+extra;
++}
+ export async function saveProfile(request, env, url, data) {
+   if (!isOwner(request, env)) fail('只有已登录的站点所有者可以修改研究兴趣和筛选偏好', 403);
+   if (request.headers.get('Origin') !== url.origin) fail('请求来源无效', 403);
+@@ -48,7 +52,8 @@ export async function saveProfile(request, env, url, data) {
+   if (!Number.isSafeInteger(data.base_version) || data.base_version < 0 || data.base_version >= Number.MAX_SAFE_INTEGER || typeof data.generation !== 'string' || !/^[a-f0-9]{64}$/.test(data.generation)) fail('画像版本无效');
+   if (typeof data.content !== 'string' || !data.content.trim() || data.content.length > 100000 || data.content.includes('\0')) fail('研究兴趣不能为空，且最多 100000 字符');
+   if (typeof data.summary !== 'string' || !data.summary.trim() || data.summary.length > 1000 || data.summary.includes('\0')) fail('请填写修改说明，且最多 1000 字符');
+-  const configured = preferences(data.screening_preferences);
++  const legacy = preferences(data.screening_preferences||{relevance_threshold:.7,instructions:''});
++  const configured = data.profile_format==='single'?{relevance_threshold:.7,instructions:''}:legacy;
+   const generation = (await env.DB.prepare("SELECT value FROM pointers WHERE key='active'").first())?.value;
+   if (!generation) fail('数据库正在首次同步，请稍后重试', 503);
+   const current = await profileState(env.DB, generation);
+diff --git a/worker/render.js b/worker/render.js
+index e47162e..80371af 100644
+--- a/worker/render.js
++++ b/worker/render.js
+@@ -7,7 +7,7 @@ env.addFilter('authors',v=>{try{return JSON.parse(v||'[]').filter(Boolean).join(
+ env.addFilter('list_label',v=>{try{return JSON.parse(v||'[]').join('、');}catch{return '';}});
+ env.addFilter('publication_date',(v,p)=>!v?'日期未知':p==='month'?v.slice(0,7):p==='year'?v.slice(0,4):v);
+ env.addFilter('human_time',v=>{if(!v)return '尚无记录';const date=new Date(v);if(!Number.isFinite(date.getTime()))return v;return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(date);});
+-const statuses={active:'已启用',draft:'草稿',superseded:'已停用',succeeded:'成功',partial:'部分完成',failed:'失败',running:'运行中',exported:'待导入',imported:'已导入',abandoned:'已放弃',rejected:'已拒绝',healthy:'健康',degraded:'降级',unknown:'尚无记录',ok:'成功',eligible:'符合收录范围',excluded:'已排除',quarantine:'待核查',queued:'等待中'};
++const statuses={active:'已启用',draft:'草稿',superseded:'已停用',succeeded:'成功',partial:'部分完成',failed:'失败',running:'运行中',exported:'待导入',imported:'已导入',abandoned:'已放弃',rejected:'已拒绝',healthy:'健康',degraded:'降级',unknown:'尚无记录',ok:'成功',eligible:'符合收录范围',excluded:'已排除',quarantine:'待核查',queued:'等待中',no_change:'无需调整',suggested:'已有建议',accepted:'已采用'};
+ env.addFilter('status_label',v=>statuses[v]||v||'尚无记录');
+ const checks={database_integrity:'数据库完整性',confirmed_profile:'已确认研究画像',source_coverage:'来源运行覆盖',source_runs:'最近来源运行',source_degradation:'来源降级',official_issue_coverage:'官网卷期覆盖',official_issue_failures:'官网核验失败',latest_semantic_job:'最近一次 Codex 判断',semantic_coverage:'相关性判断覆盖',abstract_coverage:'摘要覆盖',web_service:'后台网页服务',cloud_sync:'云端数据同步',recommendation_freshness:'推荐更新时效'};
+ env.addFilter('check_label',v=>checks[v]||v);

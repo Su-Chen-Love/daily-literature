@@ -8,6 +8,8 @@
     <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published|publication_date(paper.published_precision|default('unknown')) }}</time></div>
     <div class="paper-title-row"><h2>{% if paper.url %}<a class="paper-title-link" href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a>{% else %}{{ paper.title }}{% endif %}</h2></div>
     <div class="paper-tags">
+      {% if paper.score is not none and paper.score < 0.7 %}<span class="tag">已保存 · 低于推荐标准</span>{% endif %}
+      {% if paper.eligibility_status != 'eligible' %}<span class="tag">当前收录：{{ paper.eligibility_status|status_label }}</span>{% endif %}
       {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
       {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
       {% if paper.confidence is not none %}<span class="tag">判断置信度 {{ (paper.confidence * 100 + 0.5)|int }}%</span>{% endif %}
@@ -23,7 +25,6 @@
     <div class="paper-controls">
       <div class="paper-quick-actions" aria-label="文献操作">
         <button type="button" class="paper-tool favorite-button {{ 'is-favorite' if paper.favorite }}" data-favorite data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.favorite else 'false' }}" aria-label="{{ '取消收藏' if paper.favorite else '收藏文献' }}"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"/></svg><span data-favorite-label>{{ '已收藏' if paper.favorite else '收藏' }}</span></button>
-        <button type="button" class="paper-tool reading-button {{ 'is-read-later' if paper.reading_status == 'read_later' }}" data-read-later data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.reading_status == 'read_later' else 'false' }}"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v17l-6-4-6 4V4Z"/><path d="M9 8h6"/></svg><span data-reading-label>{{ '已加入稍后读' if paper.reading_status == 'read_later' else '稍后读' }}</span></button>
         <button type="button" class="paper-tool feedback-button" data-open-feedback><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4V4Z"/><path d="M8 8h8M8 12h5"/></svg><span>反馈</span></button>
       </div>
       <details class="paper-details">
@@ -52,7 +53,7 @@
             <option value="not_interested" {{ 'selected' if paper.interest == 'not_interested' }}>不感兴趣</option>
           </select>
         </label>
-        <label class="grow">理由（选择兴趣判断时必填）
+        <label class="grow">理由（选填）
           <input name="reason" value="{{ paper.feedback_reason or '' }}" placeholder="它为什么适合，或为什么偏离我的研究？">
         </label>
         <label>阅读状态

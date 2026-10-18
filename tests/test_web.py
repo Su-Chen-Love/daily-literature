@@ -83,8 +83,8 @@ class WebTests(unittest.TestCase):
                     self.assertIn('rel="icon" type="image/svg+xml"', response.text)
                     self.assertIn('/images/daily-literature-logo.svg?v=brand01', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=daily-20261018", response.text)
-                        self.assertEqual(response.text.count('class="nav-icon"'), 6)
+                        self.assertIn("app.js?v=center-20261018", response.text)
+                        self.assertEqual(response.text.count('class="nav-icon"'), 5)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
                 self.assertEqual(favicon.headers["content-type"], "image/png")
@@ -167,7 +167,7 @@ class WebTests(unittest.TestCase):
                     self.assertEqual(page.status_code, 200)
                     self.assertIn("A useful paper", page.text)
                     self.assertIn("Direct match", page.text)
-                status = client.get("/status").text
+                status = client.get("/api/center/status").json()["html"]
             self.assertNotIn("待按新量表重新判断", status)
             self.assertIn("仅导出从未由 Codex 判断过的新文献", status)
 
@@ -230,7 +230,7 @@ class WebTests(unittest.TestCase):
                 response = client.post(
                     "/feedback",
                     data={"csrf_token": app.state.csrf_token, "identity": "doi:10.1/test",
-                          "interest": "interested", "reason": "", "reading_status": "unread"},
+                          "interest": "invalid", "reason": "", "reading_status": "unread"},
                 )
             self.assertEqual(response.status_code, 400)
             self.assertIn("这次操作没有保存", response.text)
@@ -759,17 +759,18 @@ class WebTests(unittest.TestCase):
     def test_status_page_has_actionable_buttons_and_no_provider_api(self):
         with tempfile.TemporaryDirectory() as td:
             app, _, _=self.make_app(Path(td))
-            with TestClient(app) as client: response=client.get("/status")
+            with TestClient(app) as client: response=client.get("/api/center/status")
+            response_text=response.json()["html"]
             for label in ("更新数据库", "当前：", "由 Codex 完整执行", "需要处理", "推荐精确率"):
-                self.assertIn(label,response.text)
+                self.assertIn(label,response_text)
             for label in ("agent-export", "agent-import"):
-                self.assertIn(label,response.text)
-            self.assertNotIn("recent-tasks-panel", response.text)
-            self.assertNotIn("网页运行方式", response.text)
-            self.assertNotIn("交给 Codex 判断相关性", response.text)
-            self.assertNotIn("数据库结构版本", response.text)
-            self.assertNotIn("API Key",response.text)
-            self.assertNotIn("DeepSeek",response.text)
+                self.assertIn(label,response_text)
+            self.assertNotIn("recent-tasks-panel", response_text)
+            self.assertNotIn("网页运行方式", response_text)
+            self.assertNotIn("交给 Codex 判断相关性", response_text)
+            self.assertNotIn("数据库结构版本", response_text)
+            self.assertNotIn("API Key",response_text)
+            self.assertNotIn("DeepSeek",response_text)
 
     def test_local_feedback_edits_queue_sync_after_saving(self):
         with tempfile.TemporaryDirectory() as td:

@@ -66,10 +66,14 @@ async function view(r,e,u){
  if(v==='sources'||v==='status'){if(!own)result.overview.sources=meta.sources.map(s=>({...s,health:{status:s.health?.status,last_success_at:s.health?.last_success_at}}));return json(result);}
  let papers=await all(db,g,'paper');
  if(v==='today'){const today=new Date().toLocaleDateString('en-CA',{timeZone:meta.timezone||'Asia/Shanghai'}),day=u.searchParams.get('day')||today;let history=await record(db,g,'history',day===today?'current':day);if(day===today&&history?.day!==today)history=null;const index=new Map(papers.map(p=>[p.identity,p]));result.day=day;result.batches=history?.batches||0;result.incomplete=history?.incomplete||false;papers=(history?.papers||[]).filter(p=>index.has(p.identity)).map(p=>({...index.get(p.identity),...p}));}
- else if(v==='library')papers=papers.filter(p=>p.eligibility_status==='eligible'&&p.score>=(meta.threshold??.70));else if(v!=='feedback')fail('页面不存在',404);
+ else if(v==='library'){const personalView=u.searchParams.get('favorite')==='yes'||['read_later','read'].includes(u.searchParams.get('reading'));papers=papers.filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));}else if(v!=='feedback')fail('页面不存在',404);
  const f=own?await feedback(db,g):new Map();
  const publicFields=['identity','doi','title','abstract','venue','published','published_precision','url','authors_json','abstract_source','abstract_source_url','abstract_retrieved_at','eligibility_status','publication_type','score','reasons','confidence','rubric_version','needs_rescreen'];
  result.papers=papers.map(p=>own?{...p,...(f.has(p.identity)?{feedback:f.get(p.identity)}:{})}:Object.fromEntries(publicFields.filter(k=>k in p).map(k=>[k,p[k]])));
+ if(v==='library'){
+  if(u.searchParams.get('favorite')==='yes')result.papers=result.papers.filter(p=>p.feedback?.favorite);
+  const reading=u.searchParams.get('reading');if(['unread','read_later','read'].includes(reading))result.papers=result.papers.filter(p=>(p.feedback?.reading_status||'unread')===reading);
+ }
  if(v==='feedback')result.papers=result.papers.filter(p=>p.feedback);return json(result);
 }
 async function saveFeedback(r,e,u){
@@ -83,7 +87,7 @@ async function saveFeedback(r,e,u){
  if(u.pathname==='/api/favorite')patch={...previous,favorite:Number(Boolean(d.favorite))};
  if(u.pathname==='/feedback/clear')patch={interest:null,reason:null,favorite:0,reading_status:'unread'};
  if(![null,'interested','not_interested'].includes(patch.interest)||![0,1].includes(patch.favorite)||!['unread','read','read_later'].includes(patch.reading_status))fail('反馈格式无效');
- const reason=String(patch.reason||'').trim();if(reason.length>3000||patch.interest&&!reason)fail('请填写具体偏好理由');const stamp=new Date(Math.max(Date.now(),Date.parse(previous.updated_at||'')+1||0)).toISOString();
+ const reason=String(patch.reason||'').trim();if(reason.length>3000)fail('理由最多3000字');const stamp=new Date(Math.max(Date.now(),Date.parse(previous.updated_at||'')+1||0)).toISOString();
  // One SQL statement assigns a strictly newer logical UTC time, even when two
  // requests read the same previous row during the same millisecond.
  await e.DB.prepare("INSERT INTO cloud_feedback(identity,interest,reason,favorite,reading_status,updated_at) SELECT ?,?,?,?,?,CASE WHEN MAX(julianday(updated_at))>=julianday(?) THEN strftime('%Y-%m-%dT%H:%M:%fZ',MAX(julianday(updated_at))+1.0/86400000) ELSE ? END FROM cloud_feedback WHERE identity=?").bind(d.identity,patch.interest,reason||null,patch.favorite,patch.reading_status,stamp,stamp,d.identity).run();
@@ -119,7 +123,8 @@ async function pageContext(r,e,u,page){
  }
  if(page==='library'){
   Object.assign(context,{q:sp.get('q')||'',interest:sp.get('interest')||'',reading:sp.get('reading')||'',favorite:sp.get('favorite')||'',sort:sp.get('sort')||'score_desc',page_no:Math.max(1,Math.min(100000,parseInt(sp.get('page_no')||'1')||1))});
-  let selected=[...index.values()].filter(p=>p.eligibility_status==='eligible'&&p.score>=(meta.threshold??.7));
+  const personalView=context.favorite==='yes'||['read_later','read'].includes(context.reading);
+  let selected=[...index.values()].filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));
   const q=context.q;selected=selected.filter(p=>(!q||[p.title,p.abstract,p.venue].some(v=>searchMatches(v,q)))&&(!['interested','not_interested'].includes(context.interest)||p.interest===context.interest)&&(!['unread','read_later','read'].includes(context.reading)||p.reading_status===context.reading)&&(context.favorite!=='yes'||p.favorite));
   if(!['score_desc','score_asc','date_desc','date_asc','title_asc'].includes(context.sort))context.sort='score_desc';const sort=context.sort;
   selected.sort((a,b)=>(sort==='score_asc'?(a.score-b.score||binary(b.published,a.published)):sort==='date_asc'?(binary(a.published,b.published)||b.score-a.score):sort==='date_desc'?(binary(b.published,a.published)||b.score-a.score):sort==='title_asc'?binary(fold(a.title),fold(b.title)):(b.score-a.score||binary(b.published,a.published)))||binary(a.identity,b.identity));
@@ -138,6 +143,12 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
  const asset=staticAsset(u.pathname);if(asset)return asset;
  if(u.pathname==='/healthz')return json({ok:!!e.DB,ready:!!(e.DB&&await active(e.DB))});
  if(!e.DB&&u.pathname.startsWith('/api/'))fail('云端数据库暂时不可用',503);
+ if(u.pathname==='/status'&&r.method==='GET')return new Response(null,{status:303,headers:{...h,Location:'/?center=checks'}});
+ if(u.pathname==='/api/center/status'&&r.method==='GET'){
+  const context=await pageContext(r,e,u,'status'),state=await syncState(e.DB);
+  const generation=await active(e.DB),overview=await record(e.DB,generation,'meta','overview');
+  return json({html:render('_center_checks',context),local_checked_at:context.local_checked_at||null,last_import:overview?.last_import||null,sync:{...state,status:state.pending?'pending':'succeeded',message:state.pending?'已保存更新，等待本地接收。':'最近同步已完成。'}});
+ }
  if(u.pathname==='/api/sync'&&r.method==='POST')return await requestSync(r,e,u);
  if(u.pathname==='/api/sync/status'&&r.method==='GET'){const state=await syncState(e.DB);return json({...state,message:state.pending?'已保存更新，等待本地在线后同步。':'两端同步已完成；暂无待同步更新。'});}
  if(u.pathname.startsWith('/api/sync/'))return await sync(r,e,u);
@@ -147,13 +158,13 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
  if(r.method==='POST')fail('这项操作需要在本地站点执行；保存的反馈和阅读标记可在两端直接修改。',409);
  if(!['/','/library','/sources','/profile','/feedback','/status'].includes(u.pathname))fail('页面不存在',404);
  const name=u.pathname==='/'?'today':u.pathname.slice(1);
- return new Response(render(name,await pageContext(r,e,u,name)),{headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+ return new Response(render(name,await pageContext(r,e,u,name)),{headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
  }catch(error){
   if(!error.status)console.error('radar storage error',error.name);
   const status=error.status||503,message=error.status?error.message:'数据暂时无法读取或保存，请稍后重试';
   const url=new URL(r.url);
   if(r.method==='GET'&&(r.headers.get('Accept')||'').includes('text/html')&&!url.pathname.startsWith('/api/')&&!url.pathname.startsWith('/static/')&&url.pathname!=='/fulltext/file'&&status!==403){
-    return new Response(render('error',{page:'error',site_mode:'cloud',cloud_sync_status:{},title:status===404?'页面未找到':'这次操作没有完成',message,action:'检查输入后重试，或从导航继续。'}),{status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
+    return new Response(render('error',{page:'error',site_mode:'cloud',cloud_sync_status:{},title:status===404?'页面未找到':'这次操作没有完成',message,action:'检查输入后重试，或从导航继续。'}),{status,headers:{...h,'Content-Type':'text/html; charset=utf-8','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
   }
   return json({error:message},status);
  }}};

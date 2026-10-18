@@ -240,6 +240,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.group == "verify":
             result=verify_installation(args.config)
+            from .storage import connect, utc_now
+            cfg=load_config(args.config)
+            db_path=resolve_state(args.config,cfg)/"papers.sqlite3"
+            if db_path.exists():
+                checked_at=utc_now()
+                with connect(db_path) as db:
+                    db.execute("INSERT INTO meta(key,value) VALUES('last_local_check',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(checked_at,))
+                result["checked_at"]=checked_at
             print(json.dumps(result,ensure_ascii=False,indent=2))
             return 0 if result["ok"] else 1
         if args.group in {"abstracts","cleanup","official"}:
