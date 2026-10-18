@@ -7,7 +7,7 @@ for(const name of (await readdir('shared/templates')).sort()) {
  templates.push(nunjucks.precompileString(source,{name,wrapper:items=>items.map(t=>JSON.stringify(t.name)+':(function(){'+t.template+'})()').join(',')}));
 }
 const assets={};
-for(const [path,type] of [['app.css','text/css; charset=utf-8'],['app.js','text/javascript; charset=utf-8'],['images/academic-radar-logo.png','image/png']]) {
+for(const [path,type] of [['app.css','text/css; charset=utf-8'],['app.js','text/javascript; charset=utf-8'],['images/academic-radar-logo.png','image/png'],['images/daily-literature-logo.svg','image/svg+xml']]) {
  const data=await readFile('shared/static/'+path);
  assets['/static/'+path]={type,data:data.toString('base64')};
 }

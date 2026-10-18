@@ -80,12 +80,18 @@ class WebTests(unittest.TestCase):
                     self.assertIn("每日文献", response.text)
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
+                    self.assertIn('rel="icon" type="image/svg+xml"', response.text)
+                    self.assertIn('/images/daily-literature-logo.svg?v=brand01', response.text)
                     if path == "/":
                         self.assertIn("app.js?v=daily-20261018", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
                 self.assertEqual(favicon.headers["content-type"], "image/png")
+                vector = client.get("/static/images/daily-literature-logo.svg")
+                self.assertEqual(vector.status_code, 200)
+                self.assertIn("image/svg+xml", vector.headers["content-type"])
+                self.assertIn('viewBox="0 0 240 240"', vector.text)
                 self.assertTrue(client.get("/healthz").json()["ok"])
 
     def test_sync_status_has_polling_message_and_pending_flag(self):

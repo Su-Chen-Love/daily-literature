@@ -6,8 +6,9 @@
   <meta name="color-scheme" content="light">
   <meta name="csrf-token" content="{{ csrf_token }}">
   <title>{% block title %}每日文献{% endblock %}</title>
-  <link rel="icon" type="image/png" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}">
-  <link rel="apple-touch-icon" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}">
+  <link rel="icon" type="image/svg+xml" sizes="any" href="{{ url_for('static', path='/images/daily-literature-logo.svg') }}?v=brand01">
+  <link rel="icon" type="image/png" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
+  <link rel="apple-touch-icon" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
   <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=daily-20261018">
   <script src="{{ url_for('static', path='/app.js') }}?v=daily-20261018"></script>
 </head>
@@ -15,7 +16,7 @@
   <a href="#main-content" class="skip-link">跳到正文</a>
   <aside class="sidebar">
     <a class="brand" href="/">
-      <span class="brand-mark"><img src="{{ url_for('static', path='/images/academic-radar-logo.png') }}" alt=""></span>
+      <span class="brand-mark"><img src="{{ url_for('static', path='/images/daily-literature-logo.svg') }}?v=brand01" width="36" height="36" alt=""></span>
       <strong>每日文献</strong>
     </a>
     <nav aria-label="主导航">

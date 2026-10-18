@@ -88,3 +88,8 @@ assert.ok((await browserError.text()).includes('返回首页'));
 const apiError=await worker.fetch(new Request(origin+'/api/missing',{headers:{Accept:'text/html'}}),env);
 assert.ok(apiError.headers.get('Content-Type').includes('application/json'));
 console.log('Recoverable browser errors retain navigation; API errors retain JSON and native forms retain same-origin metadata.');
+
+const brandSvg=await worker.fetch(new Request(origin+'/static/images/daily-literature-logo.svg'),env);
+assert.equal(brandSvg.status,200);assert.ok(brandSvg.headers.get('Content-Type').includes('image/svg+xml'));
+assert.equal(await brandSvg.text(),readFileSync(new URL('../shared/static/images/daily-literature-logo.svg',import.meta.url),'utf8'));
+console.log('Approved brand SVG is embedded and served byte-for-byte.');
