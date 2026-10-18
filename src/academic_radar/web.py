@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .cloud_sync import background_sync, background_sync_state
 from .engagement import (
@@ -266,7 +267,7 @@ def create_app(config_path: Path) -> FastAPI:
     initialize_installation(state, config_path)
     config = load_config(config_path)
 
-    app = FastAPI(title="Personal Academic Assistant", docs_url=None, redoc_url=None)
+    app = FastAPI(title="每日文献", docs_url=None, redoc_url=None)
     app.state.config_path = config_path
     app.state.config = config
     app.state.state = state
@@ -386,12 +387,28 @@ def create_app(config_path: Path) -> FastAPI:
         }
 
     def error_response(request: Request, status_code: int, title: str, message: str, action: str) -> HTMLResponse:
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"error": message}, status_code=status_code)
         return templates.TemplateResponse(
             request,
             "error.html",
             context(request, "error", title=title, message=message, action=action),
             status_code=status_code,
         )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request: Request, exc: StarletteHTTPException):
+        message = str(exc.detail) if isinstance(exc.detail, str) else "请检查输入后重试。"
+        if message in {"Invalid form token", "Invalid request token"}:
+            message = "页面已过期，请刷新后重试。"
+        elif message == "Not Found":
+            message = "未找到这个页面。"
+        response = error_response(request, exc.status_code,
+                                  "页面未找到" if exc.status_code == 404 else "这次操作没有完成",
+                                  message, "返回上一页检查输入，或从导航继续。")
+        if exc.headers:
+            response.headers.update(exc.headers)
+        return response
 
     @app.exception_handler(ValueError)
     async def value_error_handler(request: Request, exc: ValueError) -> HTMLResponse:
@@ -860,7 +877,7 @@ def create_app(config_path: Path) -> FastAPI:
                 situations.append("现有可筛选论文均已完成相关性判断")
             update_summary="当前："+"；".join(situations)+"。点击“更新数据库”复制针对这些情况生成的 Codex 任务。"
             prompt_steps=[
-                "请更新“个人学术助手”的本地数据库，并在完成后报告结果。不要使用独立模型 API。",
+                "请更新“每日文献”的本地数据库，并在完成后报告结果。不要使用独立模型 API。",
                 "1. 阅读此项目的 SKILL.md 与 references/profile-guidance.md，遵守完整队列、原子导入和私有数据边界。",
                 f"2. 阅读研究兴趣：{state / str(config.get('profile_file', 'research-profile.md'))}。",
                 "3. 当前诊断："+"；".join(situations)+"。",

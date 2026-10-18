@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}更新与检查 · 个人学术助手{% endblock %}
+{% block title %}更新与检查 · 每日文献{% endblock %}
 {% block content %}
 <header class="page-head"><div><p class="kicker">UPDATES · 可操作</p><h1>更新与检查</h1><p>每日只判断尚未判断的新论文；已有评分与历史推荐保留。</p></div><span class="health {{ 'healthy' if db_state.integrity == 'ok' and db_state.schema_current else 'failed' }}">数据库 {{ '正常' if db_state.integrity == 'ok' else '需要修复' }}</span></header>
 <section class="metric-grid"><div><strong>{{ quality.visible }}</strong><span>推荐文献</span></div><div><strong>{{ quality.abstract_percent }}%</strong><span>推荐库摘要覆盖</span></div><div><strong>{{ quality.missing_abstracts }}</strong><span>推荐库仍缺摘要</span></div><div><strong>{{ (recommendation_quality.precision_percent ~ '%') if recommendation_quality.precision_percent is not none else '—' }}</strong><span>反馈样本推荐精确率</span></div><div><strong>{{ recommendation_quality.false_positive }}</strong><span>已反馈误推荐</span></div></section>

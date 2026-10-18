@@ -1,14 +1,12 @@
 {% macro paper_card(paper, return_to, show_pdf=false, anchor_prefix='') %}
 {% set paper_anchor = anchor_prefix ~ 'paper-' ~ paper.identity|replace(':','-')|replace('/','-')|replace('.','-') %}
-<article class="paper-card" id="{{ paper_anchor }}" data-interest="{{ paper.interest or '' }}" data-paper-identity="{{ paper.identity }}">
+<article class="paper-card" id="{{ paper_anchor }}" data-interest="{{ paper.interest or '' }}" data-paper-identity="{{ paper.identity }}" data-reading-status="{{ paper.reading_status or 'unread' }}" data-feedback-reason="{{ paper.feedback_reason or '' }}">
   <div class="paper-score">
     {% if paper.score is not none %}<strong>{{ (paper.score * 100 + 0.5)|int }}</strong><span>匹配度</span>{% else %}<strong>—</strong><span>待判断</span>{% endif %}
   </div>
   <div class="paper-body">
     <div class="eyebrow"><span>{{ paper.venue or '未知来源' }}</span><time>{{ paper.published|publication_date(paper.published_precision|default('unknown')) }}</time></div>
-    <div class="paper-title-row"><h2>{% if paper.url %}<a class="paper-title-link" href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a>{% else %}{{ paper.title }}{% endif %}</h2>
-      <button type="button" class="favorite-button {{ 'is-favorite' if paper.favorite }}" data-favorite data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.favorite else 'false' }}" aria-label="{{ '取消收藏' if paper.favorite else '收藏到文献库' }}">{{ '★' if paper.favorite else '☆' }}</button>
-    </div>
+    <div class="paper-title-row"><h2>{% if paper.url %}<a class="paper-title-link" href="{{ paper.url }}" target="_blank" rel="noreferrer">{{ paper.title }}</a>{% else %}{{ paper.title }}{% endif %}</h2></div>
     <div class="paper-tags">
       {% if paper.publication_type %}<span class="tag">{{ paper.publication_type }}</span>{% endif %}
       {% if paper.fulltext_count %}<span class="tag">全文 {{ paper.fulltext_count }} 个</span>{% endif %}
@@ -22,8 +20,14 @@
     {% if anchor_prefix and paper.eligibility_status != 'eligible' %}<p class="reason">当前收录状态：{{ paper.eligibility_status|status_label }}</p>{% endif %}
     {% if paper.reasons %}<p class="reason"><strong>研究解读：</strong>{{ paper.reasons }}</p>{% endif %}
     {% if paper.needs_rescreen and not anchor_prefix %}<p class="muted">资料或研究偏好已有更新；这里保留此前的评分与推荐理由。</p>{% endif %}
-    <details class="paper-details">
-      <summary>展开详情</summary>
+    <div class="paper-controls">
+      <div class="paper-quick-actions" aria-label="文献操作">
+        <button type="button" class="paper-tool favorite-button {{ 'is-favorite' if paper.favorite }}" data-favorite data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.favorite else 'false' }}" aria-label="{{ '取消收藏' if paper.favorite else '收藏文献' }}"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-3-5.6 3 1.1-6.2L3 9.6l6.2-.9L12 3Z"/></svg><span data-favorite-label>{{ '已收藏' if paper.favorite else '收藏' }}</span></button>
+        <button type="button" class="paper-tool reading-button {{ 'is-read-later' if paper.reading_status == 'read_later' }}" data-read-later data-identity="{{ paper.identity }}" aria-pressed="{{ 'true' if paper.reading_status == 'read_later' else 'false' }}"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v17l-6-4-6 4V4Z"/><path d="M9 8h6"/></svg><span data-reading-label>{{ '已加入稍后读' if paper.reading_status == 'read_later' else '稍后读' }}</span></button>
+        <button type="button" class="paper-tool feedback-button" data-open-feedback><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4V4Z"/><path d="M8 8h8M8 12h5"/></svg><span>反馈</span></button>
+      </div>
+      <details class="paper-details">
+      <summary><span>详情</span><svg class="icon detail-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg></summary>
       <div class="paper-detail-content">
       {% if not paper.abstract %}<p class="warning">公开渠道暂未找到原始摘要；系统不会生成或改写摘要冒充原文。你可以在下方粘贴从论文页核验的完整摘要。</p>
       <form class="manual-abstract-form" data-manual-abstract-form>
@@ -36,7 +40,7 @@
       <dl class="paper-meta"><div><dt>作者</dt><dd>{{ paper.authors_json|authors }}</dd></div><div><dt>摘要来源</dt><dd>{{ paper.abstract_source or '未找到' }}</dd></div><div><dt>DOI</dt><dd>{{ paper.doi or '无' }}</dd></div></dl>
       {% if show_pdf %}<div class="paper-actions"><form method="post" action="/fulltext" enctype="multipart/form-data" class="pdf-inline-form" data-inline-pdf-form data-has-fulltext="{{ 'true' if paper.fulltext_id else 'false' }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="return_to" value="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}#{{ paper_anchor }}"><input type="hidden" name="identity" value="{{ paper.identity }}"><input type="file" name="pdf" accept="application/pdf,.pdf" required hidden data-inline-pdf-file><button type="button" class="button secondary" data-inline-pdf-trigger>导入全文 PDF</button><span class="pdf-file-name" data-inline-pdf-name hidden></span><button type="submit" class="button" data-inline-pdf-submit hidden>确认上传</button></form>{% if paper.fulltext_id %}<a class="button secondary" href="/fulltext/file?identity={{ paper.identity|urlencode }}" target="_blank" rel="noopener">查看 PDF</a>{% endif %}</div>{% endif %}
       <section class="feedback-panel" aria-label="标记与反馈">
-      <div class="feedback-heading"><strong>标记与反馈</strong>{% if paper.favorite %}<span class="star">★ 已收藏</span>{% endif %}</div>
+      <div class="feedback-heading"><strong>标记与反馈</strong></div>
       <form method="post" action="/feedback" class="feedback-form" data-feedback-form>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="identity" value="{{ paper.identity }}">
@@ -63,7 +67,8 @@
       </form>
       </section>
       </div>
-    </details>
+      </details>
+    </div>
   </div>
 </article>
 {% endmacro %}

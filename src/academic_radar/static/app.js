@@ -1,5 +1,23 @@
 (() => {
   "use strict";
+  const appearanceKey = "daily-literature.appearance.v1";
+  const normalizeAppearance = (value) => ({
+    font: value?.font === "serif" ? "serif" : "system",
+    theme: value?.theme === "paper" ? "paper" : "sage",
+  });
+  const readAppearance = () => {
+    try { return normalizeAppearance(JSON.parse(localStorage.getItem(appearanceKey))); }
+    catch (_) { return normalizeAppearance(null); }
+  };
+  const applyAppearance = (value) => {
+    const preferences = normalizeAppearance(value);
+    document.documentElement.dataset.font = preferences.font;
+    document.documentElement.dataset.theme = preferences.theme;
+    return preferences;
+  };
+  // This self-hosted script runs in the head, before the page is painted.
+  applyAppearance(readAppearance());
+  const onReady = () => {
   const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const toast = document.getElementById("toast");
   const announce = (message, error = false) => {
@@ -19,6 +37,35 @@
     if (!response.ok) throw new Error(data.error || `请求失败（${response.status}）`);
     return data;
   };
+
+  const appearanceDialog = document.getElementById("appearance-dialog");
+  const showAppearance = (value) => {
+    const preferences = applyAppearance(value);
+    appearanceDialog?.querySelectorAll('input[name="appearance-font"], input[name="appearance-theme"]').forEach((input) => {
+      const key = input.name === "appearance-font" ? "font" : "theme";
+      input.checked = input.value === preferences[key];
+    });
+    return preferences;
+  };
+  const saveAppearance = (value) => {
+    const preferences = showAppearance(value);
+    const status = appearanceDialog?.querySelector("[data-appearance-status]");
+    try {
+      localStorage.setItem(appearanceKey, JSON.stringify(preferences));
+      if (status) status.textContent = "已保存到此浏览器";
+    } catch (_) {
+      if (status) status.textContent = "已应用；浏览器暂时无法保存偏好";
+    }
+  };
+  showAppearance(readAppearance());
+  document.querySelector("[data-open-appearance]")?.addEventListener("click", () => appearanceDialog?.showModal());
+  appearanceDialog?.addEventListener("change", (event) => {
+    if (!event.target.matches('input[name="appearance-font"], input[name="appearance-theme"]')) return;
+    saveAppearance({font: appearanceDialog.querySelector('input[name="appearance-font"]:checked')?.value,
+                    theme: appearanceDialog.querySelector('input[name="appearance-theme"]:checked')?.value});
+  });
+  document.querySelector("[data-reset-appearance]")?.addEventListener("click", () => saveAppearance(null));
+  window.addEventListener("storage", (event) => { if (event.key === appearanceKey) showAppearance(readAppearance()); });
 
   document.querySelectorAll("[data-sync-now]").forEach(button => button.addEventListener("click", async () => {
     button.disabled = true;
@@ -64,7 +111,11 @@
   document.querySelectorAll(".paper-details").forEach((details) => {
     const summary = details.querySelector(":scope > summary");
     details.addEventListener("toggle", () => {
-      if (summary) summary.textContent = details.open ? "收起详情" : "展开详情";
+      if (summary) {
+        const label = summary.querySelector("span");
+        if (label) label.textContent = details.open ? "收起" : "详情";
+        else summary.textContent = details.open ? "收起详情" : "展开详情";
+      }
     });
   });
 
@@ -90,14 +141,32 @@
     if (button) {
       button.setAttribute("aria-pressed", String(favorite));
       button.classList.toggle("is-favorite", favorite);
-      button.textContent = favorite ? "★" : "☆";
-      button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏到本地文献库");
+      const label = button.querySelector("[data-favorite-label]");
+      if (label) label.textContent = favorite ? "已收藏" : "收藏";
+      button.setAttribute("aria-label", favorite ? "取消收藏" : "收藏文献");
     }
     const checkbox = card.querySelector('input[name="favorite"]');
     if (checkbox) checkbox.checked = favorite;
     const star = card.querySelector(".feedback-heading .star");
     if (star) star.hidden = !favorite;
   };
+  const syncReading = (card, readingStatus) => {
+    card.dataset.readingStatus = readingStatus;
+    const button = card.querySelector("[data-read-later]");
+    const later = readingStatus === "read_later";
+    if (button) {
+      button.setAttribute("aria-pressed", String(later));
+      button.setAttribute("aria-label", later ? "移出稍后读" : "加入稍后读");
+      button.classList.toggle("is-read-later", later);
+      const label = button.querySelector("[data-reading-label]");
+      if (label) label.textContent = later ? "已加入稍后读" : "稍后读";
+    }
+    const select = card.querySelector('select[name="reading_status"]');
+    if (select) select.value = readingStatus;
+  };
+  const setCardBusy = (identity, busy) => matchingCards(identity).forEach((card) => {
+    card.querySelectorAll('[data-favorite], [data-read-later], [data-feedback-form] button[type="submit"]').forEach((button) => { button.disabled = busy; });
+  });
 
   const orderRecommendationCards = (list) => {
     if (!list) return;
@@ -119,11 +188,12 @@
       reading_status: values.get("reading_status"),
       favorite: values.get("favorite") === "on",
     };
-    submit.disabled = true;
+    setCardBusy(payload.identity, true);
     try {
       const result = await api("/api/feedback", {method: "POST", body: JSON.stringify(payload)});
       matchingCards(payload.identity).forEach((card) => {
         card.dataset.interest = result.interest || "";
+        card.dataset.feedbackReason = payload.reason || "";
         const status = card.querySelector("[data-feedback-status]");
         if (status) {
           status.textContent = result.status_label;
@@ -137,6 +207,7 @@
           otherForm.elements.reading_status.value = payload.reading_status;
         }
         syncFavorite(card, payload.favorite);
+        syncReading(card, result.reading_status);
         const list = card.closest("[data-today-list], [data-history-list]");
         if (list) {
           card.classList.add("is-completing");
@@ -146,21 +217,47 @@
       });
       announce(result.message);
     } catch (error) { announce(error.message, true); }
-    finally { submit.disabled = false; }
+    finally { setCardBusy(payload.identity, false); }
   }));
 
   document.addEventListener("click", async (event) => {
+    const feedback = event.target.closest("[data-open-feedback]");
+    if (feedback) {
+      const card = feedback.closest("[data-paper-identity]");
+      const details = card?.querySelector(".paper-details");
+      if (details) details.open = true;
+      requestAnimationFrame(() => card?.querySelector('[data-feedback-form] select[name="interest"]')?.focus());
+      return;
+    }
+    const reading = event.target.closest("[data-read-later]");
+    if (reading) {
+      const card = reading.closest("[data-paper-identity]");
+      const identity = reading.dataset.identity;
+      const next = card.dataset.readingStatus === "read_later" ? "unread" : "read_later";
+      setCardBusy(identity, true);
+      try {
+        const result = await api("/api/feedback", {method: "POST", body: JSON.stringify({
+          identity, interest: card.dataset.interest || null, reason: card.dataset.feedbackReason || "",
+          favorite: card.querySelector("[data-favorite]")?.getAttribute("aria-pressed") === "true",
+          reading_status: next,
+        })});
+        matchingCards(identity).forEach((other) => syncReading(other, result.reading_status));
+        announce(next === "read_later" ? "已加入稍后读" : "已移出稍后读");
+      } catch (error) { announce(error.message, true); }
+      finally { setCardBusy(identity, false); }
+      return;
+    }
     const favorite = event.target.closest("[data-favorite]");
     if (favorite) {
       event.preventDefault();
       const next = favorite.getAttribute("aria-pressed") !== "true";
-      favorite.disabled = true;
+      setCardBusy(favorite.dataset.identity, true);
       try {
         const result = await api("/api/favorite", {method: "POST", body: JSON.stringify({identity: favorite.dataset.identity, favorite: next})});
         matchingCards(favorite.dataset.identity).forEach((card) => syncFavorite(card, result.favorite));
         announce(result.message);
       } catch (error) { announce(error.message, true); }
-      finally { favorite.disabled = false; }
+      finally { setCardBusy(favorite.dataset.identity, false); }
     }
   });
 
@@ -288,4 +385,7 @@
     try { await navigator.clipboard.writeText(text); announce("更新任务已复制，发送给 Codex 即可执行"); }
     catch (_) { announce("无法访问剪贴板，请手动复制", true); }
   });
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", onReady, {once: true});
+  else onReady();
 })();

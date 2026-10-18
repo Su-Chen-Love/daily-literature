@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}偏好反馈 · 个人学术助手{% endblock %}
+{% block title %}偏好反馈 · 每日文献{% endblock %}
 {% block content %}
 <header class="page-head"><div><p class="kicker">FEEDBACK · CALIBRATION</p><h1>偏好反馈</h1><p>兴趣判断会作为后续 Codex 判断的校准例；收藏只是阅读星标，不会自动改变研究兴趣。</p></div></header>
 <section class="metric-grid four"><div><strong>{{ stats.total or 0 }}</strong><span>有当前反馈</span></div><div><strong>{{ stats.interested or 0 }}</strong><span>感兴趣</span></div><div><strong>{{ stats.not_interested or 0 }}</strong><span>不感兴趣</span></div><div><strong>{{ stats.favorites or 0 }}</strong><span>已收藏</span></div></section>

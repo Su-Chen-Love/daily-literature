@@ -23,6 +23,19 @@ from academic_radar.recommendations import snapshot_run
 
 @unittest.skipIf(TestClient is None, "web test dependencies are not installed")
 class WebTests(unittest.TestCase):
+    def test_navigation_errors_render_page_but_api_errors_stay_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _, _ = self.make_app(Path(td))
+            with TestClient(app) as client:
+                response = client.get('/?history_date=invalid')
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('每日文献', response.text)
+                self.assertIn('请选择有效的历史日期', response.text)
+                self.assertIn('text/html', response.headers['content-type'])
+                response = client.post('/api/favorite', json={'identity': 'doi:10.1/test', 'favorite': True})
+                self.assertEqual(response.status_code, 403)
+                self.assertIn('error', response.json())
+
     def make_app(self, root: Path):
         config = root / "config.toml"
         config.write_text(
@@ -64,11 +77,11 @@ class WebTests(unittest.TestCase):
                 for path in ("/", "/library", "/sources", "/profile", "/feedback", "/status"):
                     response = client.get(path)
                     self.assertEqual(response.status_code, 200, path)
-                    self.assertIn("个人学术助手", response.text)
+                    self.assertIn("每日文献", response.text)
                     self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
                     self.assertIn('rel="icon" type="image/png"', response.text)
                     if path == "/":
-                        self.assertIn("app.js?v=0.12.0", response.text)
+                        self.assertIn("app.js?v=daily-20261018", response.text)
                         self.assertEqual(response.text.count('class="nav-icon"'), 6)
                 favicon = client.get("/static/images/academic-radar-logo.png")
                 self.assertEqual(favicon.status_code, 200)
@@ -593,7 +606,7 @@ class WebTests(unittest.TestCase):
             db.close()
             with TestClient(app) as client: response=client.get("/")
             self.assertIn("A useful paper",response.text)
-            self.assertIn("展开详情",response.text)
+            self.assertIn("详情",response.text)
             self.assertNotIn('action="/fulltext"',response.text)
             self.assertNotIn("打开原文", response.text)
             self.assertNotIn("展开摘要", response.text)
