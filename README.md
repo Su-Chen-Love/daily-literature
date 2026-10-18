@@ -1,6 +1,6 @@
 # Personal Academic Assistant
 
-[![Tests](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/personal-academic-radar/actions/workflows/test.yml)
+[![Tests](https://github.com/Su-Chen-Love/daily-literature/actions/workflows/test.yml/badge.svg)](https://github.com/Su-Chen-Love/daily-literature/actions/workflows/test.yml)
 
 Personal Academic Assistant 是面向单个研究者的本地优先文献助手。代码可以公开；配置、SQLite、队列、摘要结果、日志和 PDF 保存在私有状态目录，默认是 `~/.local/share/personal-academic-radar`。
 

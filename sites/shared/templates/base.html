@@ -9,8 +9,8 @@
   <link rel="icon" type="image/svg+xml" sizes="any" href="{{ url_for('static', path='/images/daily-literature-logo.svg') }}?v=brand01">
   <link rel="icon" type="image/png" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
   <link rel="apple-touch-icon" href="{{ url_for('static', path='/images/academic-radar-logo.png') }}?v=brand01">
-  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=center-20261018">
-  <script src="{{ url_for('static', path='/app.js') }}?v=center-20261018"></script>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=center-20261018c">
+  <script src="{{ url_for('static', path='/app.js') }}?v=center-20261018c"></script>
 </head>
 <body>
   <a href="#main-content" class="skip-link">跳到正文</a>
@@ -27,7 +27,6 @@
       <a class="{{ 'active' if page == 'feedback' }}" {% if page == 'feedback' %}aria-current="page"{% endif %} href="/feedback"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v12H9l-5 4V4Zm4 4h8m-8 4h5"/></svg><span class="nav-label">偏好反馈</span></a>
     </nav>
     <div class="account-entry">
-      <button type="button" class="cloud-state" data-open-center="checks" data-sync-indicator data-sync-state="unknown" aria-label="同步状态尚未检查，打开个人中心"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18a4 4 0 0 1-1-7.9 6.5 6.5 0 0 1 12.5-1.6A4.8 4.8 0 0 1 18 18H6Z"/><path data-cloud-state-mark d="M9 14h6"/></svg></button>
       <button type="button" class="personal-trigger" data-open-center="profile" aria-haspopup="dialog" aria-controls="personal-center">
         <span class="personal-avatar" data-personal-avatar aria-hidden="true">文</span><span><strong data-personal-name>个人中心</strong><small>资料与设置</small></span><span aria-hidden="true">⌃</span>
       </button>
