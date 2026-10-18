@@ -504,10 +504,12 @@ def create_app(config_path: Path) -> FastAPI:
             db.close()
 
     @app.get("/library", response_class=HTMLResponse)
-    def library(request: Request, q: str = "", interest: str = "", reading: str = "", favorite: str = "",
+    def library(request: Request, q: str = "", interest: str = "", favorite: str = "",
                 sort: str = "score_desc", page_no: int = 1) -> HTMLResponse:
+        if "reading" in request.query_params:
+            return RedirectResponse(str(request.url.remove_query_params("reading")),303)
         page_no=max(1,page_no); limit=24; offset=(page_no-1)*limit
-        personal_view = favorite == "yes" or reading in {"read_later", "read"}
+        personal_view = favorite == "yes"
         clauses=["1=1"] if personal_view else ["p.eligibility_status='eligible'","s.score>=?"]
         parameters: list[Any]=[] if personal_view else [0.7]
         if q:
@@ -515,8 +517,6 @@ def create_app(config_path: Path) -> FastAPI:
             value=f"%{q}%"; parameters.extend([value,value,value])
         if interest in ("interested","not_interested"):
             clauses.append("f.interest=?"); parameters.append(interest)
-        if reading in ("unread","read","read_later"):
-            clauses.append("COALESCE(f.reading_status,'unread')=?"); parameters.append(reading)
         if favorite == "yes":
             clauses.append("COALESCE(f.favorite,0)=1")
         where=" AND ".join(clauses)
@@ -545,11 +545,11 @@ def create_app(config_path: Path) -> FastAPI:
             count=row(db,f"""SELECT COUNT(*) count FROM papers p JOIN ({latest}) s ON s.identity=p.identity
               LEFT JOIN paper_feedback f ON f.identity=p.identity WHERE {where}""",
               tuple(parameters))["count"]
-            base_params={"q":q,"interest":interest,"reading":reading,"favorite":favorite,"sort":sort}
+            base_params={"q":q,"interest":interest,"favorite":favorite,"sort":sort}
             previous_query=urllib.parse.urlencode({**base_params,"page_no":page_no-1})
             next_query=urllib.parse.urlencode({**base_params,"page_no":page_no+1})
             return templates.TemplateResponse(request,"library.html",context(request,"library",papers=paper_rows,
-                q=q,interest=interest,reading=reading,favorite=favorite,sort=sort,page_no=page_no,total=count,
+                q=q,interest=interest,favorite=favorite,sort=sort,page_no=page_no,total=count,
                 has_next=offset+limit<count,previous_query=previous_query,next_query=next_query))
         finally: db.close()
 

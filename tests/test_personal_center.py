@@ -22,7 +22,7 @@ class PersonalCenterTests(unittest.TestCase):
                 db.execute("INSERT INTO paper_feedback(identity,interest,reason,favorite,reading_status,created_at,updated_at) VALUES('doi:10.1/test',NULL,NULL,1,'read_later','2026-01-01','2026-01-01')")
             with TestClient(app) as client:
                 self.assertNotIn('A useful paper', client.get('/library').text)
-                for query in ['favorite=yes', 'reading=read_later']:
+                for query in ['favorite=yes']:
                     self.assertIn('A useful paper', client.get('/library?' + query).text)
             with connect(path) as db:
                 self.assertEqual(db.execute('SELECT score FROM screenings').fetchone()[0], .55)
@@ -89,3 +89,16 @@ class PersonalCenterTests(unittest.TestCase):
                 second=client.post('/api/feedback',json={"identity":"doi:10.1/test","interest":"not_interested","reason":"","favorite":True},headers=headers)
                 self.assertEqual(second.status_code,200)
                 self.assertEqual(second.json()['reading_status'],'read_later')
+
+    def test_old_reading_bookmark_is_normalized_without_losing_other_filters(self):
+        with tempfile.TemporaryDirectory() as td:
+            app,_,_=self.make_app(Path(td))
+            with TestClient(app) as client:
+                response=client.get('/library?reading=read_later&q=useful&interest=interested&favorite=yes&sort=title_asc&page_no=2',follow_redirects=False)
+                self.assertEqual(response.status_code,303)
+                from urllib.parse import urlsplit,parse_qs
+                query=parse_qs(urlsplit(response.headers['location']).query)
+                self.assertNotIn('reading',query)
+                self.assertEqual(query,{'q':['useful'],'interest':['interested'],'favorite':['yes'],'sort':['title_asc'],'page_no':['2']})
+                old=client.get('/library?reading=read_later')
+                self.assertEqual(old.text,client.get('/library').text)

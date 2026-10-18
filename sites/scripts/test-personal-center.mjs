@@ -16,7 +16,7 @@ record('paper','doi:normal',{identity:'doi:normal',title:'Ordinary recommended p
 record('feedback','doi:low',{identity:'doi:low',interest:null,reason:null,favorite:1,reading_status:'read_later',updated_at:'2026-01-01T00:00:00Z'});
 async function request(path,data){return worker.fetch(new Request(origin+path,{headers:{...headers,...(data?{'Content-Type':'application/json'}:{})},method:data?'POST':'GET',...(data?{body:JSON.stringify(data)}:{})}),env)}
 const normal=await (await request('/library')).text();assert.ok(!normal.includes('Saved below threshold'));assert.ok(normal.includes('Ordinary recommended paper'));
-for(const query of ['favorite=yes','reading=read_later']){
+for(const query of ['favorite=yes']){
  const html=await (await request('/library?'+query)).text();assert.ok(html.includes('Saved below threshold'));assert.ok(html.includes('低于推荐标准'));}
 const savedView=await (await request('/api/view?view=library&favorite=yes')).json();assert.equal(savedView.papers.length,1);assert.equal(savedView.papers[0].identity,'doi:low');
 const response=await request('/api/feedback',{identity:'doi:low',interest:'interested',reason:'',favorite:true,reading_status:'read_later'});assert.equal(response.status,200);
@@ -25,3 +25,7 @@ const checks=await (await request('/api/center/status')).json();assert.equal(che
 const redirect=await request('/status');assert.equal(redirect.status,303);assert.equal(redirect.headers.get('Location'),'/?center=checks');
 const unauth=await worker.fetch(new Request(origin+'/api/center/status'),env);assert.ok([200,403].includes(unauth.status)); // legacy repository keeps its existing access behavior; production worker denial is tested separately.
 console.log('Personal center checks/redirect/auth, fixed .7 views, optional feedback and all saved low-score/excluded entries passed.');
+
+const oldBookmark=await request('/library?reading=read_later&q=Ordinary&favorite=yes&sort=title_asc');assert.equal(oldBookmark.status,303);const normalized=new URL(oldBookmark.headers.get('Location'),origin);assert.equal(normalized.searchParams.has('reading'),false);assert.equal(normalized.searchParams.get('q'),'Ordinary');assert.equal(normalized.searchParams.get('favorite'),'yes');assert.equal(normalized.searchParams.get('sort'),'title_asc');
+const ignored=await (await request('/api/view?view=library&reading=read_later')).json();assert.ok(ignored.papers.some(p=>p.identity==='doi:normal'));assert.ok(!ignored.papers.some(p=>p.identity==='doi:low'));
+console.log('Removed reading bookmarks normalize without dropping other filters; API ignores the retired reading filter.');

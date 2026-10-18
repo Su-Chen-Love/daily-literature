@@ -66,13 +66,12 @@ async function view(r,e,u){
  if(v==='sources'||v==='status'){if(!own)result.overview.sources=meta.sources.map(s=>({...s,health:{status:s.health?.status,last_success_at:s.health?.last_success_at}}));return json(result);}
  let papers=await all(db,g,'paper');
  if(v==='today'){const today=new Date().toLocaleDateString('en-CA',{timeZone:meta.timezone||'Asia/Shanghai'}),day=u.searchParams.get('day')||today;let history=await record(db,g,'history',day===today?'current':day);if(day===today&&history?.day!==today)history=null;const index=new Map(papers.map(p=>[p.identity,p]));result.day=day;result.batches=history?.batches||0;result.incomplete=history?.incomplete||false;papers=(history?.papers||[]).filter(p=>index.has(p.identity)).map(p=>({...index.get(p.identity),...p}));}
- else if(v==='library'){const personalView=u.searchParams.get('favorite')==='yes'||['read_later','read'].includes(u.searchParams.get('reading'));papers=papers.filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));}else if(v!=='feedback')fail('页面不存在',404);
+ else if(v==='library'){const personalView=u.searchParams.get('favorite')==='yes';papers=papers.filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));}else if(v!=='feedback')fail('页面不存在',404);
  const f=own?await feedback(db,g):new Map();
  const publicFields=['identity','doi','title','abstract','venue','published','published_precision','url','authors_json','abstract_source','abstract_source_url','abstract_retrieved_at','eligibility_status','publication_type','score','reasons','confidence','rubric_version','needs_rescreen'];
  result.papers=papers.map(p=>own?{...p,...(f.has(p.identity)?{feedback:f.get(p.identity)}:{})}:Object.fromEntries(publicFields.filter(k=>k in p).map(k=>[k,p[k]])));
  if(v==='library'){
   if(u.searchParams.get('favorite')==='yes')result.papers=result.papers.filter(p=>p.feedback?.favorite);
-  const reading=u.searchParams.get('reading');if(['unread','read_later','read'].includes(reading))result.papers=result.papers.filter(p=>(p.feedback?.reading_status||'unread')===reading);
  }
  if(v==='feedback')result.papers=result.papers.filter(p=>p.feedback);return json(result);
 }
@@ -122,14 +121,14 @@ async function pageContext(r,e,u,page){
   context.totals={...context.totals,favorites:[...f.values()].filter(x=>x.favorite).length,read_later:[...f.values()].filter(x=>x.reading_status==='read_later').length};
  }
  if(page==='library'){
-  Object.assign(context,{q:sp.get('q')||'',interest:sp.get('interest')||'',reading:sp.get('reading')||'',favorite:sp.get('favorite')||'',sort:sp.get('sort')||'score_desc',page_no:Math.max(1,Math.min(100000,parseInt(sp.get('page_no')||'1')||1))});
-  const personalView=context.favorite==='yes'||['read_later','read'].includes(context.reading);
+  Object.assign(context,{q:sp.get('q')||'',interest:sp.get('interest')||'',favorite:sp.get('favorite')||'',sort:sp.get('sort')||'score_desc',page_no:Math.max(1,Math.min(100000,parseInt(sp.get('page_no')||'1')||1))});
+  const personalView=context.favorite==='yes';
   let selected=[...index.values()].filter(p=>personalView||(p.eligibility_status==='eligible'&&p.score>=.7));
-  const q=context.q;selected=selected.filter(p=>(!q||[p.title,p.abstract,p.venue].some(v=>searchMatches(v,q)))&&(!['interested','not_interested'].includes(context.interest)||p.interest===context.interest)&&(!['unread','read_later','read'].includes(context.reading)||p.reading_status===context.reading)&&(context.favorite!=='yes'||p.favorite));
+  const q=context.q;selected=selected.filter(p=>(!q||[p.title,p.abstract,p.venue].some(v=>searchMatches(v,q)))&&(!['interested','not_interested'].includes(context.interest)||p.interest===context.interest)&&(context.favorite!=='yes'||p.favorite));
   if(!['score_desc','score_asc','date_desc','date_asc','title_asc'].includes(context.sort))context.sort='score_desc';const sort=context.sort;
   selected.sort((a,b)=>(sort==='score_asc'?(a.score-b.score||binary(b.published,a.published)):sort==='date_asc'?(binary(a.published,b.published)||b.score-a.score):sort==='date_desc'?(binary(b.published,a.published)||b.score-a.score):sort==='title_asc'?binary(fold(a.title),fold(b.title)):(b.score-a.score||binary(b.published,a.published)))||binary(a.identity,b.identity));
   context.total=selected.length;context.papers=selected.slice((context.page_no-1)*24,context.page_no*24);context.has_next=context.page_no*24<selected.length;
-  const query=n=>{const params=new URLSearchParams(sp);params.set('page_no',String(n));return params.toString();};context.previous_query=query(context.page_no-1);context.next_query=query(context.page_no+1);
+  const query=n=>{const params=new URLSearchParams(sp);params.delete('reading');params.set('page_no',String(n));return params.toString();};context.previous_query=query(context.page_no-1);context.next_query=query(context.page_no+1);
  }
  if(page==='feedback'){
   context.interest=sp.get('interest')||'';context.favorite=sp.get('favorite')||'';context.sort=sp.get('sort')||'updated';
@@ -143,6 +142,7 @@ export default {async fetch(r,e){const u=new URL(r.url);try{
  const asset=staticAsset(u.pathname);if(asset)return asset;
  if(u.pathname==='/healthz')return json({ok:!!e.DB,ready:!!(e.DB&&await active(e.DB))});
  if(!e.DB&&u.pathname.startsWith('/api/'))fail('云端数据库暂时不可用',503);
+ if(u.pathname==='/library'&&r.method==='GET'&&u.searchParams.has('reading')){const target=new URL(u);target.searchParams.delete('reading');return new Response(null,{status:303,headers:{...h,Location:target.pathname+target.search}});}
  if(u.pathname==='/status'&&r.method==='GET')return new Response(null,{status:303,headers:{...h,Location:'/?center=checks'}});
  if(u.pathname==='/api/center/status'&&r.method==='GET'){
   const context=await pageContext(r,e,u,'status'),state=await syncState(e.DB);

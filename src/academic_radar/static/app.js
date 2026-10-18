@@ -82,6 +82,7 @@
   const renderPersonal = value => {
     document.querySelectorAll('[data-personal-avatar]').forEach(el=>paintAvatar(el,value));
     document.querySelectorAll('[data-personal-name]').forEach(el=>el.textContent=value.name||'个人中心');
+    document.querySelectorAll('[data-personal-subtitle]').forEach(el=>el.hidden=!value.name);
   };
   let avatarRead=0;
   let draftPersonal=readPersonal();renderPersonal(draftPersonal);
