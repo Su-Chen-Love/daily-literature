@@ -76,7 +76,7 @@
   const readPersonal = () => {try{return normalizePersonal(JSON.parse(localStorage.getItem(personalKey)))}catch(_){return normalizePersonal(null)}};
   const paintAvatar = (element, value) => {
     if(!element)return; element.replaceChildren();
-    if(value.avatar){const image=document.createElement('img');image.src=value.avatar.startsWith('preset:')?'/static/images/avatars/avatar-'+value.avatar.slice(7)+'.webp':value.avatar;image.alt='';if(value.avatar.startsWith('preset:'))image.className='avatar-preset-image';element.append(image)}
+    if(value.avatar){const image=document.createElement('img');image.src=value.avatar.startsWith('preset:')?'/static/images/avatars/avatar-'+value.avatar.slice(7)+'.webp':value.avatar;image.alt='';element.append(image)}
     else element.textContent=Array.from(value.name)[0]||'文';
   };
   const renderPersonal = value => {
